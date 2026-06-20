@@ -1,0 +1,27 @@
+[package]
+name = "rust-backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "rust-backup — modular streaming source→destination backup over an efficient tunnel transport"
+
+[[bin]]
+name = "rust-backup"
+path = "src/main.rs"
+
+[dependencies]
+rb-core = { path = "../rb-core" }
+rb-transport = { path = "../rb-transport" }
+rb-postgres = { path = "../rb-postgres" }
+rb-mongodb = { path = "../rb-mongodb" }
+rb-filesystem = { path = "../rb-filesystem" }
+rb-s3 = { path = "../rb-s3" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true

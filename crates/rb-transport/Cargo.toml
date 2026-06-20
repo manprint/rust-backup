@@ -1,0 +1,41 @@
+[package]
+name = "rb-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "rust-backup transport: coordination server + paired byte-channel (relay + direct QUIC), vendored from bore"
+
+[features]
+default = ["udp"]
+# Direct peer-to-peer path via UDP hole-punching carried over QUIC, with relay
+# fallback. Mirrors bore's `udp` feature. Build --no-default-features to drop it.
+udp = ["dep:quinn", "dep:rcgen"]
+
+[dependencies]
+rb-core = { path = "../rb-core" }
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+tokio = { workspace = true }
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+webpki-roots.workspace = true
+yamux.workspace = true
+quinn = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

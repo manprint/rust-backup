@@ -1,0 +1,110 @@
+//! Backup-module trait surface and registry.
+//!
+//! MODULARITY INVARIANT: a new backend (the next heterogeneous target) is added
+//! by implementing [`BackupModule`] in its own crate and registering it — no
+//! core change. Everything a module needs flows through these traits plus the
+//! transport-agnostic [`crate::channel`] types.
+//!
+//! SOURCE-IMMUTABILITY INVARIANT: [`Source`] exposes only read/analyze/stream
+//! operations and a [`Source::fingerprint`] used by the session to assert the
+//! source is byte/logically unchanged before and after every run.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+
+use crate::channel::{ChunkSink, ChunkSource};
+use crate::error::{BackupError, Result};
+use crate::plan::{BackupPlan, Preflight};
+
+/// Opaque per-target parameter bag (merged from CLI/env/yaml). Each module
+/// deserializes it into its own typed params struct.
+#[derive(Clone, Debug, Default)]
+pub struct TargetParams(pub serde_json::Value);
+
+impl TargetParams {
+    /// Deserialize into a module-defined params type.
+    pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_value(self.0.clone())
+            .map_err(|e| BackupError::Config(format!("invalid module params: {e}")))
+    }
+
+    /// Build from any serializable struct (used by the CLI layer).
+    pub fn from_value(v: serde_json::Value) -> Self {
+        TargetParams(v)
+    }
+}
+
+/// The source side of a target: analyze (read-only) and stream payload out.
+#[async_trait]
+pub trait Source: Send + Sync {
+    /// Inspect the backend and build a complete, self-describing [`BackupPlan`].
+    /// MUST NOT mutate the source.
+    async fn analyze(&self) -> Result<BackupPlan>;
+
+    /// Stream the payload described by `plan` into `sink`, chunk by chunk, with
+    /// no local temp files. MUST NOT mutate the source.
+    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()>;
+
+    /// A stable fingerprint of source state (catalog hash, fs tree hash, object
+    /// listing hash…). Used by the session to prove immutability. Read-only.
+    async fn fingerprint(&self) -> Result<String>;
+}
+
+/// The destination side of a target: validate and apply the streamed payload.
+#[async_trait]
+pub trait Destination: Send + Sync {
+    /// Preflight the plan: disk space, accessibility, version compatibility,
+    /// privilege checks. The transfer proceeds only if `Preflight::ok`.
+    async fn validate(&self, plan: &BackupPlan) -> Result<Preflight>;
+
+    /// Apply the streamed payload to reach 1:1 with the source. No temp files.
+    async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()>;
+}
+
+/// A backup-capable backend type. One instance per module, registered once.
+#[async_trait]
+pub trait BackupModule: Send + Sync {
+    /// CLI/identifier name ("postgres", "mongodb", "filesystem", "s3").
+    fn name(&self) -> &'static str;
+
+    /// Human-readable supported-version range (e.g. "PostgreSQL 10..=latest").
+    fn version_support(&self) -> &'static str;
+
+    /// Open a read-only source from connection params.
+    async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>>;
+
+    /// Open a read-write destination from connection params.
+    async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>>;
+}
+
+/// Registry of available modules, populated at startup by the binary.
+#[derive(Default, Clone)]
+pub struct ModuleRegistry {
+    modules: HashMap<&'static str, Arc<dyn BackupModule>>,
+}
+
+impl ModuleRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a module under its `name()`.
+    pub fn register(&mut self, module: Arc<dyn BackupModule>) {
+        self.modules.insert(module.name(), module);
+    }
+
+    /// Look up a module by name.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn BackupModule>> {
+        self.modules.get(name).cloned()
+    }
+
+    /// All registered module names (sorted).
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v: Vec<_> = self.modules.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+}

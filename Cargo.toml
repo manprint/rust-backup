@@ -1,0 +1,68 @@
+# rust-backup — workspace root.
+#
+# Modular source→destination backup/restore over an efficient tunnel transport
+# vendored from `bore` (yamux relay + QUIC direct path, hole-punching, carriers).
+#
+# Crates:
+#   rb-core       library: traits, plan model, wire framing, config, errors, progress
+#   rb-transport  library: coordination server + paired byte-channel (relay+direct)
+#   rb-postgres   module: PostgreSQL  10..=latest  (stub; see docs/plans)
+#   rb-mongodb    module: MongoDB     4..=8        (stub)
+#   rb-filesystem module: filesystem (ownership/perms preserved on Linux) (stub)
+#   rb-s3         module: S3-compatible object storage (stub)
+#   rust-backup   binary: CLI, config loading, module registry, session runner
+[workspace]
+resolver = "2"
+members = [
+    "crates/rb-core",
+    "crates/rb-transport",
+    "crates/rb-postgres",
+    "crates/rb-mongodb",
+    "crates/rb-filesystem",
+    "crates/rb-s3",
+    "crates/rust-backup",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Fabio Pierri <fabio.pierri@synclab.it>"]
+repository = "https://github.com/manprint/rust-backup"
+
+# Shared dependency versions (pinned to bore's where the code is vendored, so the
+# transport copies compile unchanged).
+[workspace.dependencies]
+anyhow = { version = "1.0.56", features = ["backtrace"] }
+async-trait = "0.1"
+blake3 = "1.5.5"
+bytes = "1"
+clap = { version = "4.5.0", features = ["derive", "env"] }
+dashmap = "5.2.0"
+fastrand = "2"
+futures-util = { version = "0.3.21", features = ["sink"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+ring = "0.17"
+serde = { version = "1.0.136", features = ["derive"] }
+serde_json = "1.0.79"
+serde_yaml = "0.9"
+sha2 = "0.10.2"
+socket2 = "0.6.4"
+thiserror = "1"
+tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread", "io-std", "io-util", "macros", "net", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
+tracing = "0.1.32"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+uuid = { version = "1.2.1", features = ["serde", "v4"] }
+webpki-roots = "1.0.7"
+yamux = "0.13.10"
+# udp feature (vendored direct path)
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.14.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

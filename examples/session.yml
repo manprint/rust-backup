@@ -1,0 +1,22 @@
+# Example multi-target session: `rust-backup run --config examples/session.yml`
+# CLI flags and RUST_BACKUP_* env vars override matching fields here.
+targets:
+  # Back up a PostgreSQL cluster A -> B (source uses a read-only user).
+  - module: postgres
+    role: source
+    transport: { to: coord.example:7835, channel: pg-prod, secret: s3cr3t, udp: true }
+    params:
+      host: db-a.internal
+      port: 5432
+      user: backup_ro
+      password: ${PGPASS}   # expand via env in your shell before running
+      database: app
+
+  # Restore a directory tree (destination under sudo to preserve ownership).
+  - module: filesystem
+    role: destination
+    transport: { to: coord.example:7835, channel: fs-home, secret: s3cr3t }
+    params:
+      root: /restore/home
+      preserve_ownership: true
+    auto_accept: true
