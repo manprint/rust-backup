@@ -59,23 +59,26 @@ spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening)
 §"Phase 2" below. Done so far: **2.1** (connect+version), **2.2** (read-only
 introspection → `PgPlanPayload`), **2.3** (DDL reconstruction, golden-tested),
 **2.4** (`source.rs` `stream_out`: binary `COPY` → chunked `ChunkSink`),
-**2.5** (`dest.rs` `validate`: preflight, pure `assess` unit-tested).
+**2.5** (`dest.rs` `validate`: preflight), **2.6** (`dest.rs` `stream_in`:
+restore — DDL order + `COPY FROM STDIN` data load).
+
+**⚠ Live restore (2.6) is UNVERIFIED here** (no DB). The apply ordering reuses the
+golden-tested `build_cluster_ddl`; the live backup→restore→diff loop is the 2.8
+`e2e/postgres_matrix.sh` (to be written) — run it on a Docker host.
 
 **⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
 SQL is written to be version-robust but must be checked by running
 `bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
 (2.3 DDL is pure → fully unit-verified here via goldens.)
 
-**▶ NEXT: Phase 2.6 — `dest stream_in`** (OPUS GATE): apply the streamed payload.
-Order (use `ddl::build_cluster_ddl`): on a bootstrap admin connection run
-`ClusterDdl.roles` then `.databases`; then per database connect and run
-`DatabaseDdl.pre_data`, load data via `COPY <tbl> (<cols>) FROM STDIN (FORMAT
-binary)` (`copy_in`) fed from the `ChunkSource` events (match `item.id` →
-db/schema/table/columns; the raw bytes are COPY-binary, write verbatim), then run
-`DatabaseDdl.post_data` (constraints, indexes, setval, grants, owners). Wrap each
-database's apply in a transaction where possible. Pure: the apply-order assembly
-is unit-testable (assert pre_data before COPY before post_data); live restore =
-e2e. Replace the `stream_in` stub. Needs an ADMIN connection.
+**▶ NEXT: Phase 2.7 — `immutability.rs`** (OPUS GATE): source fingerprint =
+stable hash of (catalog snapshot + per-table `COUNT` + a sampled checksum).
+Implement `Source::fingerprint` (currently a stub) read-only; the session already
+calls it before/after every run and raises `BackupError::SourceMutated` on drift.
+Also reject a writable source user (a read-only source must not be able to
+mutate). Pure: the fingerprint COMPOSITION (hashing a snapshot struct →
+deterministic hex) is unit-testable here; the live catalog/COUNT queries +
+mid-`COPY`-abort stability are e2e (`T-PG-IMMUT`, part of the matrix).
 Module crates depend only on `rb-core`; never edit core to add a backend
 (I-MODULAR).
 
@@ -370,7 +373,13 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > creation privileges, per-db absent-or-overwrite; size informational — free disk
 > not visible over SQL). Added `PostgresParams.overwrite`. 4 unit tests on
 > `assess` (clean/older/no-privs/existing±overwrite); `probe_dest` via e2e.
-> · 2.6–2.8 ⏳ pending.
+> 2.6 ✅ done (live-UNVERIFIED here) — `dest.rs` `stream_in`: bootstrap conn runs
+> `ClusterDdl.roles` then `.databases`; per-db conn runs `pre_data`; bulk data via
+> a single linear pass over the `ChunkSource` → `COPY <tbl>(<cols>) FROM STDIN
+> (FORMAT binary)` (`copy_in` sink per item, raw bytes verbatim); then per-db
+> `post_data`. Autocommit (per-db txn is a noted refinement). Unit: `copy_in_sql`
+> mirrors `copy_out`, `item_metas` maps id→meta. Live restore via 2.8 matrix.
+> · 2.7–2.8 ⏳ pending.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.

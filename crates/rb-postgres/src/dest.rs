@@ -9,12 +9,20 @@
 //! Free-disk space is intentionally NOT a hard check: a SQL connection cannot see
 //! the destination host's filesystem, so the size is reported informationally.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 
+use bytes::Bytes;
+use futures_util::SinkExt;
+use tokio_postgres::{Client, CopyInSink};
+
+use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{human_bytes, BackupPlan, Preflight};
 
+use crate::ddl::{build_cluster_ddl, quote_ident, quote_qualified};
 use crate::model::PgPlanPayload;
+use crate::source::ItemMeta;
 use crate::{PgConnection, PostgresParams};
 
 /// Facts gathered from the destination needed to assess the plan.
@@ -134,6 +142,156 @@ async fn probe_dest(params: &PostgresParams, payload: &PgPlanPayload) -> Result<
     })
 }
 
+// --- restore (apply) ---------------------------------------------------------
+
+/// Apply the streamed payload to reach 1:1 with the source (plan Phase 2.6):
+/// roles → databases (cluster scope) → per-db structure (`pre_data`) → bulk data
+/// via `COPY … FROM STDIN (FORMAT binary)` → per-db `post_data` (constraints,
+/// indexes, sequence values, grants, owners). No temp files.
+///
+/// `CREATE DATABASE` cannot run inside a transaction, so cluster-scope DDL is
+/// autocommit. Per-database apply is autocommit too in this phase; wrapping each
+/// database in a transaction is a documented refinement. Verified end-to-end by
+/// the postgres e2e (live restore is not runnable in a DB-less CI).
+pub async fn stream_in(
+    params: &PostgresParams,
+    plan: &BackupPlan,
+    src: &mut dyn ChunkSource,
+) -> Result<()> {
+    let payload: PgPlanPayload = serde_json::from_value(plan.payload.clone())
+        .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
+    let ddl = build_cluster_ddl(&payload);
+
+    // 1. Cluster scope: roles, then databases.
+    let boot = PgConnection::connect(params, &params.bootstrap_database()).await?;
+    run_statements(&boot.client, &ddl.roles).await?;
+    run_statements(&boot.client, &ddl.databases).await?;
+    drop(boot);
+
+    // 2. Per-database structure; keep each connection for the data load.
+    let mut conns: HashMap<String, PgConnection> = HashMap::new();
+    for dbddl in &ddl.per_database {
+        let conn = PgConnection::connect(params, &dbddl.name).await?;
+        run_statements(&conn.client, &dbddl.pre_data).await?;
+        conns.insert(dbddl.name.clone(), conn);
+    }
+
+    // 3. Bulk data: one linear pass over the chunk stream, each item routed to a
+    //    COPY … FROM STDIN on its database connection.
+    let metas = item_metas(plan);
+    apply_data(&conns, &metas, src).await?;
+
+    // 4. Per-database post_data.
+    for dbddl in &ddl.per_database {
+        if let Some(conn) = conns.get(&dbddl.name) {
+            run_statements(&conn.client, &dbddl.post_data).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Map `item.id` → its COPY descriptor (table-kind items only).
+fn item_metas(plan: &BackupPlan) -> HashMap<u32, ItemMeta> {
+    plan.items
+        .iter()
+        .filter(|i| i.kind == "table")
+        .filter_map(|i| {
+            serde_json::from_value::<ItemMeta>(i.meta.clone())
+                .ok()
+                .map(|m| (i.id, m))
+        })
+        .collect()
+}
+
+async fn run_statements(client: &Client, stmts: &[String]) -> Result<()> {
+    for stmt in stmts {
+        client
+            .batch_execute(stmt)
+            .await
+            .map_err(|e| BackupError::phase_src(Phase::Apply, format!("apply DDL: {stmt}"), e))?;
+    }
+    Ok(())
+}
+
+/// `COPY … FROM STDIN (FORMAT binary)` mirroring the source's `COPY … TO STDOUT`,
+/// so the binary stream loads back verbatim.
+fn copy_in_sql(meta: &ItemMeta) -> String {
+    let qual = quote_qualified(&meta.schema, &meta.table);
+    if meta.columns.is_empty() {
+        format!("COPY {qual} FROM STDIN (FORMAT binary)")
+    } else {
+        let cols = meta
+            .columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("COPY {qual} ({cols}) FROM STDIN (FORMAT binary)")
+    }
+}
+
+async fn apply_data(
+    conns: &HashMap<String, PgConnection>,
+    metas: &HashMap<u32, ItemMeta>,
+    src: &mut dyn ChunkSource,
+) -> Result<()> {
+    // The open COPY sink for the item currently being loaded.
+    let mut current: Option<(u32, Pin<Box<CopyInSink<Bytes>>>)> = None;
+
+    loop {
+        match src.next().await? {
+            ChunkEvent::Chunk { item_id, data, .. } => {
+                let reopen = current
+                    .as_ref()
+                    .map(|(id, _)| *id != item_id)
+                    .unwrap_or(true);
+                if reopen {
+                    finish_current(&mut current).await?;
+                    let meta = metas.get(&item_id).ok_or_else(|| {
+                        BackupError::phase(Phase::Apply, format!("data for unknown item {item_id}"))
+                    })?;
+                    let conn = conns.get(&meta.database).ok_or_else(|| {
+                        BackupError::phase(
+                            Phase::Apply,
+                            format!("no connection for database '{}'", meta.database),
+                        )
+                    })?;
+                    let sql = copy_in_sql(meta);
+                    let sink = conn.client.copy_in::<_, Bytes>(&sql).await.map_err(|e| {
+                        BackupError::phase_src(
+                            Phase::Apply,
+                            format!("copy_in {}.{}", meta.schema, meta.table),
+                            e,
+                        )
+                    })?;
+                    current = Some((item_id, Box::pin(sink)));
+                }
+                if let Some((_, sink)) = &mut current {
+                    sink.send(Bytes::from(data))
+                        .await
+                        .map_err(|e| BackupError::phase_src(Phase::Apply, "copy_in send", e))?;
+                }
+            }
+            ChunkEvent::ItemEnd { .. } => finish_current(&mut current).await?,
+            ChunkEvent::End => {
+                finish_current(&mut current).await?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn finish_current(current: &mut Option<(u32, Pin<Box<CopyInSink<Bytes>>>)>) -> Result<()> {
+    if let Some((_, mut sink)) = current.take() {
+        sink.as_mut()
+            .finish()
+            .await
+            .map_err(|e| BackupError::phase_src(Phase::Apply, "copy_in finish", e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +348,41 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name == "privileges" && c.passed));
+    }
+
+    #[test]
+    fn copy_in_sql_mirrors_copy_out() {
+        let m = ItemMeta {
+            database: "appdb".into(),
+            schema: "app".into(),
+            table: "accounts".into(),
+            columns: vec!["id".into(), "email".into()],
+        };
+        assert_eq!(
+            copy_in_sql(&m),
+            "COPY \"app\".\"accounts\" (\"id\", \"email\") FROM STDIN (FORMAT binary)"
+        );
+        let m2 = ItemMeta {
+            columns: vec![],
+            ..m
+        };
+        assert_eq!(
+            copy_in_sql(&m2),
+            "COPY \"app\".\"accounts\" FROM STDIN (FORMAT binary)"
+        );
+    }
+
+    #[test]
+    fn item_metas_indexes_table_items_by_id() {
+        let payload = crate::model::test_fixture();
+        let bp = crate::introspect::build_plan(&payload, "t".to_string());
+        let metas = item_metas(&bp);
+        assert_eq!(metas.len(), 1);
+        let m = metas.get(&0).expect("item 0");
+        assert_eq!(m.database, "appdb");
+        assert_eq!(m.schema, "app");
+        assert_eq!(m.table, "accounts");
+        assert_eq!(m.columns, vec!["id".to_string(), "email".to_string()]);
     }
 
     #[test]

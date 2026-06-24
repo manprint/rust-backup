@@ -23,14 +23,15 @@ use rb_core::wire::CHUNK_SIZE;
 use crate::ddl::{quote_ident, quote_qualified};
 use crate::{PgConnection, PostgresParams};
 
-/// The per-item COPY descriptor carried in `PlanItem::meta` (set by `build_plan`).
+/// The per-item COPY descriptor carried in `PlanItem::meta` (set by `build_plan`,
+/// consumed by both source `stream_out` and destination `stream_in`).
 #[derive(Debug, Deserialize)]
-struct ItemMeta {
-    database: String,
-    schema: String,
-    table: String,
+pub(crate) struct ItemMeta {
+    pub(crate) database: String,
+    pub(crate) schema: String,
+    pub(crate) table: String,
     #[serde(default)]
-    columns: Vec<String>,
+    pub(crate) columns: Vec<String>,
 }
 
 /// Stream every data-bearing item of `plan` into `sink`. Does NOT close the sink

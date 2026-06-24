@@ -141,11 +141,8 @@ impl Destination for PostgresDestination {
         dest::validate(&self.params, plan).await
     }
 
-    async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Apply,
-            "rb-postgres: stream_in not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        dest::stream_in(&self.params, plan, src).await
     }
 }
 
