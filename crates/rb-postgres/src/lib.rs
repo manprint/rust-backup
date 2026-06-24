@@ -10,6 +10,7 @@ mod connect;
 pub mod ddl;
 mod introspect;
 mod model;
+mod source;
 
 pub use connect::{parse_major, PgConnection, MIN_PG_MAJOR};
 pub use model::PgPlanPayload;
@@ -110,11 +111,8 @@ impl Source for PostgresSource {
         Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
     }
 
-    async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Transfer,
-            "rb-postgres: stream_out not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        source::stream_out(&self.params, plan, sink).await
     }
 
     async fn fingerprint(&self) -> Result<String> {
