@@ -55,37 +55,26 @@ in this environment (no sudo/netns/Docker); must run on a host with privileges.
 block `serve_control`'s select so the reaper can't fire. Recv-deadline reaper is the
 spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening).
 
-**Phase 2 (PostgreSQL) — in progress.** See the per-sub-phase status block under
-§"Phase 2" below. Done so far: **2.1** (connect+version), **2.2** (read-only
-introspection → `PgPlanPayload`), **2.3** (DDL reconstruction, golden-tested),
-**2.4** (`source.rs` `stream_out`: binary `COPY` → chunked `ChunkSink`),
-**2.5** (`dest.rs` `validate`: preflight), **2.6** (`dest.rs` `stream_in`:
-restore — DDL order + `COPY FROM STDIN` data load).
+**Phase 2 (PostgreSQL) — code-complete.** All sub-phases 2.1–2.8 implemented;
+`bash scripts/gates.sh` green. 2.1–2.7 are unit/golden-tested in-process; 2.8 is
+the live e2e (`e2e/postgres_matrix.sh`), runnable only on a Docker host. See the
+per-sub-phase status block under §"Phase 2".
 
-Plus **2.7** (`immutability.rs`: source fingerprint + connection-level read-only
-enforcement). **Only 2.8 (e2e matrix, Docker) remains** — script-only in this env.
+**⚠ The live SQL paths — introspection (2.2), restore (2.6), fingerprint (2.7) —
+are UNVERIFIED in this DB-less env.** The DDL/fingerprint/plan COMPOSITION is
+golden/unit-tested, but the actual catalog/`COPY` SQL has NEVER run against a real
+server here. **Before trusting Phase 2, on a Docker host run:**
+`bash e2e/postgres_introspect.sh 16` then `bash e2e/postgres_matrix.sh 10 12 14 16 18`
+and fix whatever the live runs surface. The CLI run-path is fully wired
+(`rust-backup server` + `postgres source|destination … --no-udp --admin --yes`).
 
-**⚠ Live restore + introspection (2.2/2.6/2.7 SQL) are UNVERIFIED here** (no DB).
-The DDL/fingerprint COMPOSITION is golden/unit-tested; the live backup→restore→
-diff loop + mid-abort immutability is the 2.8 `e2e/postgres_matrix.sh` — run it on
-a Docker host before trusting the SQL.
-
-**⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
-SQL is written to be version-robust but must be checked by running
-`bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
-(2.3 DDL is pure → fully unit-verified here via goldens.)
-
-**▶ NEXT: Phase 2.8 — `e2e/postgres_matrix.sh`** (T-PG-MATRIX, T-PG-IMMUT): for pg
-10/12/14/16/18 in Docker — seed a source, run the full backup→restore over the
-relay using the `rust-backup` binary (server + source + destination), diff row
-counts + checksums, and assert the source fingerprint is unchanged including a
-run aborted at ~50%. SCRIPT-ONLY here (no Docker/privileges in this env); the
-script is the deliverable + must be run on a capable host. This likely needs the
-CLI run-path wired (see Phase 7); if the binary can't yet drive a postgres
-source→destination session, note the gap and scope the script to what works
-(e.g. analyze/plan + the gated introspect/restore tests) until Phase 7 lands.
-Module crates depend only on `rb-core`; never edit core to add a backend
-(I-MODULAR).
+**▶ NEXT: Phase 3 — MongoDB module** (`crates/rb-mongodb`, currently a stub).
+Mirrors the postgres shape: connect + version probe (reject < 4), introspect →
+`MongoPlanPayload`, BSON streaming (`find({})` cursor → `ChunkSink`), restore
+(`insert_many` batched), immutability fingerprint. `mongodb = "3"` (pure Rust).
+Same testing discipline: pure logic unit-tested here; live paths behind a gated
+test (`RUST_BACKUP_MONGO_URI`) + an e2e script. Module crates depend only on
+`rb-core`; never edit core to add a backend (I-MODULAR).
 
 **Build/test:** `cargo build --all-features` · `cargo build --no-default-features`
 (relay-only, no quinn) · `cargo test --all-features` · `bash scripts/gates.sh` (full).
@@ -393,7 +382,14 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > accidental write fails at the server (introspect/source/fingerprint switched
 > over). 4 pure unit tests (compose determinism/order-independence/drift,
 > normalize zeroes estimates, catalog hash ignores estimate drift but not
-> structure). Live catalog/COUNT + mid-abort stability via 2.8. · 2.8 ⏳ pending.
+> structure). Live catalog/COUNT + mid-abort stability via 2.8.
+> 2.8 ✅ done (script-only here) — `e2e/postgres_matrix.sh` (T-PG-MATRIX +
+> T-PG-IMMUT): per major (default 16; pass `10 12 14 16 18`) two Docker pg
+> containers, seed source, full backup→restore over the relay via the real
+> `rust-backup` binary (server + source + destination, `--no-udp`), then asserts:
+> source unchanged after an aborted transfer, source unchanged after the full run,
+> destination data checksums match source, destination schema (`pg_dump -s`)
+> matches. Bash-syntax-checked; RUN ON A DOCKER HOST to actually verify Phase 2.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.

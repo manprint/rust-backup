@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# T-PG-MATRIX + T-PG-IMMUT (plan Phase 2.8): full backup -> restore -> diff over
+# the relay, across PostgreSQL majors, plus the source-immutability assertion
+# (incl. a run aborted mid-transfer).
+#
+# For each major: two Docker PostgreSQL containers (source seeded, destination
+# empty), then `rust-backup server` + `postgres source` + `postgres destination`
+# move the cluster over the relay; finally schema + per-table data checksums are
+# compared and the source is proven unchanged.
+#
+# Usage:  bash e2e/postgres_matrix.sh [MAJOR ...]   (default: 16)
+# Needs:  docker, cargo. No sudo. Relay-only (--no-udp) for CI determinism.
+# Exits non-zero on any failure.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+MAJORS=("${@:-16}")
+PASS=0
+FAIL=0
+BIN="./target/release/rust-backup"
+PASSWORD="rbpg"
+CTRL_PORT=7835
+
+CONTAINERS=()
+PIDS=()
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
+  for c in "${CONTAINERS[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+}
+trap cleanup EXIT INT TERM
+
+echo "==> building release binary"
+cargo build --release --all-features
+
+start_pg() { # name port -> starts container, waits ready
+  local name="$1" port="$2"
+  docker run -d --name "$name" -e POSTGRES_PASSWORD="$PASSWORD" \
+    -p "${port}:5432" "postgres:${MAJOR}-alpine" >/dev/null
+  CONTAINERS+=("$name")
+  for _ in $(seq 1 30); do
+    docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  echo "FAIL: $name not ready"; return 1
+}
+
+seed_source() { # container
+  docker exec -i "$1" psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE app_owner LOGIN PASSWORD 'x';
+CREATE ROLE readers;
+GRANT readers TO app_owner;
+CREATE DATABASE appdb OWNER app_owner;
+\connect appdb
+CREATE SCHEMA app AUTHORIZATION app_owner;
+CREATE TABLE app.accounts (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email text NOT NULL UNIQUE,
+  status text NOT NULL DEFAULT 'active'
+);
+CREATE TABLE app.orders (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  acct bigint NOT NULL REFERENCES app.accounts (id),
+  total numeric(12,2) NOT NULL
+);
+CREATE INDEX orders_acct_idx ON app.orders (acct);
+INSERT INTO app.accounts (email) SELECT 'u'||g||'@x' FROM generate_series(1,500) g;
+INSERT INTO app.orders (acct, total)
+  SELECT (random()*499)::int + 1, (random()*1000)::numeric(12,2) FROM generate_series(1,2000);
+SQL
+}
+
+# Per-table data checksum (order-independent within a table).
+data_checksum() { # container db
+  docker exec "$1" psql -U postgres -d "$2" -At -F'|' -c "
+    SELECT n.nspname||'.'||c.relname
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.relkind='r' AND n.nspname='app' ORDER BY 1" | while read -r tbl; do
+      sum=$(docker exec "$1" psql -U postgres -d "$2" -At -c \
+        "SELECT coalesce(md5(string_agg(md5(t::text), '' ORDER BY t::text)),'') FROM ${tbl} t")
+      cnt=$(docker exec "$1" psql -U postgres -d "$2" -At -c "SELECT count(*) FROM ${tbl}")
+      echo "${tbl}|${cnt}|${sum}"
+    done
+}
+
+schema_dump() { # container db
+  docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
+    | grep -vE '^--|^$|^SET |^SELECT pg_catalog'
+}
+
+run_transfer() { # src_port dst_port channel [abort]
+  local src_port="$1" dst_port="$2" channel="$3" abort="${4:-}"
+  "$BIN" server --bind-addr 127.0.0.1 --control-port "$CTRL_PORT" >/tmp/rb-server.log 2>&1 &
+  local server_pid=$!; PIDS+=("$server_pid")
+  sleep 1
+
+  # Source registers as provider first, then destination consumes.
+  "$BIN" postgres source --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
+    --no-udp --insecure --host 127.0.0.1 --port "$src_port" --user postgres \
+    --password "$PASSWORD" --database appdb --sslmode disable >/tmp/rb-src.log 2>&1 &
+  local src_pid=$!; PIDS+=("$src_pid")
+
+  if [[ "$abort" == "abort" ]]; then
+    sleep 2; kill -9 "$src_pid" >/dev/null 2>&1 || true
+    kill "$server_pid" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  sleep 2
+  "$BIN" postgres destination --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
+    --no-udp --insecure --yes --admin --host 127.0.0.1 --port "$dst_port" --user postgres \
+    --password "$PASSWORD" --sslmode disable >/tmp/rb-dst.log 2>&1 &
+  local dst_pid=$!; PIDS+=("$dst_pid")
+
+  wait "$src_pid"; local src_rc=$?
+  wait "$dst_pid"; local dst_rc=$?
+  kill "$server_pid" >/dev/null 2>&1 || true
+  [[ $src_rc -eq 0 && $dst_rc -eq 0 ]]
+}
+
+for MAJOR in "${MAJORS[@]}"; do
+  echo "================  PostgreSQL ${MAJOR}  ================"
+  SRC="rb-pg-src-${MAJOR}-$$"; DST="rb-pg-dst-${MAJOR}-$$"
+  SRC_PORT=$((55000 + MAJOR)); DST_PORT=$((56000 + MAJOR))
+
+  start_pg "$SRC" "$SRC_PORT"
+  start_pg "$DST" "$DST_PORT"
+  seed_source "$SRC"
+
+  # Source fingerprint before any transfer (external immutability baseline).
+  fp_before=$(data_checksum "$SRC" appdb)
+
+  # 1) Mid-transfer abort must not mutate the source (T-PG-IMMUT).
+  run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-abort-${MAJOR}" abort || true
+  fp_after_abort=$(data_checksum "$SRC" appdb)
+  if [[ "$fp_before" == "$fp_after_abort" ]]; then
+    echo "PASS: source unchanged after aborted transfer"; PASS=$((PASS+1))
+  else
+    echo "FAIL: source mutated by aborted transfer"; FAIL=$((FAIL+1))
+  fi
+
+  # 2) Full backup -> restore.
+  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-${MAJOR}"; then
+    echo "PASS: transfer completed"; PASS=$((PASS+1))
+  else
+    echo "FAIL: transfer failed (see /tmp/rb-*.log)"; FAIL=$((FAIL+1)); continue
+  fi
+
+  # 3) Source still unchanged after the full run.
+  fp_after=$(data_checksum "$SRC" appdb)
+  if [[ "$fp_before" == "$fp_after" ]]; then
+    echo "PASS: source unchanged after full transfer"; PASS=$((PASS+1))
+  else
+    echo "FAIL: source mutated by full transfer"; FAIL=$((FAIL+1))
+  fi
+
+  # 4) Destination data matches source 1:1.
+  if [[ "$(data_checksum "$SRC" appdb)" == "$(data_checksum "$DST" appdb)" ]]; then
+    echo "PASS: destination data matches source"; PASS=$((PASS+1))
+  else
+    echo "FAIL: destination data differs"; FAIL=$((FAIL+1))
+  fi
+
+  # 5) Destination schema matches source.
+  if diff <(schema_dump "$SRC" appdb) <(schema_dump "$DST" appdb) >/tmp/rb-schema.diff; then
+    echo "PASS: destination schema matches source"; PASS=$((PASS+1))
+  else
+    echo "FAIL: schema differs (see /tmp/rb-schema.diff)"; FAIL=$((FAIL+1))
+  fi
+
+  docker rm -f "$SRC" "$DST" >/dev/null 2>&1 || true
+done
+
+echo "================================================"
+echo "PASS=${PASS}  FAIL=${FAIL}"
+[[ $FAIL -eq 0 ]]
