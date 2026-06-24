@@ -55,9 +55,12 @@ in this environment (no sudo/netns/Docker); must run on a host with privileges.
 block `serve_control`'s select so the reaper can't fire. Recv-deadline reaper is the
 spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening).
 
-**▶ NEXT: Phase 2 — PostgreSQL module** (`crates/rb-postgres`, currently a
-`not-implemented` stub). Build per §"Phase 2" below. Module crates depend only on
-`rb-core`; never edit core to add a backend (I-MODULAR).
+**Phase 2 (PostgreSQL) — in progress.** See the per-sub-phase status block under
+§"Phase 2" below. Done so far: **2.1** (connect + version probe).
+
+**▶ NEXT: Phase 2.2 — `introspect.rs`** (catalog → `PgPlanPayload`, OPUS GATE).
+Module crates depend only on `rb-core`; never edit core to add a backend
+(I-MODULAR).
 
 **Build/test:** `cargo build --all-features` · `cargo build --no-default-features`
 (relay-only, no quinn) · `cargo test --all-features` · `bash scripts/gates.sh` (full).
@@ -311,6 +314,18 @@ subcommand; relay channel moves bytes in an in-process e2e.
 
 > `tokio-postgres = "0.7"`. Supports pg 10..=latest via protocol v3. Logical
 > approach: catalog introspection + `COPY … (FORMAT binary)` streaming.
+
+> **Status** *(2026-06-24)* — gates green; DB-backed e2e is script-only here
+> (no Docker/live pg in this env), so each sub-phase ships real unit tests now +
+> a live test gated on `RUST_BACKUP_PG_HOST` (skips cleanly when unset).
+> 2.1 ✅ done — `connect.rs`: `PgConnection::connect` (NoTls; sslmode
+> disable/allow/prefer OK, verifying modes rejected w/ clear error → TLS
+> follow-up), `parse_major`, `MIN_PG_MAJOR`=10, reject < 10. Tests: 5 unit
+> (`parse_major` ×3, sslmode gate ×2) + `tests/connect_live.rs` (gated). ·
+> 2.2–2.8 ⏳ pending.
+>
+> **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
+> so `require`/`verify-ca`/`verify-full` work; today they error out.
 
 - **2.1** *(Sonnet)* — `rb-postgres/Cargo.toml` add `tokio-postgres`, `postgres-protocol`;
   `connect.rs` read-only connect (source) / admin connect (dest); server version probe

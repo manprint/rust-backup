@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "rust-backup postgres module (stub)"
+description = "rust-backup postgres module (PostgreSQL 10..=latest, logical, pure Rust)"
 
 [dependencies]
 rb-core = { path = "../rb-core" }
@@ -13,6 +13,5 @@ async-trait.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 tracing.workspace = true
-
-# Phase 2: tokio-postgres = "0.7" (PostgreSQL 10..=latest, pure Rust, logical backup)

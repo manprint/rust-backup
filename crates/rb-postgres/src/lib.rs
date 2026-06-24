@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! rust-backup postgres module (stub).
+//! rust-backup PostgreSQL module.
 //!
-//! Provides typed parameter handling and plan shape for PostgreSQL backups.
-//! Real backup/restore logic lands in Phase 2.
+//! Logical, pure-Rust backup/restore for PostgreSQL 10..=latest via catalog
+//! introspection + binary `COPY` streaming (no `pg_dump`). Built phase by phase
+//! per `docs/plans/RUST_BACKUP_PLAN.md` §"Phase 2".
+
+mod connect;
+
+pub use connect::{parse_major, PgConnection, MIN_PG_MAJOR};
 
 use std::sync::Arc;
 
