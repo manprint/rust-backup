@@ -7,6 +7,7 @@
 //! per `docs/plans/RUST_BACKUP_PLAN.md` §"Phase 2".
 
 mod connect;
+pub mod ddl;
 mod introspect;
 mod model;
 

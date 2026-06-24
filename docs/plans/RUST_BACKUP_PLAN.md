@@ -56,16 +56,20 @@ block `serve_control`'s select so the reaper can't fire. Recv-deadline reaper is
 spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening).
 
 **Phase 2 (PostgreSQL) — in progress.** See the per-sub-phase status block under
-§"Phase 2" below. Done so far: **2.1** (connect + version probe), **2.2**
-(read-only catalog introspection → `PgPlanPayload` + `build_plan`).
+§"Phase 2" below. Done so far: **2.1** (connect+version), **2.2** (read-only
+introspection → `PgPlanPayload`), **2.3** (DDL reconstruction, golden-tested).
 
 **⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
 SQL is written to be version-robust but must be checked by running
 `bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
+(2.3 DDL is pure → fully unit-verified here via goldens.)
 
-**▶ NEXT: Phase 2.3 — `ddl.rs`** (reconstruct DDL from `PgPlanPayload`; golden
-tests, OPUS GATE). The model (`src/model.rs`) is the fixed contract; a fully
-populated `model::test_fixture()` is the reference cluster for DDL goldens.
+**▶ NEXT: Phase 2.4 — `source.rs` `stream_out`**: per data-bearing item (from
+`build_plan`) run `COPY (SELECT cols) TO STDOUT (FORMAT binary)` via
+tokio-postgres `copy_out`, chunk into the `ChunkSink` (≤1 MiB, no temp). The
+item `meta` already carries `{database, schema, table, columns}` and the COPY
+column list (generated columns omitted). Make the chunking unit-testable with an
+in-memory sink + a synthetic byte stream (decouple from a live DB).
 Module crates depend only on `rb-core`; never edit core to add a backend
 (I-MODULAR).
 
@@ -338,7 +342,17 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > skips child partitions, omits generated cols from COPY list; `now_rfc3339`).
 > Tests: serde roundtrip ×2, `build_plan` ×2, rfc3339 vectors, all run;
 > `tests/introspect_live.rs` + `e2e/postgres_introspect.sh` (gated/Docker).
-> · 2.3–2.8 ⏳ pending.
+> 2.3 ✅ done — `ddl.rs` (pure, golden-tested): `build_cluster_ddl(payload)` →
+> `ClusterDdl{roles, databases, per_database:[DatabaseDdl{pre_data, post_data}]}`.
+> Emitters for roles/memberships/tablespaces/databases (+GUCs), extensions,
+> schemas, tables (columns only — UNLOGGED, identity/generated/defaults/collation,
+> PARTITION BY/OF, reloptions, tablespace), constraints (non-FK before FK),
+> indexes (skips constraint-backed), sequences (+OWNED BY/setval), views,
+> functions (verbatim from `pg_get_functiondef`), comments, owners, ACL→GRANT
+> (priv-letter map + WITH GRANT OPTION). Tables created bare; constraints/indexes
+> deferred to post_data so COPY loads fast. 9 goldens (hand-written expected SQL,
+> not echoes) all run. ACL/GUC rendering best-effort (verified by e2e apply, 2.6).
+> · 2.4–2.8 ⏳ pending.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.
