@@ -10,7 +10,7 @@ description = "rust-backup transport: coordination server + paired byte-channel 
 default = ["udp"]
 # Direct peer-to-peer path via UDP hole-punching carried over QUIC, with relay
 # fallback. Mirrors bore's `udp` feature. Build --no-default-features to drop it.
-udp = ["dep:quinn", "dep:rcgen"]
+udp = ["dep:quinn", "dep:rcgen", "dep:nix"]
 
 [dependencies]
 rb-core = { path = "../rb-core" }
@@ -36,6 +36,7 @@ webpki-roots.workspace = true
 yamux.workspace = true
 quinn = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
+nix = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

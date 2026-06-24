@@ -24,10 +24,8 @@ use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use tokio::time::{interval, MissedTickBehavior};
-#[cfg(feature = "udp")]
-use tracing::debug;
-use tracing::{error, info, info_span, trace, warn, Instrument};
+use tokio::time::{interval, Instant as TokioInstant, MissedTickBehavior};
+use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
 use crate::admin::{ActiveGuard, AdminRegistry, NewEntry, Registration, Role};
 use crate::auth::Authenticator;
@@ -43,6 +41,22 @@ use uuid::Uuid;
 
 /// Heartbeat interval on secret-tunnel control substreams.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long the server waits for *any* control frame from a secret
+/// provider/consumer before reaping the connection (and its admin entry). The
+/// control channel is a yamux substream, so a half-open/abandoned peer is
+/// invisible to `send`/`recv`; without this deadline the loop blocks forever on
+/// `recv` and the RAII admin `Registration` never drops — a zombie entry. The
+/// client sends [`ClientMessage::Heartbeat`] every [`CTRL_CLIENT_HEARTBEAT`] so a
+/// healthy idle tunnel always beats this. Parity with the VPN
+/// `CTRL_HEARTBEAT_TIMEOUT` (60 s). Overridable per-server (see
+/// [`crate::server::Server::secret_ctrl_timeout`]) so tests can reap fast.
+pub(crate) const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often a secret provider/consumer *client* sends [`ClientMessage::Heartbeat`]
+/// up the control substream. Must stay well under [`SECRET_CTRL_TIMEOUT`] so a
+/// few lost frames never trip the server's reaper.
+pub(crate) const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 
 /// How long a consumer waits for the server to broker a UDP direct path before
 /// falling back to the relay.
@@ -179,6 +193,61 @@ impl Drop for Deregister {
     }
 }
 
+/// Display-only flag/parameter bundle carried by `HelloSecret`/`ConnectSecret`
+/// for the admin status page. None of these affect the data path; they are
+/// captured into the admin [`crate::admin::Entry`] so the dashboard can show
+/// every flag a secret provider/consumer was launched with (flag-parity).
+pub struct SecretDisplay {
+    /// `--udp` (direct path requested).
+    pub udp: bool,
+    /// `--auto-reconnect`.
+    pub auto_reconnect: bool,
+    /// `--webserver-log` enabled (provider only).
+    pub webserver_log: bool,
+    /// `--nat-udp-preferred-port` (0 = unset).
+    pub nat_udp_preferred_port: u16,
+    /// `--nat-udp-release-timeout` seconds.
+    pub nat_udp_release_timeout: u64,
+    /// `--stun-server`, if any.
+    pub stun_server: Option<String>,
+    /// `--upnp`.
+    pub upnp: bool,
+    /// `--try-port-prediction`.
+    pub try_port_prediction: bool,
+    /// `--max-conns` (provider only; 0 = unset/default).
+    pub max_conns: usize,
+    /// `-l/--local-host` (provider local target).
+    pub local_host: Option<String>,
+    /// Provider local target port (0 = unknown).
+    pub local_port: u16,
+    /// Consumer `--local-proxy-port` (0 = unset).
+    pub local_proxy_port: u16,
+    /// `--carriers` requested.
+    pub carriers: u16,
+}
+
+impl SecretDisplay {
+    /// Apply the display-only fields onto a [`NewEntry`] under construction.
+    fn fill(self, mut new: NewEntry) -> NewEntry {
+        new.udp = self.udp;
+        new.auto_reconnect = self.auto_reconnect;
+        new.webserver_log = self.webserver_log;
+        new.carriers = self.carriers;
+        new.nat_udp_preferred_port =
+            (self.nat_udp_preferred_port != 0).then_some(self.nat_udp_preferred_port);
+        new.nat_udp_release_timeout =
+            (self.nat_udp_release_timeout != 0).then_some(self.nat_udp_release_timeout);
+        new.stun_server = self.stun_server;
+        new.upnp = self.upnp;
+        new.try_port_prediction = self.try_port_prediction;
+        new.max_conns = (self.max_conns != 0).then_some(self.max_conns);
+        new.local_host = self.local_host;
+        new.local_port = (self.local_port != 0).then_some(self.local_port);
+        new.local_proxy_port = (self.local_proxy_port != 0).then_some(self.local_proxy_port);
+        new
+    }
+}
+
 /// Server side: register this connection as the provider for `id`, then keep it
 /// alive with heartbeats until it disconnects (which deregisters it).
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +265,8 @@ pub async fn serve_provider(
     max_carriers: u16,
     carriers: u16,
     udp_tuning: UdpDirectTuning,
+    display: SecretDisplay,
+    ctrl_timeout: Duration,
 ) -> Result<()> {
     // Register atomically, rejecting a duplicate id rather than hijacking it. The
     // registration is a carrier pool seeded with this connection's opener; extra
@@ -219,7 +290,7 @@ pub async fn serve_provider(
         id: id.clone(),
     };
     // Live admin entry for this provider; dropped (removed) when it disconnects.
-    let admin_reg = admin.register(NewEntry {
+    let admin_reg = admin.register(display.fill(NewEntry {
         role: Role::SecretProvider,
         peer,
         secret_id: Some(id.clone()),
@@ -240,7 +311,16 @@ pub async fn serve_provider(
         vpn_route_policy: None,
         vpn_advertised: vec![],
         vpn_nat_udp_port: None,
-    });
+        local_proxy_port: None,
+        local_host: None,
+        local_port: None,
+        nat_udp_preferred_port: None,
+        nat_udp_release_timeout: None,
+        stun_server: None,
+        upnp: false,
+        try_port_prediction: false,
+        max_conns: None,
+    }));
     info!(%id, "secret provider registered");
     control.send(ServerMessage::Ok).await?;
 
@@ -273,15 +353,28 @@ pub async fn serve_provider(
     let mut offers: Option<mpsc::Receiver<UdpOffer>> = None;
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Liveness deadline: reaped if no client frame arrives within `ctrl_timeout`.
+    // Checked on every heartbeat tick (≤ HEARTBEAT_INTERVAL granularity) rather
+    // than via `timeout(recv)` — the latter would reset every time the heartbeat
+    // branch wins the `select!`, so it could never reach `ctrl_timeout`.
+    let mut last_recv = TokioInstant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
                     return Ok(());
                 }
+                if last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%id, timeout = ?ctrl_timeout,
+                        "secret provider control idle; reaping (peer wedged/abandoned)");
+                    return Ok(());
+                }
             }
             message = control.recv() => {
+                last_recv = TokioInstant::now();
                 match message? {
+                    // Liveness ping; the deadline reset above is its only effect.
+                    Some(ClientMessage::Heartbeat) => {}
                     Some(ClientMessage::UdpCandidates(candidates)) => {
                         register_provider_udp_offer(
                             &udp_registry,
@@ -358,44 +451,93 @@ pub async fn serve_consumer(
     udp_tuning: UdpDirectTuning,
     grx: Arc<std::sync::atomic::AtomicU64>,
     gtx: Arc<std::sync::atomic::AtomicU64>,
+    display: SecretDisplay,
+    ctrl_timeout: Duration,
+    carrier: bool,
 ) -> Result<()> {
-    info!(%id, "secret consumer connected");
+    if carrier {
+        debug!(%id, %peer, "secret consumer relay carrier connected (no admin entry, not reaped — liveness is owned by the consumer's main control connection)");
+    } else {
+        info!(%id, %peer, "secret consumer connected");
+    }
     control.send(ServerMessage::Ok).await?;
 
-    // Live admin entry for this consumer; dropped (removed) when it disconnects.
-    let admin_reg = admin.register(NewEntry {
-        role: Role::SecretConsumer,
-        peer,
-        secret_id: Some(id.clone()),
-        public_port: None,
-        notes,
-        basic_auth: false,
-        https: false,
-        force_https: false,
-        carriers: 0,
-        auto_reconnect: false,
-        webserver_log: false,
-        udp: false,
-        vpn_relay_only: false,
-        vpn_pin_mtu: false,
-        vpn_mtu: None,
-        vpn_forward_accept: false,
-        vpn_nat_masquerade: false,
-        vpn_route_policy: None,
-        vpn_advertised: vec![],
-        vpn_nat_udp_port: None,
-    });
-    let active = admin_reg.active();
-    // Per-tunnel relay byte counters for this consumer (shown on the admin page).
-    // Summed off the hot path, once per closed relayed substream.
-    let (relay_tx, relay_rx) = admin_reg.relay_bytes();
+    // A primary consumer registers a live admin entry (removed when it disconnects).
+    // An extra relay *carrier* (`--carriers N` opens N-1 of these) registers NOTHING
+    // and is never reaped (I-2/I-3): its data substreams are still accepted and
+    // relayed below, but it owns no admin row and its liveness is the main control
+    // connection's responsibility. The `carrier == false` path stays byte-identical
+    // to the previous behaviour (I-1).
+    let admin_reg = if carrier {
+        None
+    } else {
+        Some(admin.register(display.fill(NewEntry {
+            role: Role::SecretConsumer,
+            peer,
+            secret_id: Some(id.clone()),
+            public_port: None,
+            notes,
+            basic_auth: false,
+            https: false,
+            force_https: false,
+            carriers: 0,
+            auto_reconnect: false,
+            webserver_log: false,
+            udp: false,
+            vpn_relay_only: false,
+            vpn_pin_mtu: false,
+            vpn_mtu: None,
+            vpn_forward_accept: false,
+            vpn_nat_masquerade: false,
+            vpn_route_policy: None,
+            vpn_advertised: vec![],
+            vpn_nat_udp_port: None,
+            local_proxy_port: None,
+            local_host: None,
+            local_port: None,
+            nat_udp_preferred_port: None,
+            nat_udp_release_timeout: None,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            max_conns: None,
+        })))
+    };
+    let active = admin_reg
+        .as_ref()
+        .map(|r| r.active())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    // Per-tunnel relay byte counters for this consumer (shown on the admin page),
+    // summed off the hot path once per closed relayed substream. A carrier owns no
+    // entry, so it gets throwaway counters here; its bytes still count toward the
+    // global server totals inside `relay()`.
+    let (relay_tx, relay_rx) = admin_reg
+        .as_ref()
+        .map(|r| r.relay_bytes())
+        .unwrap_or_else(|| {
+            (
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+        });
 
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Liveness deadline: reaped if no client frame arrives within `ctrl_timeout`.
+    // Checked on the heartbeat tick, not via `timeout(recv)` (which the heartbeat
+    // branch would reset every iteration so it never reaches `ctrl_timeout`).
+    let mut last_recv = TokioInstant::now();
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if control.send(ServerMessage::Heartbeat).await.is_err() {
+                    return Ok(());
+                }
+                // Carriers are never reaped (they send no heartbeats by design —
+                // their liveness is the main control connection's job, I-2).
+                if !carrier && last_recv.elapsed() >= ctrl_timeout {
+                    warn!(%id, %peer, timeout = ?ctrl_timeout,
+                        "secret consumer control idle; reaping (peer wedged/abandoned)");
                     return Ok(());
                 }
             }
@@ -403,12 +545,17 @@ pub async fn serve_consumer(
             // the registered provider (if it is UDP-capable) and reply with the
             // provider's candidates + a shared nonce, else say it is unavailable.
             message = control.recv() => {
+                last_recv = TokioInstant::now();
                 match message? {
+                    // Liveness ping; the deadline reset above is its only effect.
+                    Some(ClientMessage::Heartbeat) => {}
                     Some(ClientMessage::UdpCandidates(consumer_cands)) => {
                         // Flag for the admin page that this consumer attempted a
                         // direct path (success is established peer-to-peer, off the
                         // server, so the relay can only record the attempt).
-                        admin_reg.mark_udp();
+                        if let Some(reg) = &admin_reg {
+                            reg.mark_udp();
+                        }
                         broker_udp(
                             &mut control,
                             &udp_registry,
@@ -419,7 +566,9 @@ pub async fn serve_consumer(
                         .await?;
                     }
                     Some(ClientMessage::UdpCandidateOffer(consumer_offer)) => {
-                        admin_reg.mark_udp();
+                        if let Some(reg) = &admin_reg {
+                            reg.mark_udp();
+                        }
                         broker_udp(&mut control, &udp_registry, &id, consumer_offer, udp_tuning)
                             .await?;
                     }
@@ -555,8 +704,34 @@ async fn relay(
         Some(pool) => pool,
         None => bail!("no provider registered for '{id}'"),
     };
-    let opener = pool.pick().context("no live provider carrier")?;
-    let mut provider = opener.open().await.context("provider unavailable")?;
+    // Fail over across live provider carriers (D5): a carrier can die between
+    // `pick` (which prunes dead ones under the lock) and `open` (the connection
+    // breaking is observed asynchronously), so try up to the pool size before
+    // dropping this forwarded connection. `pick` round-robins, so successive
+    // attempts hit different carriers.
+    let attempts = pool.len().max(1);
+    let mut provider = None;
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let Some(opener) = pool.pick() else { break };
+        match opener.open().await {
+            Ok(stream) => {
+                provider = Some(stream);
+                break;
+            }
+            Err(err) => {
+                trace!(%id, %err, "provider carrier open failed; trying next live carrier");
+                last_err = Some(err);
+            }
+        }
+    }
+    let mut provider = match provider {
+        Some(stream) => stream,
+        None => match last_err {
+            Some(err) => return Err(err).context("all provider carriers unavailable"),
+            None => bail!("no live provider carrier"),
+        },
+    };
     provider.write_all(&[mux::STREAM_READY]).await?;
 
     let buf = proxy_buffer_size();
@@ -750,6 +925,7 @@ impl Proxy {
         nat_udp_release_timeout: u64,
         carriers: u16,
         notes: Option<String>,
+        auto_reconnect: bool,
     ) -> Result<Self> {
         #[cfg(not(feature = "udp"))]
         let _ = nat_udp_release_timeout;
@@ -771,6 +947,16 @@ impl Proxy {
             .send(ClientMessage::ConnectSecret {
                 id: tcp_secret_id.to_string(),
                 notes,
+                carriers,
+                auto_reconnect,
+                udp,
+                local_proxy_port: bind_addr.port(),
+                nat_udp_preferred_port: udp_port,
+                nat_udp_release_timeout,
+                stun_server: stun_server.map(|s| s.to_string()),
+                upnp: port_map,
+                try_port_prediction: port_prediction,
+                carrier: false,
             })
             .await?;
         if let Some(secret) = secret {
@@ -819,6 +1005,17 @@ impl Proxy {
                 #[cfg(feature = "udp")]
                 Ok(Some(conn)) => {
                     info!(%tcp_secret_id, "using direct udp path");
+                    // The direct path uses a single QUIC connection (one stream per
+                    // proxied connection); `--carriers` only governs the relay
+                    // fallback. Warn rather than silently ignore the flag (D8).
+                    if carriers > 1 {
+                        warn!(
+                            %tcp_secret_id, carriers,
+                            "secret --udp direct path uses a single QUIC connection; \
+                             --carriers applies only to the relay fallback \
+                             (multi-connection direct is not supported)"
+                        );
+                    }
                     direct_closed_rx = Some(spawn_closed_monitor(conn.clone()));
                     data_path = DataPath::Direct(conn);
                     direct = true;
@@ -850,7 +1047,18 @@ impl Proxy {
                     warn!(%err, "failed to open extra relay carrier");
                 }
             }
-            info!(%tcp_secret_id, size = pool.len(), "consumer carrier pool established");
+            let opened = pool.len();
+            if (opened as u16) < carriers {
+                warn!(
+                    %tcp_secret_id, requested = carriers, opened,
+                    "consumer relay carrier pool degraded: fewer carriers connected than requested"
+                );
+            } else {
+                info!(
+                    %tcp_secret_id, requested = carriers, opened,
+                    "consumer relay carrier pool established"
+                );
+            }
         }
 
         let listener = TcpListener::bind(bind_addr)
@@ -995,6 +1203,13 @@ impl Proxy {
         let mut upgrade_backoff = reconnect::Backoff::new_with(1, 1);
         #[cfg(not(feature = "udp"))]
         let mut upgrade_attempt = 0;
+        // Periodic liveness ping so the server's recv-deadline reaper never trips
+        // on a healthy idle consumer (a yamux substream hides a half-open peer).
+        let mut ctrl_heartbeat = {
+            let mut t = tokio::time::interval(CTRL_CLIENT_HEARTBEAT);
+            t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            t
+        };
         loop {
             // Kick off an upgrade attempt on the timer. Non-blocking: the attempt
             // runs in `upgrade_task`; this loop keeps accepting and forwarding.
@@ -1226,6 +1441,11 @@ impl Proxy {
                         }
                     }
                 }
+                _ = ctrl_heartbeat.tick() => {
+                    if control.send(ClientMessage::Heartbeat).await.is_err() {
+                        return Ok(());
+                    }
+                }
                 accepted = listener.accept() => {
                     let (local, addr) = match accepted {
                         Ok(pair) => pair,
@@ -1295,6 +1515,18 @@ async fn open_consumer_carrier(
         .send(ClientMessage::ConnectSecret {
             id: id.to_string(),
             notes: None,
+            carriers: 0,
+            auto_reconnect: false,
+            udp: false,
+            local_proxy_port: 0,
+            nat_udp_preferred_port: 0,
+            nat_udp_release_timeout: 0,
+            stun_server: None,
+            upnp: false,
+            try_port_prediction: false,
+            // This is an extra relay carrier of an existing consumer: the server
+            // must NOT register an admin entry for it and must NOT reap it (I-2).
+            carrier: true,
         })
         .await?;
     if let Some(secret) = secret {

@@ -70,6 +70,17 @@ against an in-memory channel.
   = one task); apply `tune_tcp` to every socket; `--max-conns` semaphore is the
   real bound. Direct path falls back to the warm relay per-connection; UDP never
   gates channel liveness.
+  - **Control heartbeat + recv-deadline reaper.** A yamux substream hides a
+    half-open peer, so liveness needs an app-level deadline. The provider sends
+    `Heartbeat` every `CTRL_CLIENT_HEARTBEAT` (20 s); the coord server reaps a
+    registry entry whose control substream has been silent for
+    `SECRET_CTRL_TIMEOUT` (60 s). Without this, a wedged/abandoned provider
+    zombies its channel id (`secret.rs`).
+  - **UDP hole-punch socket bind — never `SO_REUSEADDR`.** Bind the fixed/preferred
+    punch port plainly; on `EADDRINUSE` fall back to an ephemeral port. Two
+    wildcard UDP sockets that both set `SO_REUSEADDR` co-bind the same port and
+    steal each other's inbound datagrams — the concurrent-tunnel ~30 s flap
+    (BUG-S3, `holepunch.rs` `make_socket`/`bind_socket`).
 
 ## Model selection per task (target: minimize tokens)
 

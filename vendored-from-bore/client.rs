@@ -64,6 +64,13 @@ pub struct Client {
     /// Port that is publicly available on the remote.
     remote_port: u16,
 
+    /// Whether this client is a secret-tunnel **provider** (registered via
+    /// [`ClientMessage::HelloSecret`]). Only secret providers send periodic
+    /// [`ClientMessage::Heartbeat`] frames so the server's recv-deadline reaper
+    /// (`secret::SECRET_CTRL_TIMEOUT`) can detect a wedged/abandoned control
+    /// substream; public and vhost tunnels keep the legacy heartbeat-free path.
+    is_secret_provider: bool,
+
     /// UDP socket reserved for a direct hole-punched path; `Some` only for a
     /// secret provider that opted into the `udp` direct-path mode.
     #[cfg(feature = "udp")]
@@ -268,6 +275,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port,
+            is_secret_provider: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -339,6 +347,17 @@ impl Client {
                 notes: meta.notes.clone(),
                 basic_auth: meta.basic_auth.is_some(),
                 carriers,
+                udp,
+                auto_reconnect: meta.auto_reconnect,
+                webserver_log: access_logger.is_some(),
+                nat_udp_preferred_port: udp_port,
+                nat_udp_release_timeout,
+                stun_server: stun_server.map(|s| s.to_string()),
+                upnp: port_map,
+                try_port_prediction: port_prediction,
+                max_conns,
+                local_host: Some(local_host.to_string()),
+                local_port,
             })
             .await?;
         if let Some(secret) = secret {
@@ -446,6 +465,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
+            is_secret_provider: true,
             #[cfg(feature = "udp")]
             udp_socket,
             #[cfg(feature = "udp")]
@@ -556,6 +576,8 @@ impl Client {
                 udp,
                 webserver_log: access_logger.is_some(),
                 auto_reconnect: meta.auto_reconnect,
+                local_host: Some(local_host.to_string()),
+                local_port,
             })
             .await?;
 
@@ -634,6 +656,7 @@ impl Client {
             local_host: local_host.to_string(),
             local_port,
             remote_port: 0,
+            is_secret_provider: false,
             #[cfg(feature = "udp")]
             udp_socket: None,
             #[cfg(feature = "udp")]
@@ -719,6 +742,7 @@ impl Client {
         let mut preferred_port_remapped = false;
         #[cfg(feature = "udp")]
         let mut next_preferred_port_check = tokio::time::Instant::now();
+        let is_secret_provider = self.is_secret_provider;
         let this = Arc::new(self);
 
         // Carrier pool: pump each extra carrier's accepted data substreams into a
@@ -741,8 +765,22 @@ impl Client {
         // the whole session (the consumer already retries; the provider did not).
         // The first tick fires immediately, re-offering at once if needed.
         let mut udp_retry = tokio::time::interval(Duration::from_secs(15));
+        // Secret providers ping the server periodically so its recv-deadline
+        // reaper never trips on a healthy idle provider (a yamux substream hides
+        // a half-open peer). Public/vhost tunnels keep the legacy heartbeat-free
+        // path (branch disabled below).
+        let mut ctrl_heartbeat = {
+            let mut t = tokio::time::interval(crate::secret::CTRL_CLIENT_HEARTBEAT);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            t
+        };
         loop {
             tokio::select! {
+                _ = ctrl_heartbeat.tick(), if is_secret_provider => {
+                    if control.send(ClientMessage::Heartbeat).await.is_err() {
+                        return Ok(());
+                    }
+                }
                 // Drain the control substream so the server's heartbeats are read;
                 // this also surfaces server errors and connection teardown.
                 message = control.recv() => {
@@ -1495,10 +1533,13 @@ async fn provider_direct(
                             }
                         });
                     }
-                    // A single bad handshake (e.g. token mismatch from a stray
-                    // peer) must not tear down the listener; log and keep serving.
+                    // `accept()` now swallows benign hole-punch strays internally
+                    // (BUG-S3), so reaching here means an endpoint-level problem
+                    // (the QUIC endpoint closed). Back off briefly before retrying;
+                    // intentional teardown is handled by the `punch_rx` `None` arm.
+                    // Logged at debug — a closed endpoint during teardown is normal.
                     Err(err) => {
-                        warn!(%err, "direct udp accept failed (will retry in 100ms)");
+                        debug!(%err, "direct udp endpoint accept error; retrying in 100ms");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }

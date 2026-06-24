@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
-use tokio::time::interval;
+use tokio::sync::{oneshot, Semaphore};
+use tokio::time::{interval, Instant};
 use tracing::{error, info, info_span, warn, Instrument};
 
 use rb_core::config::ServerConfig;
@@ -21,8 +21,182 @@ use crate::proto::{ClientMsg, Delimited, ServerMsg};
 use crate::shared::{proxy_buffer_size, tune_tcp};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const UDP_BROKER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Control substream recv deadline: the coordination server reaps a registry
+/// entry whose control substream has been silent this long. A yamux substream
+/// hides a half-open peer, so liveness needs an app-level recv deadline; the
+/// provider/consumer must heartbeat well within it (see `CTRL_CLIENT_HEARTBEAT`).
+const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub type Registry = Arc<DashMap<String, Arc<CarrierPool>>>;
+
+/// Registry of UDP hole-punch matchmakers, keyed by channel id. Both the provider
+/// and the consumer task `or_insert` the same matchmaker, so it exists regardless
+/// of which side reaches the server first.
+pub type UdpRegistry = Arc<DashMap<String, Arc<UdpMatchmaker>>>;
+
+/// Cross-task rendezvous that exchanges the two peers' UDP hole-punch candidates.
+///
+/// Each side registers a one-shot sink for the *peer's* addresses and later offers
+/// its own. [`Self::try_match`] fires both sinks exactly once, the moment BOTH
+/// peers have offered — so the exchange is fully order-independent (provider-first
+/// or consumer-first). A side that never offers, or whose peer never offers,
+/// leaves its receiver pending; the owning task's broker deadline then sends
+/// `UdpUnavailable` and falls back to the relay.
+#[derive(Default)]
+pub struct UdpMatchmaker {
+    inner: std::sync::Mutex<UdpMatchInner>,
+}
+
+#[derive(Default)]
+struct UdpMatchInner {
+    provider_addrs: Option<Vec<SocketAddr>>,
+    consumer_addrs: Option<Vec<SocketAddr>>,
+    /// Delivers the consumer's addresses to the provider task.
+    to_provider: Option<oneshot::Sender<Vec<SocketAddr>>>,
+    /// Delivers the provider's addresses to the consumer task.
+    to_consumer: Option<oneshot::Sender<Vec<SocketAddr>>>,
+}
+
+impl UdpMatchmaker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, UdpMatchInner> {
+        // The critical sections are tiny and panic-free; recover from a poisoned
+        // lock rather than `unwrap`-panicking (no unwrap in production paths).
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Provider task: register the sink for the consumer's addresses.
+    pub fn register_provider(&self) -> oneshot::Receiver<Vec<SocketAddr>> {
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.lock();
+        g.to_provider = Some(tx);
+        Self::try_match(&mut g);
+        rx
+    }
+
+    /// Consumer task: register the sink for the provider's addresses.
+    pub fn register_consumer(&self) -> oneshot::Receiver<Vec<SocketAddr>> {
+        let (tx, rx) = oneshot::channel();
+        let mut g = self.lock();
+        g.to_consumer = Some(tx);
+        Self::try_match(&mut g);
+        rx
+    }
+
+    /// Provider task: record this side's offered candidates.
+    pub fn offer_provider(&self, addrs: Vec<SocketAddr>) {
+        let mut g = self.lock();
+        g.provider_addrs = Some(addrs);
+        Self::try_match(&mut g);
+    }
+
+    /// Consumer task: record this side's offered candidates.
+    pub fn offer_consumer(&self, addrs: Vec<SocketAddr>) {
+        let mut g = self.lock();
+        g.consumer_addrs = Some(addrs);
+        Self::try_match(&mut g);
+    }
+
+    /// Fire both sinks (each gets the *other* side's addresses) once both peers
+    /// have offered. Idempotent: the `take()`s ensure it delivers at most once.
+    fn try_match(g: &mut UdpMatchInner) {
+        let (Some(provider), Some(consumer)) = (&g.provider_addrs, &g.consumer_addrs) else {
+            return;
+        };
+        if let Some(tx) = g.to_provider.take() {
+            let _ = tx.send(consumer.clone());
+        }
+        if let Some(tx) = g.to_consumer.take() {
+            let _ = tx.send(provider.clone());
+        }
+    }
+}
+
+/// Which peer a shared control loop serves — selects the matchmaker sink.
+#[derive(Clone, Copy)]
+enum BrokerSide {
+    Provider,
+    Consumer,
+}
+
+/// Shared control-plane loop for both peers. Sends the server heartbeat, brokers
+/// the UDP hole-punch candidate exchange against [`UDP_BROKER_TIMEOUT`], and reaps
+/// the peer if its control substream is silent past `reap_timeout` — a yamux
+/// substream hides a half-open peer, so liveness needs this app-level recv
+/// deadline. Returns `Ok(())` when the peer disconnects or is reaped. `reap_timeout`
+/// is a parameter (not a global) so tests can drive it fast without racing.
+async fn serve_control<S>(
+    control: &mut Delimited<S>,
+    matchmaker: &Arc<UdpMatchmaker>,
+    side: BrokerSide,
+    id: &str,
+    reap_timeout: Duration,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut udp_rx = match side {
+        BrokerSide::Provider => matchmaker.register_provider(),
+        BrokerSide::Consumer => matchmaker.register_consumer(),
+    };
+    let udp_deadline = tokio::time::sleep(UDP_BROKER_TIMEOUT);
+    tokio::pin!(udp_deadline);
+    let mut udp_pending = true;
+
+    // Reset on every inbound frame; fires only after a full silent `reap_timeout`.
+    let reap = tokio::time::sleep(reap_timeout);
+    tokio::pin!(reap);
+
+    let mut heartbeat = interval(HEARTBEAT_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                if control.send_server(ServerMsg::Heartbeat).await.is_err() {
+                    return Ok(());
+                }
+            }
+            res = &mut udp_rx, if udp_pending => {
+                udp_pending = false;
+                if let Ok(peer_addrs) = res {
+                    info!(%id, peer_candidate_count = peer_addrs.len(), "received peer candidates");
+                    if control.send_server(ServerMsg::UdpPunch { peer_addrs }).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            _ = &mut udp_deadline, if udp_pending => {
+                udp_pending = false;
+                warn!(%id, "udp broker timeout; falling back to relay");
+                if control.send_server(ServerMsg::UdpUnavailable).await.is_err() {
+                    return Ok(());
+                }
+            }
+            _ = &mut reap => {
+                warn!(%id, "control substream silent past deadline; reaping channel");
+                return Ok(());
+            }
+            msg = control.recv_client() => {
+                // Any inbound frame proves the peer is alive — push the reap deadline.
+                reap.as_mut().reset(Instant::now() + reap_timeout);
+                match msg? {
+                    Some(ClientMsg::Heartbeat) => {}
+                    Some(ClientMsg::UdpCandidateOffer { addrs }) => {
+                        info!(%id, candidate_count = addrs.len(), "peer offered udp candidates");
+                        match side {
+                            BrokerSide::Provider => matchmaker.offer_provider(addrs),
+                            BrokerSide::Consumer => matchmaker.offer_consumer(addrs),
+                        }
+                    }
+                    Some(_) => warn!(%id, "unexpected control message"),
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
 
 pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
     let addr = format!("{}:{}", cfg.bind_addr, cfg.control_port);
@@ -34,6 +208,7 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
     let registry = Arc::new(DashMap::new());
     let max_conns = Arc::new(Semaphore::new(cfg.max_conns));
     let pending_carriers = Arc::new(DashMap::new());
+    let udp_registry = Arc::new(DashMap::new());
     let auth = cfg.secret.as_ref().map(|s| Authenticator::new(s));
 
     loop {
@@ -43,6 +218,7 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                 let registry = Arc::clone(&registry);
                 let max_conns = Arc::clone(&max_conns);
                 let pending_carriers = Arc::clone(&pending_carriers);
+                let udp_registry = Arc::clone(&udp_registry);
                 let auth_opt = auth.clone();
                 tokio::spawn(
                     handle_conn(
@@ -51,6 +227,7 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                         registry,
                         max_conns,
                         pending_carriers,
+                        udp_registry,
                         auth_opt,
                     )
                     .instrument(info_span!("client", %peer)),
@@ -69,6 +246,7 @@ async fn handle_conn(
     registry: Registry,
     max_conns: Arc<Semaphore>,
     pending_carriers: PendingCarriers,
+    udp_registry: UdpRegistry,
     auth: Option<Authenticator>,
 ) -> Result<()> {
     // The CLIENT opens the control substream and sends Register/Connect FIRST —
@@ -92,10 +270,28 @@ async fn handle_conn(
 
     match first {
         Some(ClientMsg::Register { channel }) => {
-            serve_provider(control, opener, registry, channel, peer, pending_carriers).await
+            serve_provider(
+                control,
+                opener,
+                registry,
+                udp_registry,
+                channel,
+                peer,
+                pending_carriers,
+            )
+            .await
         }
         Some(ClientMsg::Connect { channel }) => {
-            serve_consumer(control, acceptor, registry, channel, peer, max_conns).await
+            serve_consumer(
+                control,
+                acceptor,
+                registry,
+                udp_registry,
+                channel,
+                peer,
+                max_conns,
+            )
+            .await
         }
         Some(msg) => {
             warn!(?msg, "unexpected message before register/connect");
@@ -112,6 +308,7 @@ async fn serve_provider(
     mut control: Delimited<mux::Stream>,
     opener: mux::Opener,
     registry: Registry,
+    udp_registry: UdpRegistry,
     id: String,
     _peer: SocketAddr,
     _pending_carriers: PendingCarriers,
@@ -128,35 +325,38 @@ async fn serve_provider(
     registry.insert(id.clone(), Arc::clone(&pool));
     let _guard = DropGuard {
         registry: Arc::clone(&registry),
+        udp_registry: Arc::clone(&udp_registry),
         id: id.clone(),
     };
 
     control.send_server(ServerMsg::Ok).await?;
     info!(%id, "provider registered");
 
-    let mut heartbeat = interval(HEARTBEAT_INTERVAL);
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                if control.send_server(ServerMsg::Heartbeat).await.is_err() {
-                    return Ok(());
-                }
-            }
-            msg = control.recv_client() => {
-                match msg? {
-                    Some(ClientMsg::Heartbeat) => {}
-                    Some(_) => warn!(%id, "unexpected message from provider"),
-                    None => return Ok(()),
-                }
-            }
-        }
-    }
+    // UDP hole-punch brokering + control-plane liveness run in the shared control
+    // loop. The matchmaker is shared with the consumer task via the registry
+    // (created by whichever side arrives first); the relay path is unaffected.
+    // When this returns, `_guard` drops and removes the registry entries — so a
+    // reaped/disconnected provider releases its channel id.
+    let matchmaker = udp_registry
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(UdpMatchmaker::default()))
+        .clone();
+
+    serve_control(
+        &mut control,
+        &matchmaker,
+        BrokerSide::Provider,
+        &id,
+        SECRET_CTRL_TIMEOUT,
+    )
+    .await
 }
 
 async fn serve_consumer(
     mut control: Delimited<mux::Stream>,
     mut acceptor: mux::Acceptor,
     registry: Registry,
+    udp_registry: UdpRegistry,
     id: String,
     _peer: SocketAddr,
     max_conns: Arc<Semaphore>,
@@ -164,48 +364,54 @@ async fn serve_consumer(
     control.send_server(ServerMsg::Ok).await?;
     info!(%id, "consumer connected");
 
-    let mut heartbeat = interval(HEARTBEAT_INTERVAL);
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                if control.send_server(ServerMsg::Heartbeat).await.is_err() {
-                    return Ok(());
-                }
-            }
-            msg = control.recv_client() => {
-                match msg? {
-                    Some(ClientMsg::Heartbeat) => {}
-                    Some(_) => warn!(%id, "unexpected message from consumer"),
-                    None => return Ok(()),
-                }
-            }
-            inbound = acceptor.accept() => {
-                let Some(consumer_stream) = inbound else {
-                    return Ok(());
-                };
-                let permit = match Arc::clone(&max_conns).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        warn!(%id, "too many active connections, dropping");
-                        continue;
-                    }
-                };
-                let registry = Arc::clone(&registry);
-                let id = id.clone();
-                tokio::spawn(
-                    async move {
-                        let _permit = permit;
-                        if let Err(err) = relay(consumer_stream, registry, &id).await {
-                            tracing::trace!(%err, "relay closed");
-                        }
-                    }
-                    .instrument(info_span!("relay")),
-                );
-            }
-        }
+    // The shared control loop (heartbeat, UDP broker, reaper) runs alongside the
+    // consumer-specific relay-accept loop; whichever ends first ends the task.
+    let matchmaker = udp_registry
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(UdpMatchmaker::default()))
+        .clone();
+
+    tokio::select! {
+        r = serve_control(&mut control, &matchmaker, BrokerSide::Consumer, &id, SECRET_CTRL_TIMEOUT) => r,
+        r = accept_relays(&mut acceptor, &registry, &id, &max_conns) => r,
     }
 }
 
+/// Consumer-specific loop: accept each relayed substream and splice it to a live
+/// provider carrier under the `max_conns` semaphore.
+async fn accept_relays(
+    acceptor: &mut mux::Acceptor,
+    registry: &Registry,
+    id: &str,
+    max_conns: &Arc<Semaphore>,
+) -> Result<()> {
+    loop {
+        let Some(consumer_stream) = acceptor.accept().await else {
+            return Ok(());
+        };
+        let permit = match Arc::clone(max_conns).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(%id, "too many active connections, dropping");
+                continue;
+            }
+        };
+        let registry = Arc::clone(registry);
+        let id = id.to_string();
+        tokio::spawn(
+            async move {
+                let _permit = permit;
+                if let Err(err) = relay(consumer_stream, registry, &id).await {
+                    tracing::trace!(%err, "relay closed");
+                }
+            }
+            .instrument(info_span!("relay")),
+        );
+    }
+}
+
+/// Broker UDP candidates: when consumer offers, look up the provider.
+/// If provider has already offered candidates, send both sides UdpPunch.
 async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Result<()> {
     let mut marker = [0u8; 1];
     consumer.read_exact(&mut marker).await?;
@@ -225,11 +431,91 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
 
 struct DropGuard {
     registry: Registry,
+    udp_registry: UdpRegistry,
     id: String,
 }
 
 impl Drop for DropGuard {
     fn drop(&mut self) {
         self.registry.remove(&self.id);
+        self.udp_registry.remove(&self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    /// A peer whose control substream goes silent is reaped once the recv deadline
+    /// elapses — even while the server keeps heartbeating it. Drains server→client
+    /// so the heartbeat sends never block; the client never sends a frame.
+    #[tokio::test(start_paused = true)]
+    async fn serve_control_reaps_silent_peer() {
+        let (srv, cli) = duplex(8192);
+        let matchmaker = Arc::new(UdpMatchmaker::default());
+        let mut server = Delimited::new(srv);
+        let mm = Arc::clone(&matchmaker);
+        let handle = tokio::spawn(async move {
+            serve_control(
+                &mut server,
+                &mm,
+                BrokerSide::Provider,
+                "chan",
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let mut client = Delimited::new(cli);
+        let drain =
+            tokio::spawn(async move { while let Ok(Some(_)) = client.recv_server().await {} });
+
+        let joined = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("silent peer must be reaped within the deadline");
+        joined.expect("join").expect("serve_control ok");
+        drain.abort();
+    }
+
+    /// A peer that heartbeats within the deadline is NOT reaped; the loop ends only
+    /// once that peer disconnects.
+    #[tokio::test(start_paused = true)]
+    async fn serve_control_keeps_heartbeating_peer() {
+        let (srv, cli) = duplex(8192);
+        let matchmaker = Arc::new(UdpMatchmaker::default());
+        let mut server = Delimited::new(srv);
+        let mm = Arc::clone(&matchmaker);
+        let handle = tokio::spawn(async move {
+            serve_control(
+                &mut server,
+                &mm,
+                BrokerSide::Consumer,
+                "chan",
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let mut client = Delimited::new(cli);
+        // Heartbeat every 1s (< 2s deadline) for ~6s; the loop must stay alive.
+        for _ in 0..6 {
+            client
+                .send_client(ClientMsg::Heartbeat)
+                .await
+                .expect("send heartbeat");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "heartbeating peer must not be reaped"
+        );
+
+        // Stop heartbeating and disconnect; the loop ends on EOF.
+        drop(client);
+        let joined = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("loop must end after the peer disconnects");
+        joined.expect("join").expect("serve_control ok");
     }
 }

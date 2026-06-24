@@ -1,6 +1,7 @@
 //! Minimal control protocol for rb-transport coordination.
 
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -8,7 +9,7 @@ use uuid::Uuid;
 pub const MAX_FRAME_LENGTH: usize = 1024;
 
 /// Client → Server: protocol messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientMsg {
     /// Register as the source/provider for a channel.
@@ -19,10 +20,12 @@ pub enum ClientMsg {
     Authenticate(String),
     /// Heartbeat to keep the connection alive.
     Heartbeat,
+    /// Offer UDP candidate addresses for hole-punching to the server.
+    UdpCandidateOffer { addrs: Vec<SocketAddr> },
 }
 
 /// Server → Client: protocol messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerMsg {
     /// Authentication challenge (UUID); client must respond with Authenticate.
@@ -33,6 +36,10 @@ pub enum ServerMsg {
     Heartbeat,
     /// Error message; connection will close.
     Error(String),
+    /// Forward the peer's UDP candidate addresses for hole-punching.
+    UdpPunch { peer_addrs: Vec<SocketAddr> },
+    /// Direct UDP path unavailable; proceed with relay fallback.
+    UdpUnavailable,
 }
 
 /// Null-delimited JSON codec for control messages.

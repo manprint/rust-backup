@@ -8,6 +8,62 @@
 
 ---
 
+## ⏯ RESUME HERE — current implementation state
+
+> Read this first to continue work. Updated **2026-06-24**.
+
+**Done & committed:** Phase 0 (skeleton) + **Phase 1 (transport direct path), all
+non-e2e sub-phases**. Working tree green on `bash scripts/gates.sh` (clippy
+`-D warnings`, `--all-features` and `--no-default-features`).
+
+**Workflow contract:** drive sub-phase by sub-phase — Sonnet implements, Opus
+reviews ⟦OPUS GATE⟧ rows + runs `scripts/gates.sh`, **zero regressions**. A
+sub-phase is NOT done until its acceptance test actually *ran* (`0 ignored`, not
+faked) — past delegated agents hid/faked tests, so verify each one.
+
+**Phase 1 — what landed (see §"Phase 1" below for the spec):**
+- `crates/rb-transport/src/direct.rs` — QUIC (quinn 0.11/rustls 0.23) direct path:
+  `DirectConn`/`DirectListener`/`connect_direct`/`bind_socket` (wildcard bind, **no
+  `SO_REUSEADDR`**, `EADDRINUSE`→ephemeral), `configure_udp_socket_buffers` (Linux
+  nix force+getsockopt-verify+clamp warn), BBR + 16 MiB window configs, `SkipVerify`,
+  `derive_token`. `UdpDirectTuning` in `shared.rs`.
+- `crates/rb-transport/src/proto.rs` — `ClientMsg` (Register/Connect/Authenticate/
+  **Heartbeat**/`UdpCandidateOffer`), `ServerMsg` (Challenge/Ok/**Heartbeat**/Error/
+  `UdpPunch`/`UdpUnavailable`); `Delimited<T>` null-JSON codec.
+- `crates/rb-transport/src/server.rs` — `UdpMatchmaker` (per-channel oneshot
+  rendezvous, order-independent `try_match`); generic `serve_control<S>` =
+  control-plane loop (server heartbeat + UDP broker + **recv-deadline reaper**,
+  `SECRET_CTRL_TIMEOUT`=60s passed as a PARAM so tests don't race); `serve_provider`
+  calls it; `serve_consumer` selects it vs `accept_relays` (relay splice loop).
+- `crates/rb-transport/src/client.rs` — `connect_source`/`connect_destination` run
+  `setup_direct` on `&mut control` BEFORE control moves into the channel:
+  `gather_candidates` (loopback + primary-IP, never `0.0.0.0`; best-effort RFC 5389
+  STUN via `RUST_BACKUP_STUN_SERVER`) → `UdpCandidateOffer` → `recv_punch` →
+  listen/dial → `set_direct`.
+- `crates/rb-transport/src/channel.rs` — `PairedChannel` direct routing + per-conn
+  relay fallback (`DIRECT_SETUP_TIMEOUT`=10s); `set_direct`/`is_direct`; control
+  substream owned by a spawned `drive_control` task (`AbortOnDrop`) that sends
+  `ClientMsg::Heartbeat` every `CTRL_CLIENT_HEARTBEAT`=20s and drains server frames.
+- Tests (all ran, `0 ignored`): `tests/udp_broker.rs` (8), `tests/direct_test.rs`
+  (4), `tests/direct_e2e.rs` (1, real server+2 clients, `is_direct()` both sides),
+  STUN parse (2), `serve_control` reaper/keepalive (2), socket-buffer (1).
+
+**Not done in Phase 1:** **1.5 netns e2e** (`e2e/transport_netns_test.sh`) — blocked
+in this environment (no sudo/netns/Docker); must run on a host with privileges.
+
+**Known edge (logged, non-blocking):** if a peer stops *reading*, `send_server` can
+block `serve_control`'s select so the reaper can't fire. Recv-deadline reaper is the
+spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening).
+
+**▶ NEXT: Phase 2 — PostgreSQL module** (`crates/rb-postgres`, currently a
+`not-implemented` stub). Build per §"Phase 2" below. Module crates depend only on
+`rb-core`; never edit core to add a backend (I-MODULAR).
+
+**Build/test:** `cargo build --all-features` · `cargo build --no-default-features`
+(relay-only, no quinn) · `cargo test --all-features` · `bash scripts/gates.sh` (full).
+
+---
+
 ## 0. Scope & reference scenario
 
 **Goal.** A modular Rust application, `rust-backup`, that performs
@@ -116,10 +172,10 @@ against an in-memory channel.
 | TCP/TLS control | `transport.rs` `Endpoint::parse`, `connect`, `client_config`, `server_tls_from_pem` | `rb-transport/src/transport.rs` | trim to control channel |
 | HMAC auth | `auth.rs` `Authenticator::{new,server_handshake,client_handshake}` | `rb-transport/src/auth.rs` | retarget to new proto |
 | framed codec | `shared.rs` `Delimited` (null-JSON, `MAX_FRAME_LENGTH`), `tune_tcp`, `NETWORK_TIMEOUT` | `rb-transport/src/proto.rs` + `rb-core/src/wire.rs` | new minimal `Msg` enums |
-| provider/consumer relay | `secret.rs` `serve_provider`/`serve_consumer`/`relay` (registry `DashMap<String,Arc<CarrierPool>>`, `broker_udp`) | `rb-transport/src/server.rs` | simplify (no vhost/vpn/admin) |
+| provider/consumer relay | `secret.rs` `serve_provider`/`serve_consumer`/`relay` (registry `DashMap<String,Arc<CarrierPool>>`, `broker_udp`), control heartbeat + recv-deadline reaper (`CTRL_CLIENT_HEARTBEAT` 20 s / `SECRET_CTRL_TIMEOUT` 60 s) | `rb-transport/src/server.rs` | simplify (no vhost/vpn/admin); keep heartbeat/reaper (Phase 1.6) |
 | control accept loop | `server.rs` accept loop + TLS + dispatch + `--max-conns` semaphore | `rb-transport/src/server.rs` | simplify |
 | reconnect/backoff | `reconnect.rs` `Backoff`, `run(auto_reconnect, connect, serve)` | `rb-transport/src/reconnect.rs` | verbatim |
-| direct QUIC | `holepunch.rs` `DirectConn`/`DirectListener`/`connect_direct`/`punch`/`server_endpoint`/`transport_config`/`configure_udp_socket_buffers`, `DatagramSend` | `rb-transport/src/direct.rs` (**Phase 1**) | the big port; relay fallback per-connection |
+| direct QUIC | `holepunch.rs` `DirectConn`/`DirectListener`/`connect_direct`/`punch`/`server_endpoint`/`transport_config`/`configure_udp_socket_buffers`/`make_socket`/`bind_socket`, `DatagramSend` | `rb-transport/src/direct.rs` (**Phase 1**) | the big port; relay fallback per-connection; **punch socket never `SO_REUSEADDR`** (`EADDRINUSE`→ephemeral, BUG-S3) |
 | chunk streaming + backpressure + BLAKE3 | `transfer.rs` `send_frame`/`recv_frame`, `write_all_idle`/`read_exact_idle`, `ChunkStart`, `ProgressShared`, `CHUNK_SIZE`/`COPY_BUFFER` | `rb-core/src/{wire,channel,progress}.rs` | **already ported** in Phase 0 |
 | netns e2e harness | `scripts/vhost_netns_test.sh` (ns create, spawn, pass/fail counters, `trap cleanup`) | `e2e/*_netns_test.sh` | pattern reuse |
 | gate script | `test_gates.sh` | `scripts/gates.sh` | adapted |
@@ -168,6 +224,9 @@ targets:
 - **Transport control proto** (`rb-transport/src/proto.rs`, null-JSON `Delimited`):
   client→server `Register{channel}` | `Connect{channel}` | `Authenticate(tag)` |
   `Heartbeat`; server→client `Challenge(uuid)` | `Ok` | `Error(msg)` | `Heartbeat`.
+  The provider sends `Heartbeat` every `CTRL_CLIENT_HEARTBEAT` (20 s); the server
+  reaps a registry entry idle past `SECRET_CTRL_TIMEOUT` (60 s) — a yamux substream
+  hides a half-open peer, so liveness is an app-level recv-deadline (Phase 1.6).
   Phase 1 adds UDP punch variants (`UdpCandidateOffer`/`UdpPunch`/`UdpUnavailable`).
 - **App channel framing** (`rb-core/src/wire.rs`, length-prefixed JSON, raw payload
   after `ChunkStart`):
@@ -204,12 +263,25 @@ subcommand; relay channel moves bytes in an in-process e2e.
 
 ### Phase 1 — Transport direct path (QUIC/hole-punch port)
 
+> **Status** *(2026-06-24)* — non-e2e items closed; gates green.
+> 1.1 ✅ done (3 tests) · 1.2 ✅ done (8 tests, `UdpMatchmaker`) ·
+> 1.3 ✅ done (`direct_test` 4 + `direct_e2e` 1 + STUN parse 2) ·
+> 1.4 ✅ done (`test_socket_buffers_enlarged`, Linux getsockopt) ·
+> 1.5 ⏸ script-only here (no sudo/netns in this env) ·
+> 1.6 ✅ done (`serve_control` reaper + client `drive_control` heartbeat;
+> `serve_control_reaps_silent_peer` / `serve_control_keeps_heartbeating_peer`).
+
 - **1.1 ⟦OPUS GATE⟧** *(Sonnet impl)* — `rb-transport/src/direct.rs`. Port
   `holepunch.rs` `DirectConn`/`DirectListener`/`connect_direct`/`punch`/`client_endpoint`/
-  `server_endpoint`/`server_config`/`transport_config`/`DatagramSend` and
-  `configure_udp_socket_buffers`. **Unit:** QUIC endpoint pair handshake on loopback;
-  `transport_config` BBR + 16 MiB windows asserted. **e2e:** none yet. **Done:**
-  `--features udp` compiles, two endpoints exchange a bidi stream on loopback.
+  `server_endpoint`/`server_config`/`transport_config`/`DatagramSend`,
+  `configure_udp_socket_buffers`, and `make_socket`/`bind_socket` — the punch socket
+  **never sets `SO_REUSEADDR`**; bind the fixed/preferred port, fall back to an
+  ephemeral port on `EADDRINUSE` (co-bound REUSEADDR sockets steal each other's
+  datagrams — the concurrent-tunnel ~30 s flap, BUG-S3). **Unit:** QUIC endpoint
+  pair handshake on loopback; `transport_config` BBR + 16 MiB windows asserted;
+  second co-bind of the same fixed port is refused → ephemeral fallback. **e2e:**
+  none yet. **Done:** `--features udp` compiles, two endpoints exchange a bidi
+  stream on loopback.
 - **1.2 ⟦OPUS GATE⟧** *(Sonnet)* — `proto.rs` + `server.rs`: add `UdpCandidateOffer`/
   `UdpPunch`/`UdpUnavailable`; server brokers candidates to both paired peers (10 s
   timeout → `UdpUnavailable`). **Unit:** broker pairs two offers, times out alone.
@@ -220,10 +292,18 @@ subcommand; relay channel moves bytes in an in-process e2e.
   **Unit:** fallback returns relay stream when direct fails. **Done:** direct used when
   available, relay otherwise, transparently.
 - **1.4** *(Haiku)* — socket buffer force + tuning consts; `warn!` on clamp survival
-  (port `configure_udp_socket_buffers`). **Done:** getsockopt-verified, warns.
+  (port `configure_udp_socket_buffers`); `warn!`-log the `EADDRINUSE`→ephemeral
+  fixed-port fallback (BUG-S3). **Done:** getsockopt-verified, warns.
 - **1.5** *(Sonnet)* — `e2e/transport_netns_test.sh` (T-NET1): netns with a NAT/relay
   topology; assert direct path is taken when reachable and relay when blocked; byte
   transfer succeeds both ways. **Done:** netns N pass / 0 fail.
+- **1.6 ⟦OPUS GATE⟧** *(Sonnet)* — control heartbeat + recv-deadline reaper
+  (`server.rs`, channel control loop). Provider sends `Heartbeat` every
+  `CTRL_CLIENT_HEARTBEAT` (20 s); server reaps a registry entry whose control
+  substream is silent past `SECRET_CTRL_TIMEOUT` (60 s) — a half-open peer is
+  invisible to a yamux `recv`, so liveness is an app-level deadline. Timeout is a
+  test hook (override the const). **Unit:** silent provider reaped after the
+  deadline; heartbeating provider survives. **Done:** no zombie channel ids.
 
 ---
 
@@ -400,7 +480,7 @@ subcommand; relay channel moves bytes in an in-process e2e.
 | 0.2 transport relay, 0.3 module stubs | **Sonnet** | — |
 | 0.4 bin glue | **Opus**→Sonnet | session wiring |
 | 0.5 docs | **Haiku** | Opus final read |
-| 1.x direct QUIC path | **Sonnet** | 1.1, 1.2, 1.3 (concurrency/hot-path) |
+| 1.x direct QUIC path | **Sonnet** | 1.1, 1.2, 1.3, 1.6 (concurrency/hot-path, heartbeat/reaper) |
 | 2.x postgres | **Sonnet** | 2.2, 2.3, 2.6, 2.7 (plan/DDL/restore/immutability) |
 | 3.x mongodb | **Sonnet** | 3.2, 3.5, 3.6 |
 | 4.x filesystem | **Sonnet** | 4.3, 4.4 (ownership/immutability) |
@@ -421,9 +501,9 @@ pool:       bore src/pool.rs      CarrierPool::{new,push,pick}, Carrier::new
 transport:  bore src/transport.rs Endpoint::parse, connect, client_config, server_tls_from_pem
 auth:       bore src/auth.rs      Authenticator::{new,server_handshake,client_handshake}; Hello-before-auth ordering
 framed:     bore src/shared.rs    Delimited (null-JSON), tune_tcp, CONTROL_PORT=7835, NETWORK_TIMEOUT=3s, MAX_FRAME_LENGTH
-relay:      bore src/secret.rs    serve_provider/serve_consumer/relay, registry DashMap<String,Arc<CarrierPool>>, broker_udp
+relay:      bore src/secret.rs    serve_provider/serve_consumer/relay, registry DashMap<String,Arc<CarrierPool>>, broker_udp, heartbeat/reaper CTRL_CLIENT_HEARTBEAT=20s/SECRET_CTRL_TIMEOUT=60s
 server:     bore src/server.rs    accept loop + TLS + dispatch + max-conns semaphore
-direct:     bore src/holepunch.rs DirectConn/DirectListener/connect_direct/punch/server_endpoint/transport_config/configure_udp_socket_buffers, DatagramSend{Sent,TooLarge}
+direct:     bore src/holepunch.rs DirectConn/DirectListener/connect_direct/punch/server_endpoint/transport_config/configure_udp_socket_buffers/make_socket/bind_socket (NO SO_REUSEADDR; EADDRINUSE->ephemeral), DatagramSend{Sent,TooLarge}
 stream:     bore src/transfer.rs  send/recv_frame, write_all_idle/read_exact_idle, ChunkStart, ProgressShared, CHUNK_SIZE=1MiB, COPY_BUFFER=64KiB
 reconnect:  bore src/reconnect.rs Backoff, run(auto_reconnect, connect, serve)
 e2e:        bore scripts/vhost_netns_test.sh  ns create/spawn/assert, trap cleanup, PASS/FAIL counters

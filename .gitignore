@@ -5,3 +5,6 @@
 # local test artifacts
 /e2e/tmp
 *.log
+notes.ai
+# Serena MCP tool cache (not part of the repo)
+/.serena/
