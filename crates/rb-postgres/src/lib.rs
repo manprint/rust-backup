@@ -8,6 +8,7 @@
 
 mod connect;
 pub mod ddl;
+mod dest;
 mod introspect;
 mod model;
 mod source;
@@ -54,6 +55,11 @@ pub struct PostgresParams {
     /// Read-only source connections do not set this.
     #[serde(default)]
     pub admin: bool,
+
+    /// Destination-only: allow restoring over databases that already exist.
+    /// Without it, preflight fails when a target database is present.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_pg_port() -> u16 {
@@ -131,12 +137,8 @@ struct PostgresDestination {
 
 #[async_trait]
 impl Destination for PostgresDestination {
-    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
-        Ok(Preflight::pass().check(
-            "not-implemented",
-            false,
-            "rb-postgres restore stub — destination validation and restore not yet implemented (plan Phase 2)",
-        ))
+    async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
+        dest::validate(&self.params, plan).await
     }
 
     async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {

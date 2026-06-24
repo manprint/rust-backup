@@ -20,6 +20,7 @@ fn params_from_env() -> Option<PostgresParams> {
         database: std::env::var("RUST_BACKUP_PG_DATABASE").ok(),
         sslmode: "prefer".into(),
         admin: false,
+        overwrite: false,
     })
 }
 

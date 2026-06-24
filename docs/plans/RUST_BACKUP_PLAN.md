@@ -58,21 +58,24 @@ spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening)
 **Phase 2 (PostgreSQL) — in progress.** See the per-sub-phase status block under
 §"Phase 2" below. Done so far: **2.1** (connect+version), **2.2** (read-only
 introspection → `PgPlanPayload`), **2.3** (DDL reconstruction, golden-tested),
-**2.4** (`source.rs` `stream_out`: binary `COPY` → chunked `ChunkSink`).
+**2.4** (`source.rs` `stream_out`: binary `COPY` → chunked `ChunkSink`),
+**2.5** (`dest.rs` `validate`: preflight, pure `assess` unit-tested).
 
 **⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
 SQL is written to be version-robust but must be checked by running
 `bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
 (2.3 DDL is pure → fully unit-verified here via goldens.)
 
-**▶ NEXT: Phase 2.5 — `dest validate`**: preflight on the destination —
-disk-space estimate vs free, server major ≥ source major, admin privileges
-(`pg_has_role`, CREATEROLE/CREATEDB), target databases absent or `--overwrite`.
-Return a `Preflight` with one `check(...)` per item. Pure comparison helpers
-(version compare, disk compare) are unit-testable here; the privilege/existence
-probes need a live DB (gated/e2e). Replace the current `validate` stub (which
-returns a failing "not-implemented" check). The destination uses an ADMIN
-connection (`PostgresParams.admin`).
+**▶ NEXT: Phase 2.6 — `dest stream_in`** (OPUS GATE): apply the streamed payload.
+Order (use `ddl::build_cluster_ddl`): on a bootstrap admin connection run
+`ClusterDdl.roles` then `.databases`; then per database connect and run
+`DatabaseDdl.pre_data`, load data via `COPY <tbl> (<cols>) FROM STDIN (FORMAT
+binary)` (`copy_in`) fed from the `ChunkSource` events (match `item.id` →
+db/schema/table/columns; the raw bytes are COPY-binary, write verbatim), then run
+`DatabaseDdl.post_data` (constraints, indexes, setval, grants, owners). Wrap each
+database's apply in a transaction where possible. Pure: the apply-order assembly
+is unit-testable (assert pre_data before COPY before post_data); live restore =
+e2e. Replace the `stream_in` stub. Needs an ADMIN connection.
 Module crates depend only on `rb-core`; never edit core to add a backend
 (I-MODULAR).
 
@@ -360,7 +363,14 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > the `ChunkSink` at ≤`CHUNK_SIZE` with running offset + whole-item blake3;
 > reuses one connection per database; never closes the sink (session does).
 > Chunker is generic over the byte stream → unit-tested in-process (split/offset/
-> hash + empty + SQL build); live `copy_out` via the postgres e2e. · 2.5–2.8 ⏳.
+> hash + empty + SQL build); live `copy_out` via the postgres e2e.
+> 2.5 ✅ done — `dest.rs` `validate`: ADMIN connection → `DestProbe`
+> (dest major, super/createdb/createrole, existing target dbs) → pure
+> `assess(payload, probe, overwrite, est_bytes)` → `Preflight` (version ≥ source,
+> creation privileges, per-db absent-or-overwrite; size informational — free disk
+> not visible over SQL). Added `PostgresParams.overwrite`. 4 unit tests on
+> `assess` (clean/older/no-privs/existing±overwrite); `probe_dest` via e2e.
+> · 2.6–2.8 ⏳ pending.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.
