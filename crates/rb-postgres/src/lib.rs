@@ -9,6 +9,7 @@
 mod connect;
 pub mod ddl;
 mod dest;
+mod immutability;
 mod introspect;
 mod model;
 mod source;
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use rb_core::channel::{ChunkSink, ChunkSource};
-use rb_core::error::{BackupError, Phase, Result};
+use rb_core::error::Result;
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
 
@@ -122,10 +123,7 @@ impl Source for PostgresSource {
     }
 
     async fn fingerprint(&self) -> Result<String> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-postgres: fingerprint not yet implemented (plan Phase 2)",
-        ))
+        immutability::fingerprint(&self.params).await
     }
 }
 

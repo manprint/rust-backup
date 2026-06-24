@@ -36,7 +36,7 @@ fn analyze_err(ctx: &str, e: tokio_postgres::Error) -> BackupError {
 /// Connect read-only and build the full cluster payload: cluster-global roles /
 /// memberships / tablespaces, then each target database's object tree.
 pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload> {
-    let boot = PgConnection::connect(params, &params.bootstrap_database()).await?;
+    let boot = PgConnection::connect_read_only(params, &params.bootstrap_database()).await?;
     let server_version = boot.server_version.clone();
     let server_major = boot.server_major;
 
@@ -49,7 +49,7 @@ pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload
 
     // Per-database trees require a connection to each database.
     for db in &mut databases {
-        let conn = PgConnection::connect(params, &db.name).await?;
+        let conn = PgConnection::connect_read_only(params, &db.name).await?;
         db.extensions = gather_extensions(&conn.client).await?;
         db.schemas = gather_schemas(&conn.client, server_major).await?;
     }

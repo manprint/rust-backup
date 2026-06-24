@@ -62,23 +62,28 @@ introspection → `PgPlanPayload`), **2.3** (DDL reconstruction, golden-tested),
 **2.5** (`dest.rs` `validate`: preflight), **2.6** (`dest.rs` `stream_in`:
 restore — DDL order + `COPY FROM STDIN` data load).
 
-**⚠ Live restore (2.6) is UNVERIFIED here** (no DB). The apply ordering reuses the
-golden-tested `build_cluster_ddl`; the live backup→restore→diff loop is the 2.8
-`e2e/postgres_matrix.sh` (to be written) — run it on a Docker host.
+Plus **2.7** (`immutability.rs`: source fingerprint + connection-level read-only
+enforcement). **Only 2.8 (e2e matrix, Docker) remains** — script-only in this env.
+
+**⚠ Live restore + introspection (2.2/2.6/2.7 SQL) are UNVERIFIED here** (no DB).
+The DDL/fingerprint COMPOSITION is golden/unit-tested; the live backup→restore→
+diff loop + mid-abort immutability is the 2.8 `e2e/postgres_matrix.sh` — run it on
+a Docker host before trusting the SQL.
 
 **⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
 SQL is written to be version-robust but must be checked by running
 `bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
 (2.3 DDL is pure → fully unit-verified here via goldens.)
 
-**▶ NEXT: Phase 2.7 — `immutability.rs`** (OPUS GATE): source fingerprint =
-stable hash of (catalog snapshot + per-table `COUNT` + a sampled checksum).
-Implement `Source::fingerprint` (currently a stub) read-only; the session already
-calls it before/after every run and raises `BackupError::SourceMutated` on drift.
-Also reject a writable source user (a read-only source must not be able to
-mutate). Pure: the fingerprint COMPOSITION (hashing a snapshot struct →
-deterministic hex) is unit-testable here; the live catalog/COUNT queries +
-mid-`COPY`-abort stability are e2e (`T-PG-IMMUT`, part of the matrix).
+**▶ NEXT: Phase 2.8 — `e2e/postgres_matrix.sh`** (T-PG-MATRIX, T-PG-IMMUT): for pg
+10/12/14/16/18 in Docker — seed a source, run the full backup→restore over the
+relay using the `rust-backup` binary (server + source + destination), diff row
+counts + checksums, and assert the source fingerprint is unchanged including a
+run aborted at ~50%. SCRIPT-ONLY here (no Docker/privileges in this env); the
+script is the deliverable + must be run on a capable host. This likely needs the
+CLI run-path wired (see Phase 7); if the binary can't yet drive a postgres
+source→destination session, note the gap and scope the script to what works
+(e.g. analyze/plan + the gated introspect/restore tests) until Phase 7 lands.
 Module crates depend only on `rb-core`; never edit core to add a backend
 (I-MODULAR).
 
@@ -379,7 +384,16 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > (FORMAT binary)` (`copy_in` sink per item, raw bytes verbatim); then per-db
 > `post_data`. Autocommit (per-db txn is a noted refinement). Unit: `copy_in_sql`
 > mirrors `copy_out`, `item_metas` maps id→meta. Live restore via 2.8 matrix.
-> · 2.7–2.8 ⏳ pending.
+> 2.7 ✅ done — `immutability.rs` `fingerprint`: structural catalog hash (volatile
+> estimates/sequence values normalized out) + per data-bearing table exact
+> `COUNT(*)` + deterministic sampled content checksum (`md5` over rows ordered by
+> row-text, capped); `compose` folds them order-independently. PLUS
+> connection-level read-only enforcement: source connections use
+> `PgConnection::connect_read_only` (`-c default_transaction_read_only=on`) so an
+> accidental write fails at the server (introspect/source/fingerprint switched
+> over). 4 pure unit tests (compose determinism/order-independence/drift,
+> normalize zeroes estimates, catalog hash ignores estimate drift but not
+> structure). Live catalog/COUNT + mid-abort stability via 2.8. · 2.8 ⏳ pending.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.

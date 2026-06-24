@@ -30,10 +30,26 @@ pub struct PgConnection {
 }
 
 impl PgConnection {
-    /// Connect to `database` using `params`, spawn the protocol driver, probe the
-    /// server version, and reject majors below [`MIN_PG_MAJOR`]. The connection is
-    /// read-only-safe: it issues only `SHOW server_version` here.
+    /// Connect read-write (the destination/restore side).
     pub async fn connect(params: &PostgresParams, database: &str) -> Result<Self> {
+        Self::connect_inner(params, database, false).await
+    }
+
+    /// Connect with the session forced to `default_transaction_read_only = on`, so
+    /// any accidental write fails at the server. Used for every SOURCE connection
+    /// (introspection, streaming, fingerprinting) to enforce I-IMMUT defensively —
+    /// even a bug cannot mutate the source.
+    pub async fn connect_read_only(params: &PostgresParams, database: &str) -> Result<Self> {
+        Self::connect_inner(params, database, true).await
+    }
+
+    /// Connect to `database` using `params`, spawn the protocol driver, probe the
+    /// server version, and reject majors below [`MIN_PG_MAJOR`].
+    async fn connect_inner(
+        params: &PostgresParams,
+        database: &str,
+        read_only: bool,
+    ) -> Result<Self> {
         require_supported_sslmode(&params.sslmode)?;
 
         let mut cfg = Config::new();
@@ -45,6 +61,11 @@ impl PgConnection {
             .application_name("rust-backup");
         if let Some(pw) = &params.password {
             cfg.password(pw);
+        }
+        if read_only {
+            // Startup option: every transaction in this session is read-only, so
+            // an accidental write fails at the server (defensive I-IMMUT).
+            cfg.options("-c default_transaction_read_only=on");
         }
 
         let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {

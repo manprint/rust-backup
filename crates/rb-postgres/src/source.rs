@@ -61,7 +61,7 @@ pub async fn stream_out(
             .map(|(db, _)| db != &meta.database)
             .unwrap_or(true);
         if stale {
-            let c = PgConnection::connect(params, &meta.database).await?;
+            let c = PgConnection::connect_read_only(params, &meta.database).await?;
             conn = Some((meta.database.clone(), c));
         }
 
