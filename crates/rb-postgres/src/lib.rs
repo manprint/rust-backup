@@ -7,8 +7,11 @@
 //! per `docs/plans/RUST_BACKUP_PLAN.md` §"Phase 2".
 
 mod connect;
+mod introspect;
+mod model;
 
 pub use connect::{parse_major, PgConnection, MIN_PG_MAJOR};
+pub use model::PgPlanPayload;
 
 use std::sync::Arc;
 
@@ -59,122 +62,14 @@ fn default_sslmode() -> String {
     "prefer".to_string()
 }
 
-/// PostgreSQL cluster-level backup plan payload.
-///
-/// Describes the complete schema, roles, and object hierarchy needed
-/// to restore the cluster exactly as it was at analysis time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostgresPlan {
-    /// PostgreSQL server version (e.g. "15.2").
-    pub server_version: String,
-
-    /// All roles in the cluster.
-    pub roles: Vec<RoleDef>,
-
-    /// All databases and their schemas.
-    pub databases: Vec<DatabaseDef>,
-}
-
-/// A PostgreSQL role definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoleDef {
-    /// Role name.
-    pub name: String,
-
-    /// Whether this is a user (login privilege).
-    pub is_user: bool,
-
-    /// Comment/description.
-    #[serde(default)]
-    pub comment: Option<String>,
-}
-
-/// A PostgreSQL database definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseDef {
-    /// Database name.
-    pub name: String,
-
-    /// Owner role name.
-    pub owner: String,
-
-    /// Server encoding (e.g. UTF8).
-    pub encoding: String,
-
-    /// Schemas in this database.
-    pub schemas: Vec<SchemaDef>,
-
-    /// Extension names installed in this database.
-    pub extensions: Vec<String>,
-}
-
-/// A PostgreSQL schema definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SchemaDef {
-    /// Schema name.
-    pub name: String,
-
-    /// Tables in this schema.
-    pub tables: Vec<TableDef>,
-
-    /// Sequences in this schema.
-    pub sequences: Vec<SequenceDef>,
-
-    /// Functions in this schema.
-    pub functions: Vec<FunctionDef>,
-}
-
-/// A PostgreSQL table definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TableDef {
-    /// Schema name (for full qualification).
-    pub schema: String,
-
-    /// Table name.
-    pub name: String,
-
-    /// Columns (name and type).
-    pub columns: Vec<(String, String)>,
-
-    /// Constraints (PK, FK, unique, check).
-    pub constraints: Vec<String>,
-
-    /// Index definitions (as DDL strings).
-    pub indexes: Vec<String>,
-
-    /// Owner role.
-    pub owner: String,
-
-    /// Grant statements.
-    pub grants: Vec<String>,
-
-    /// Estimated row count (for progress).
-    #[serde(default)]
-    pub estimated_rows: u64,
-
-    /// Estimated size in bytes.
-    #[serde(default)]
-    pub estimated_bytes: u64,
-}
-
-/// A PostgreSQL sequence definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SequenceDef {
-    /// Sequence name.
-    pub name: String,
-
-    /// Current value.
-    pub current_value: i64,
-}
-
-/// A PostgreSQL function definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionDef {
-    /// Function name with signature.
-    pub signature: String,
-
-    /// Function body (or OID reference).
-    pub definition: String,
+impl PostgresParams {
+    /// The database to connect to first for cluster-global introspection
+    /// (roles, tablespaces, the database list). Falls back to `postgres`.
+    pub fn bootstrap_database(&self) -> String {
+        self.database
+            .clone()
+            .unwrap_or_else(|| "postgres".to_string())
+    }
 }
 
 /// The PostgreSQL backup module.
@@ -210,10 +105,8 @@ struct PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn analyze(&self) -> Result<BackupPlan> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-postgres: analyze not yet implemented (plan Phase 2)",
-        ))
+        let payload = introspect::introspect_cluster(&self.params).await?;
+        Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
     }
 
     async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
@@ -282,21 +175,27 @@ mod tests {
         assert!(source.is_ok());
     }
 
+    /// analyze now performs a real read-only connection; with no server reachable
+    /// it must fail in the Connect phase (not silently succeed). Points at a
+    /// closed port for a deterministic, fast refusal.
     #[tokio::test]
-    async fn test_analyze_not_implemented() {
+    async fn analyze_fails_without_server() {
         let m = Module;
         let params = TargetParams::from_value(serde_json::json!({
-            "host": "localhost",
+            "host": "127.0.0.1",
+            "port": 1,
             "user": "postgres",
+            "sslmode": "disable",
         }));
 
         let source = m.open_source(&params).await.unwrap();
-        let result = source.analyze().await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
+        let err = source
+            .analyze()
+            .await
+            .expect_err("must fail with no server");
+        assert!(
+            err.to_string().contains("[Connect]"),
+            "expected a Connect-phase error, got: {err}"
+        );
     }
 }

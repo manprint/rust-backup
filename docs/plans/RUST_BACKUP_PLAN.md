@@ -56,9 +56,16 @@ block `serve_control`'s select so the reaper can't fire. Recv-deadline reaper is
 spec'd mechanism; the send-block case is deferred (revisit in Phase 8 hardening).
 
 **Phase 2 (PostgreSQL) — in progress.** See the per-sub-phase status block under
-§"Phase 2" below. Done so far: **2.1** (connect + version probe).
+§"Phase 2" below. Done so far: **2.1** (connect + version probe), **2.2**
+(read-only catalog introspection → `PgPlanPayload` + `build_plan`).
 
-**▶ NEXT: Phase 2.2 — `introspect.rs`** (catalog → `PgPlanPayload`, OPUS GATE).
+**⚠ Live introspection (2.2) is UNVERIFIED in this env** (no Docker/live pg). The
+SQL is written to be version-robust but must be checked by running
+`bash e2e/postgres_introspect.sh [PG_MAJOR]` on a Docker host before trusting it.
+
+**▶ NEXT: Phase 2.3 — `ddl.rs`** (reconstruct DDL from `PgPlanPayload`; golden
+tests, OPUS GATE). The model (`src/model.rs`) is the fixed contract; a fully
+populated `model::test_fixture()` is the reference cluster for DDL goldens.
 Module crates depend only on `rb-core`; never edit core to add a backend
 (I-MODULAR).
 
@@ -321,8 +328,17 @@ subcommand; relay channel moves bytes in an in-process e2e.
 > 2.1 ✅ done — `connect.rs`: `PgConnection::connect` (NoTls; sslmode
 > disable/allow/prefer OK, verifying modes rejected w/ clear error → TLS
 > follow-up), `parse_major`, `MIN_PG_MAJOR`=10, reject < 10. Tests: 5 unit
-> (`parse_major` ×3, sslmode gate ×2) + `tests/connect_live.rs` (gated). ·
-> 2.2–2.8 ⏳ pending.
+> (`parse_major` ×3, sslmode gate ×2) + `tests/connect_live.rs` (gated).
+> 2.2 ✅ done (live-UNVERIFIED here) — `model.rs` (`PgPlanPayload` cluster
+> model: roles/memberships/tablespaces/databases→schemas→tables(cols/cons/idx)/
+> sequences/views/functions; passwords NOT captured — read-only) +
+> `introspect.rs` (read-only `pg_catalog` SQL, casts to text/int8/bool, leans on
+> `pg_get_*def`; version-branches `attgenerated` 12+/`prokind` 11+; excludes
+> extension-owned objects; `build_plan` = one stream item per data-bearing table,
+> skips child partitions, omits generated cols from COPY list; `now_rfc3339`).
+> Tests: serde roundtrip ×2, `build_plan` ×2, rfc3339 vectors, all run;
+> `tests/introspect_live.rs` + `e2e/postgres_introspect.sh` (gated/Docker).
+> · 2.3–2.8 ⏳ pending.
 >
 > **TLS follow-up (deferred):** wire a rustls connector (`tokio-postgres-rustls`)
 > so `require`/`verify-ca`/`verify-full` work; today they error out.
