@@ -1,9 +1,20 @@
 #![forbid(unsafe_code)]
 
-//! rust-backup mongodb module (stub).
+//! rust-backup MongoDB module.
 //!
-//! Provides typed parameter handling and plan shape for MongoDB backups.
-//! Real backup/restore logic lands in Phase 2.
+//! Logical, pure-Rust backup/restore for MongoDB 4..=8 via catalog introspection
+//! and BSON document streaming (no `mongodump`). Built phase by phase per the
+//! plan's Phase 3 (`docs/plans/RUST_BACKUP_PLAN.md`).
+
+mod connect;
+mod dest;
+mod immutability;
+mod introspect;
+mod model;
+mod source;
+
+pub use connect::{parse_major, MongoConnection, MIN_MONGO_MAJOR};
+pub use model::{MongoCollection, MongoDatabase, MongoPlanPayload, MongoUser};
 
 use std::sync::Arc;
 
@@ -11,24 +22,23 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use rb_core::channel::{ChunkSink, ChunkSource};
-use rb_core::error::{BackupError, Phase, Result};
+use rb_core::error::Result;
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
 
 /// MongoDB connection parameters.
-///
-/// Supports either a URI string or explicit host/port/credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoDbParams {
-    /// Connection URI (e.g. mongodb://host:27017/db). Takes precedence if set.
+    /// Full connection URI (e.g. `mongodb://host:27017/db`). When set, the
+    /// discrete host/port/credential fields are ignored.
     #[serde(default)]
     pub uri: Option<String>,
 
-    /// Host to connect to (used if uri is not set).
-    #[serde(default)]
-    pub host: Option<String>,
+    /// Host to connect to (used if `uri` is unset).
+    #[serde(default = "default_mongo_host")]
+    pub host: String,
 
-    /// Port (default 27017, used if uri is not set).
+    /// Port (default 27017, used if `uri` is unset).
     #[serde(default = "default_mongo_port")]
     pub port: u16,
 
@@ -40,75 +50,38 @@ pub struct MongoDbParams {
     #[serde(default)]
     pub password: Option<String>,
 
-    /// Database to back up (optional; if omitted, back up all).
+    /// Database to back up (optional; if omitted, back up all non-system dbs).
     #[serde(default)]
     pub database: Option<String>,
 
-    /// Authentication database (usually 'admin').
+    /// Authentication database (usually `admin`).
     #[serde(default)]
     pub auth_db: Option<String>,
+
+    /// Destination-only: allow restoring over collections that already exist
+    /// (drops them first). Without it, preflight fails when a target exists.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+fn default_mongo_host() -> String {
+    "localhost".to_string()
 }
 
 fn default_mongo_port() -> u16 {
     27017
 }
 
-/// MongoDB cluster backup plan payload.
-///
-/// Describes all databases, collections, indexes, and user definitions
-/// needed to restore the cluster exactly as it was.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongoDbPlan {
-    /// MongoDB server version (e.g. "6.0.8").
-    pub server_version: String,
-
-    /// All databases and their collections.
-    pub databases: Vec<MongoDatabase>,
-}
-
-/// A MongoDB database definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongoDatabase {
-    /// Database name.
-    pub name: String,
-
-    /// Collections in this database.
-    pub collections: Vec<MongoCollection>,
-
-    /// Users defined in this database.
-    pub users: Vec<MongoUser>,
-}
-
-/// A MongoDB collection definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongoCollection {
-    /// Collection name.
-    pub name: String,
-
-    /// Collection options (as a JSON object).
-    #[serde(default)]
-    pub options: Option<serde_json::Value>,
-
-    /// Index names (full index specs stored separately in options).
-    pub indexes: Vec<String>,
-
-    /// Estimated document count.
-    #[serde(default)]
-    pub estimated_docs: u64,
-
-    /// Estimated size in bytes.
-    #[serde(default)]
-    pub estimated_bytes: u64,
-}
-
-/// A MongoDB user definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongoUser {
-    /// Username.
-    pub name: String,
-
-    /// Role assignments.
-    pub roles: Vec<String>,
+impl MongoDbParams {
+    /// The database to run cluster-level/unprivileged commands against
+    /// (`buildInfo`, `usersInfo`). Prefers the auth database, then the target
+    /// database, then `admin`.
+    pub fn command_db(&self) -> String {
+        self.auth_db
+            .clone()
+            .or_else(|| self.database.clone())
+            .unwrap_or_else(|| "admin".to_string())
+    }
 }
 
 /// The MongoDB backup module.
@@ -121,7 +94,7 @@ impl BackupModule for Module {
     }
 
     fn version_support(&self) -> &'static str {
-        "MongoDB 4..=8"
+        "MongoDB 4..=8 (logical, pure Rust)"
     }
 
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {
@@ -141,55 +114,38 @@ impl BackupModule for Module {
 
 /// MongoDB source (read-only).
 struct MongoDbSource {
-    #[allow(dead_code)]
     params: MongoDbParams,
 }
 
 #[async_trait]
 impl Source for MongoDbSource {
     async fn analyze(&self) -> Result<BackupPlan> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-mongodb: analyze not yet implemented (plan Phase 2)",
-        ))
+        let payload = introspect::introspect_cluster(&self.params).await?;
+        Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
     }
 
-    async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Transfer,
-            "rb-mongodb: stream_out not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        source::stream_out(&self.params, plan, sink).await
     }
 
     async fn fingerprint(&self) -> Result<String> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-mongodb: fingerprint not yet implemented (plan Phase 2)",
-        ))
+        immutability::fingerprint(&self.params).await
     }
 }
 
 /// MongoDB destination (restore).
 struct MongoDbDestination {
-    #[allow(dead_code)]
     params: MongoDbParams,
 }
 
 #[async_trait]
 impl Destination for MongoDbDestination {
-    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
-        Ok(Preflight::pass().check(
-            "not-implemented",
-            false,
-            "rb-mongodb restore stub — destination validation and restore not yet implemented (plan Phase 2)",
-        ))
+    async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
+        dest::validate(&self.params, plan).await
     }
 
-    async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Apply,
-            "rb-mongodb: stream_in not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        dest::stream_in(&self.params, plan, src).await
     }
 }
 
@@ -208,31 +164,55 @@ mod tests {
         assert_eq!(m.name(), "mongodb");
     }
 
+    #[test]
+    fn command_db_precedence() {
+        let mut p = MongoDbParams {
+            uri: None,
+            host: "h".into(),
+            port: 27017,
+            user: None,
+            password: None,
+            database: Some("appdb".into()),
+            auth_db: Some("admin".into()),
+            overwrite: false,
+        };
+        assert_eq!(p.command_db(), "admin");
+        p.auth_db = None;
+        assert_eq!(p.command_db(), "appdb");
+        p.database = None;
+        assert_eq!(p.command_db(), "admin");
+    }
+
     #[tokio::test]
     async fn test_open_source_valid_params() {
         let m = Module;
         let params = TargetParams::from_value(serde_json::json!({
             "uri": "mongodb://localhost:27017/mydb"
         }));
-
         let source = m.open_source(&params).await;
         assert!(source.is_ok());
     }
 
+    /// analyze performs a real connection; with no server reachable it must fail
+    /// in the Connect phase (not silently succeed). Points at a closed port for a
+    /// deterministic, fast refusal.
     #[tokio::test]
-    async fn test_analyze_not_implemented() {
+    async fn analyze_fails_without_server() {
         let m = Module;
         let params = TargetParams::from_value(serde_json::json!({
-            "uri": "mongodb://localhost:27017/mydb"
+            "host": "127.0.0.1",
+            "port": 1,
+            // short server-selection timeout so the test fails fast.
+            "uri": "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=800"
         }));
-
         let source = m.open_source(&params).await.unwrap();
-        let result = source.analyze().await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
+        let err = source
+            .analyze()
+            .await
+            .expect_err("must fail with no server");
+        assert!(
+            err.to_string().contains("[Connect]"),
+            "expected a Connect-phase error, got: {err}"
+        );
     }
 }

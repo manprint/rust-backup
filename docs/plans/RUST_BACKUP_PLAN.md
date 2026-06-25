@@ -10,7 +10,7 @@
 
 ## ⏯ RESUME HERE — current implementation state
 
-> Read this first to continue work. Updated **2026-06-24**.
+> Read this first to continue work. Updated **2026-06-25**.
 
 **Done & committed:** Phase 0 (skeleton) + **Phase 1 (transport direct path), all
 non-e2e sub-phases**. Working tree green on `bash scripts/gates.sh` (clippy
@@ -68,12 +68,33 @@ server here. **Before trusting Phase 2, on a Docker host run:**
 and fix whatever the live runs surface. The CLI run-path is fully wired
 (`rust-backup server` + `postgres source|destination … --no-udp --admin --yes`).
 
-**▶ NEXT: Phase 3 — MongoDB module** (`crates/rb-mongodb`, currently a stub).
-Mirrors the postgres shape: connect + version probe (reject < 4), introspect →
-`MongoPlanPayload`, BSON streaming (`find({})` cursor → `ChunkSink`), restore
-(`insert_many` batched), immutability fingerprint. `mongodb = "3"` (pure Rust).
-Same testing discipline: pure logic unit-tested here; live paths behind a gated
-test (`RUST_BACKUP_MONGO_URI`) + an e2e script. Module crates depend only on
+**Phase 3 (MongoDB) — code-complete.** All sub-phases 3.1–3.7 implemented;
+`bash scripts/gates.sh` green (26 rb-mongodb unit tests, `0 ignored`). `mongodb =
+"3"` (pure Rust, rustls). Mirrors the postgres shape exactly. 3.1–3.6 are
+unit/golden-tested in-process; 3.7 is the live e2e (`e2e/mongodb_matrix.sh`),
+runnable only on a Docker host. The CLI run-path is fully wired (mongo flags
+`--uri | --host/--port/--user/--password/--database/--auth-db` already in the bin;
+dest `-P overwrite=true`). See the per-sub-phase status block under §"Phase 3".
+
+**⚠ The live driver paths — introspect (3.2), stream_out (3.3), restore (3.5),
+fingerprint (3.6) — are UNVERIFIED in this DB-less env.** Composition/parsers are
+unit-tested, but `find`/`insert_many`/`listCollections`/`createIndexes`/
+`count_documents` have NEVER run against a real server here. **Before trusting
+Phase 3, on a Docker host run:** `bash e2e/mongodb_matrix.sh 4 5 6 7 8` and fix
+whatever the live runs surface.
+
+**Documented MongoDB limitations:** users/roles are captured into the plan for
+visibility + fingerprint but NOT recreated on restore (`usersInfo` exposes no
+password credentials — faithful user restore is impossible from a logical dump;
+mirrors postgres passwords-not-captured). Views and time-series collections are
+skipped (only `CollectionType::Collection` is backed up).
+
+**▶ NEXT: Phase 4 — Filesystem module** (`crates/rb-filesystem`, currently a
+stub). `std` + `nix`: recursive read-only walk → `FsPlanPayload` (kind/size/mode/
+uid/gid/mtime/symlink target/xattr), per-file byte streaming into `ChunkSink`
+(64 KiB reads, no whole-file buffer), restore recreating tree + mode/mtime always
+and uid/gid when privileged (`CAP_CHOWN`; preflight warns otherwise, D13),
+immutability tree hash with `O_NOATIME` reads. Module crates depend only on
 `rb-core`; never edit core to add a backend (I-MODULAR).
 
 **Build/test:** `cargo build --all-features` · `cargo build --no-default-features`
@@ -433,6 +454,53 @@ subcommand; relay channel moves bytes in an in-process e2e.
 ### Phase 3 — MongoDB module (4..=8)
 
 > `mongodb = "3"` (pure Rust). Mirrors Phase 2 shape.
+
+> **Status** *(2026-06-25)* — gates green; DB-backed e2e is script-only here
+> (no Docker/live mongo in this env). 26 rb-mongodb unit tests, `0 ignored`.
+> 3.1 ✅ done — `connect.rs`: `MongoConnection::connect` (uri or
+> host/port/credential→`ClientOptions`), `buildInfo` version probe, `parse_major`,
+> `MIN_MONGO_MAJOR`=4, reject < 4. 3 `parse_major` unit tests.
+> 3.2 ✅ done (live-UNVERIFIED here) — `model.rs` (`MongoPlanPayload`:
+> databases→collections(options/index specs/estimates)+users; index specs = JSON
+> form of `IndexModel`, `_id_` excluded; users captured-not-restored) +
+> `introspect.rs` (read-only `list_database_names`/`list_collections`
+> [skip views/timeseries/`system.*`]/`list_indexes`/`estimated_document_count`/
+> `collStats`/best-effort `usersInfo`; system dbs excluded; `build_plan` = one
+> item per collection; `now_rfc3339`). Tests: build_plan ×2, rfc3339 vectors,
+> serde roundtrip ×2.
+> 3.3 ✅ done — `source.rs` `stream_out`: per collection `find({})` cursor → each
+> doc `bson::to_vec` → re-chunked into the `ChunkSink` at ≤`CHUNK_SIZE` with
+> running offset + whole-item blake3 (self-delimiting BSON); reuses one client;
+> never closes the sink. Generic doc-stream chunker unit-tested (concat/hash +
+> empty + chunk-split).
+> 3.4 ✅ done — `dest.rs` `validate`: `DestProbe` (dest major, existing target
+> collections) → pure `assess(payload,probe,overwrite,est)` → `Preflight`
+> (version ≥ source major, per-collection absent-or-overwrite; size
+> informational). 3 unit tests on `assess`.
+> 3.5 ✅ done (live-UNVERIFIED here) — `dest.rs` `stream_in`: create collections
+> via `create` cmd (+captured options; drop-first on overwrite) → linear pass over
+> the `ChunkSource` with an incremental BSON framer (`take_documents`) →
+> `insert_many(..).ordered(false)` batched (1000) routed by item id → build
+> indexes from stored `IndexModel`. Users NOT restored (documented). Unit:
+> incremental parser (byte-at-a-time reassembly, partial tail, bogus length),
+> item_metas.
+> 3.6 ✅ done — `immutability.rs` `fingerprint`: structural catalog hash (volatile
+> estimates normalized out) + per-collection exact `count_documents` +
+> deterministic `_id`-ordered sampled blake3 content checksum; `compose` folds
+> order-independently. 4 pure unit tests (compose determinism/order/drift,
+> normalize zeroes estimates, catalog hash ignores estimate drift but not
+> structure). Live count/checksum + mid-abort stability via 3.7.
+> 3.7 ✅ done (script-only here) — `e2e/mongodb_matrix.sh` (T-MONGO-MATRIX +
+> T-MONGO-IMMUT): per major (default 6; pass `4 5 6 7 8`) two Docker mongo
+> containers, seed source, full backup→restore over the relay via the real
+> `rust-backup` binary (server + source + destination, `--no-udp`), then asserts:
+> source unchanged after an aborted transfer, source unchanged after the full run,
+> destination matches source 1:1 (counts + `_id`-ordered docs + index specs).
+> `mongo_eval` prefers `mongosh`, falls back to legacy `mongo` (4.x images).
+> Bash-syntax-checked; RUN ON A DOCKER HOST to actually verify Phase 3.
+>
+> **TLS note (deferred):** discrete host/port params connect without TLS; use a
+> `mongodb+srv://`/`?tls=true` `--uri` for TLS (the driver's rustls handles it).
 
 - **3.1** *(Sonnet)* — connect (uri/host); server version probe → reject < 4. **Done:** connects.
 - **3.2 ⟦OPUS GATE⟧** *(Sonnet)* — `introspect.rs`: list databases, collections (+options),
