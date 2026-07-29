@@ -50,9 +50,11 @@ link "${tag}cs" src0 "$src_ns" 10.81.0.1/24 10.81.0.2/24
 link "${tag}cd" dst0 "$dst_ns" 10.82.0.1/24 10.82.0.2/24
 ip -n "$src_ns" route add default via 10.81.0.1; ip -n "$dst_ns" route add default via 10.82.0.1
 ip netns exec "$coord" sysctl -qw net.ipv4.ip_forward=1
-# All relay -> destination traffic passes through this constrained receive link.
-ip netns exec "$dst_ns" tc qdisc replace dev dst0 root handle 1: tbf rate 5mbit burst 64k latency 400ms
-ip netns exec "$dst_ns" tc qdisc add dev dst0 parent 1:1 handle 10: netem delay 80ms
+# qdisc shapes egress, not ingress. Relay -> destination traffic leaves the
+# coordinator through its destination-facing veth; shaping dst0 would throttle
+# only destination -> relay ACK/control traffic and let payload run at line rate.
+ip netns exec "$coord" tc qdisc replace dev "${tag}cd" root handle 1: tbf rate 5mbit burst 64k latency 400ms
+ip netns exec "$coord" tc qdisc add dev "${tag}cd" parent 1:1 handle 10: netem delay 80ms
 
 port=7835
 ip netns exec "$coord" env RUST_LOG=info "$RB_E2E_BIN" server --bind-addr 0.0.0.0 --control-port "$port" --udp=false >"$work/server.log" 2>&1 &

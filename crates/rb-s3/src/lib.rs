@@ -154,6 +154,25 @@ fn unsupported_object_features(object: &S3Object) -> Vec<String> {
     unsupported
 }
 
+fn acl_is_owner_only_full_control(
+    owner_id: Option<&str>,
+    grants: &[aws_sdk_s3::types::Grant],
+) -> bool {
+    let [grant] = grants else { return false };
+    let Some(grantee) = grant.grantee() else {
+        return false;
+    };
+    let owner_id = owner_id.filter(|id| !id.is_empty());
+    let grantee_id = grantee.id().filter(|id| !id.is_empty());
+    grant
+        .permission()
+        .is_some_and(|permission| permission.as_str() == "FULL_CONTROL")
+        && grantee.r#type().as_str() == "CanonicalUser"
+        && grantee_id == owner_id
+        && grantee.email_address().is_none()
+        && grantee.uri().is_none()
+}
+
 async fn validate_source_fidelity(params: &S3Params, objects: &[S3Object]) -> Result<()> {
     let client = client(params).await;
     let versioning = client
@@ -195,6 +214,28 @@ async fn validate_source_fidelity(params: &S3Params, objects: &[S3Object]) -> Re
                 Phase::Analyze,
                 format!(
                     "S3 object {:?} has tags; object tags are not preserved",
+                    object.key
+                ),
+            ));
+        }
+        let acl = client
+            .get_object_acl()
+            .bucket(&params.bucket)
+            .key(&object.key)
+            .send()
+            .await
+            .map_err(|e| {
+                BackupError::phase(
+                    Phase::Analyze,
+                    format!("read S3 object ACL {:?}: {e}", object.key),
+                )
+            })?;
+        let owner_id = acl.owner().and_then(|owner| owner.id());
+        if !acl_is_owner_only_full_control(owner_id, acl.grants()) {
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "S3 object {:?} has a non-default ACL; object ACLs are not preserved",
                     object.key
                 ),
             ));
@@ -831,5 +872,40 @@ mod tests {
         assert!(unsupported_object_features(&huge)
             .join(" ")
             .contains("5 TiB"));
+    }
+
+    #[test]
+    fn fidelity_accepts_only_the_default_owner_acl() {
+        fn grant(id: &str, permission: aws_sdk_s3::types::Permission) -> aws_sdk_s3::types::Grant {
+            let grantee = aws_sdk_s3::types::Grantee::builder()
+                .id(id)
+                .r#type(aws_sdk_s3::types::Type::CanonicalUser)
+                .build()
+                .unwrap();
+            aws_sdk_s3::types::Grant::builder()
+                .grantee(grantee)
+                .permission(permission)
+                .build()
+        }
+
+        let owner = grant("owner", aws_sdk_s3::types::Permission::FullControl);
+        assert!(acl_is_owner_only_full_control(
+            Some("owner"),
+            std::slice::from_ref(&owner)
+        ));
+        assert!(!acl_is_owner_only_full_control(Some("other"), &[owner]));
+        let public = grant("owner", aws_sdk_s3::types::Permission::Read);
+        assert!(!acl_is_owner_only_full_control(Some("owner"), &[public]));
+        assert!(!acl_is_owner_only_full_control(Some("owner"), &[]));
+        let minio_default = aws_sdk_s3::types::Grant::builder()
+            .grantee(
+                aws_sdk_s3::types::Grantee::builder()
+                    .r#type(aws_sdk_s3::types::Type::CanonicalUser)
+                    .build()
+                    .unwrap(),
+            )
+            .permission(aws_sdk_s3::types::Permission::FullControl)
+            .build();
+        assert!(acl_is_owner_only_full_control(Some(""), &[minio_default]));
     }
 }

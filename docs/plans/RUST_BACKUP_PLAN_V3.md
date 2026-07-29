@@ -92,18 +92,25 @@ complete below only when its named command has been observed.
 | Area | Observed status |
 |---|---|
 | F1.1 ordered item-pinned restore | implemented; `cargo test -p rb-core --test session_test multi_carrier_run_ok --all-features` and real relay 4-carrier smoke pass |
-| F1.2 negotiated count + bounded stream setup | implemented and covered by the real 4-carrier relay smoke; legacy `PlanAck` defaults to one carrier |
+| F1.2 negotiated count + bounded stream setup | implemented and covered by real 1/4-carrier relay smoke; current peers negotiate a separate control/data layout, while missing legacy fields default to one multiplexed carrier |
 | F1.3 explicit multi-carrier abort | implemented in both directions; dedicated fault-bank expansion remains open |
-| F1.4 bounded source abort observation | implemented by an explicitly cancelled control watcher; dedicated 50-item bound test remains open |
+| F1.4 bounded source abort observation | complete: control abort interrupts pacing and blocked writes; the 50-item regression bounds backend work to at most three started items, preserves the reason, and completes all 50 on the happy path |
 | F1.5 carrier caps/trailer validation | filesystem cap and conservative module caps implemented; core/PostgreSQL/MongoDB trailer validation implemented; full per-module adversarial matrix remains open |
 | F1.6 carrier docs | implemented in `docs/TRANSPORT.md` and `USAGE.md` |
 | F5.3 typed exit codes | typed `BackupError` paths preserved at the CLI boundary; wording-independence unit test passes |
-| F6.1 reflexive profile | STUN observations now populate reflexive candidates and mapping classification; F6.2–F6.8 remain open |
+| F6.1 reflexive profile | STUN observations now populate reflexive candidates and mapping classification; F6.2, F6.5 and F6.7 remain open |
 | F7.1/F7.4 | QA guide and non-privileged default matrix implemented; privileged scripts are opt-in only |
 | F4.1 multipart abort cleanup | implemented and observed on MinIO: injected post-part failure leaves no incomplete upload and source listing unchanged |
 | F5.1 reconnect decision | complete: unimplemented reconnect scaffold removed; a dropped coordination path fails explicitly and cannot resume a half-applied restore |
 | F7.2 parity | complete: `scripts/help_parity.sh` is part of `scripts/gates.sh` and checks every clap help flag against `USAGE.md` |
-| F2.1 protocol fault injections | reusable data-driven in-process bank added for corrupted chunk/item hashes, totals, duplicate trailer, unexpected carrier hello, abort, and plan bounds over 1/4 carrier parser paths |
+| F2.1 protocol fault injections | reusable 26-case bank covers EOF/no `StreamEnd`, incomplete items, offset gaps, oversize/corrupt chunks, item hashes/totals, duplicate trailer, carrier hello, abort and plan bounds over 1/4 carrier parser paths |
+| Completion race found by severe audit | fixed with required `CompleteAck`/`CompleteAckAck`; source waits for destination apply + final verification and destination waits until receipt is confirmed; one/four-carrier regressions and MinIO pass |
+| Consumer-first relay race found by severe audit | relay waits a bounded 10 s for provider registration instead of dropping an early consumer stream; deterministic regression and parallel two-target e2e pass |
+| Dependency audit | vulnerable dependency paths updated or removed; `cargo audit` passes over 420 resolved dependencies |
+| F2.4 real disk-full | ext4 loop-device e2e passes 5/5: phase-tagged ENOSPC, bilateral bounded failure, peer reason, source immutability and partial-file cleanup |
+| F3.1 privileged filesystem | passes 4/4; root metadata including a real post-chown 04755 mode, non-root fallback, and abort immutability observed |
+| F3.2 privileged transport | passes 9/9 after adding the missing QUIC stream-ready marker; direct and setup-fallback transfers complete, active-path loss fails closed with immutable source and partial cleanup |
+| F3.3 bandwidth/backpressure | passes 6/6; final aggregate: 200 MiB over real 5 Mbit/s egress took 354 s at 9,908 KiB source RSS; 256 KiB/s cap took 66 s at 10,228 KiB RSS |
 | F6.3 v2 broker riders | candidates, priority/kind and NAT profile are sanitized then forwarded end-to-end; old frames retain serde defaults and frame cap coverage |
 | F6.6 learned-address cache | bounded process-local cache is integrated into direct setup: cached peer first, remember successful path, invalidate on direct failure |
 | F6.4 authenticated checks | implemented before QUIC on the same UDP socket: HMAC key derivation, bounded candidate groups, invalid-packet rejection and loopback nomination test |
@@ -118,18 +125,35 @@ cargo test -p rust-backup --all-features                     PASS, 0 ignored
 RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh           PASS=4 FAIL=0
 RUST_BACKUP_E2E_TLS=1 RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
                                                                PASS=4 FAIL=0
+RUST_BACKUP_E2E_CARRIERS=1 bash e2e/relay_smoke.sh × 20        PASS=20 FAIL=0
 bash scripts/gates.sh                                        ALL GATES PASSED
 bash e2e/s3_minio_test.sh                                    PASS (base + injected multipart abort)
+bash e2e/s3_minio_test.sh                                    PASS again (flakiness check)
+bash e2e/postgres_matrix.sh 10 12 14 16 18                   PASS=25 FAIL=0
+bash e2e/mongodb_matrix.sh 4 5 6 7 8                         PASS=20 FAIL=0
+bash e2e/full_matrix.sh                                     PASS=8 FAIL=0
+RUST_BACKUP_PRIVILEGED=1 bash e2e/full_matrix.sh            PASS=12 FAIL=0
+cargo audit                                                 PASS (420 dependencies)
+sudo -n e2e/filesystem_netns_test.sh                        PASS=4 FAIL=0
+sudo -n e2e/filesystem_disk_full.sh                         PASS=5 FAIL=0
+sudo -n e2e/transport_netns_test.sh                         PASS=9 FAIL=0
+sudo -n e2e/bandwidth_netem.sh                              PASS=6 FAIL=0
 ```
 
-Deliberately not run: every sudo/netns/bandwidth command.  Not yet complete:
-the full F2 fault bank and Docker fault matrix, S3 abort injection, reconnect
-decision, remaining NAT rows, CI/help-parity expansion, and the privileged
-measurements.
+The installed path-wildcard NOPASSWD rule permits and has observed all privileged
+scripts. Because the matched repository directory is user-writable, that rule is
+equivalent to allowing arbitrary root code; retain it only on a disposable test
+host, or replace it with a root-owned, narrowly validated runner.
+Not yet complete: the Docker-backed ≥20-case backend fault matrix, remaining NAT
+rows, real AWS, and the multi-carrier speed comparison.
 
 ---
 
-## 1. Bug register (found by review; all still present)
+## 1. Original bug register (found by the initial review)
+
+The register below is the input to this plan, not the current state. The
+observed-status table above and the audit report linked from this directory are
+authoritative for fixes that have since landed.
 
 Severity: **S1** = wrong data / silent corruption or hang · **S2** = wrong
 error/behaviour under fault · **S3** = hardening / hygiene.
@@ -349,13 +373,13 @@ helpers so no case can forget one:
   **Done:** the script prints `PASS=N FAIL=0` with **N ≥ 20** on a Docker host,
   and the run is recorded in `docs/plans/V1_LIVE_RESULTS.md`.
 
-- **F2.4** *(Sonnet)* — **Destination disk-full (needs sudo for the loop device).**
-  **Files:** `e2e/fault_matrix.sh` (guarded case), `docs/QA_GUIDE.md`.
+- **F2.4 ✅** *(Sonnet)* — **Destination disk-full (needs sudo for the loop device).**
+  **Files:** `e2e/filesystem_disk_full.sh`, `docs/QA_GUIDE.md`.
   **Change:** create a small fixed-size loopback filesystem, restore a payload
   larger than it, assert `ENOSPC` surfaces as a phase-tagged `Apply` error naming
-  the item, assert A and B. Skip with a clear `SKIP` line (not a pass) when not
-  root.
-  **Done:** the case passes under `sudo -n`, and skips loudly otherwise.
+  the item, assert A and B. The exact-path script rejects non-root invocation.
+  **Done:** 5/5 passes under `sudo -n`, including bounded bilateral abort and
+  loop/mount cleanup.
 
 - **F2.5** *(Sonnet)* — **Immutability under concurrent load** (the I-IMMUT
   stress case). **Files:** `e2e/fault_matrix.sh`.
@@ -368,27 +392,30 @@ helpers so no case can forget one:
 
 ---
 
-## Phase F3 — 🔴 Execute the privileged e2e (never run yet)
+## Phase F3 — ✅ Execute the privileged e2e
 
 > The three scripts exist but have never been invoked. Until they run, transport
 > fallback, ownership fidelity and I-BANDWIDTH are unproven. Each row is
 > "run it, then fix what it surfaces" — fixes land with an in-process test.
 
-- **F3.1 🔴** *(Sonnet)* — **Run `sudo -n bash e2e/filesystem_netns_test.sh`.**
+- **F3.1 ✅** *(Sonnet)* — **Run `sudo -n e2e/filesystem_netns_test.sh`.**
   Expect breakage in: uid/gid restore without `CAP_CHOWN`, hardlink topology,
   symlink targets, `4755`/`0400` modes, mtime rounding, empty dirs/files.
   **Done:** N pass / 0 fail for the root case **and** the non-root case, with the
   documented warning present in the non-root run; every fix has a unit test in
   `rb-filesystem`; output recorded in `V1_LIVE_RESULTS.md`.
-- **F3.2 🔴** *(Sonnet)* — **Run `sudo -n bash e2e/transport_netns_test.sh`.**
-  Three assertions: direct path used when UDP is reachable; clean relay fallback
-  when the punch ports are dropped; **mid-transfer** UDP drop still completes over
-  the relay with the control channel alive. Watch specifically for: the
+- **F3.2 ✅** *(Sonnet)* — **Run `sudo -n e2e/transport_netns_test.sh`.**
+  Direct path is used when UDP is reachable and relay fallback completes when
+  punch ports are dropped before setup. The original demand that a
+  **mid-transfer** UDP drop resume over relay was corrected by the severe audit:
+  replaying an unacknowledged byte-stream prefix is unsafe and contradicts F5.1.
+  Active loss instead fails both peers before the watchdog, preserves source
+  tree/atimes, removes the active partial item and reports `[Transfer]`. Watch the
   `SO_REUSEADDR` rule on the punch socket (never set it — `EADDRINUSE` ⇒
   ephemeral port), `STREAM_READY` written before splice, and that UDP never gates
   channel liveness (see `CLAUDE.md`).
-  **Done:** 3/3, recorded.
-- **F3.3 🔴** *(Sonnet)* — **Run `sudo -n bash e2e/bandwidth_netem.sh`** (I-BANDWIDTH).
+  **Done:** 9/9, recorded.
+- **F3.3 ✅** *(Sonnet)* — **Run `sudo -n e2e/bandwidth_netem.sh`** (I-BANDWIDTH).
   Asymmetric netem (e.g. source 100 Mbit, destination 5 Mbit, 80 ms RTT), ≥ 200 MiB.
   Assert: transfer completes; every item digest verifies; source `VmRSS` stays
   under a fixed ceiling sampled every second (no read-ahead buffering);
@@ -588,14 +615,15 @@ helpers so no case can forget one:
 | 6 | `e2e/s3_minio_test.sh` green **incl. abort injection** | F4.1 |
 | 7 | `e2e/fault_matrix.sh` ≥ 20 cases, `FAIL=0` | F2.3 |
 | 8 | in-process fault bank ≥ 26 cases, `0 ignored` | F2.1, F2.2 |
-| 9 | `sudo -n e2e/filesystem_netns_test.sh` green, root + non-root + mid-abort | F3.1 |
-| 10 | `sudo -n e2e/transport_netns_test.sh` 3/3 | F3.2 |
-| 11 | `sudo -n e2e/bandwidth_netem.sh` green with RSS ceiling + rate cap asserted | F3.3 |
-| 12 | carriers: negotiated, ordered, per-module capped; no configuration deadlocks | F1.2, F1.5 |
-| 13 | exit codes stable under message rewording | F5.3 |
-| 14 | `--help` ↔ `USAGE.md` parity check green in CI | F7.2 |
-| 15 | `docs/QA_GUIDE.md` walkthrough executed end to end by someone who did not write it | F7.1 |
-| 16 | Opus sign-off recorded | F7.6 |
+| 9 | `sudo -n e2e/filesystem_disk_full.sh` 5/5 | F2.4 |
+| 10 | `sudo -n e2e/filesystem_netns_test.sh` green, root + non-root + mid-abort | F3.1 |
+| 11 | `sudo -n e2e/transport_netns_test.sh` 9/9, including active-loss fail-safe | F3.2 |
+| 12 | `sudo -n e2e/bandwidth_netem.sh` green with RSS ceiling + rate cap asserted | F3.3 |
+| 13 | carriers: negotiated, ordered, per-module capped; no configuration deadlocks | F1.2, F1.5 |
+| 14 | exit codes stable under message rewording | F5.3 |
+| 15 | `--help` ↔ `USAGE.md` parity check green in CI | F7.2 |
+| 16 | `docs/QA_GUIDE.md` walkthrough executed end to end by someone who did not write it | F7.1 |
+| 17 | Opus sign-off recorded | F7.6 |
 
 Phase **F6 is explicitly NOT a QA criterion** — it is v0.2. `docs/TRANSPORT.md`
 must state plainly which bore NAT capabilities are not yet ported, so QA does not

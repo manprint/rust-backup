@@ -9,7 +9,25 @@ RB_E2E_BIN=${RUST_BACKUP_BIN:-"$RB_E2E_ROOT/target/release/rust-backup"}
 rb_build_release() {
   if [[ ! -x "$RB_E2E_BIN" ]] || find "$RB_E2E_ROOT/Cargo.toml" "$RB_E2E_ROOT/crates" \
       -type f -newer "$RB_E2E_BIN" -print -quit | grep -q .; then
-    (cd "$RB_E2E_ROOT" && cargo build --release --all-features)
+    if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+      # Exact-path sudo runs with secure_path and normally hides rustup/cargo.
+      # Build as the invoking user: this both finds their toolchain and avoids
+      # leaving root-owned artifacts in a developer checkout.
+      local invoking_home cargo_bin
+      invoking_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+      cargo_bin="$invoking_home/.cargo/bin/cargo"
+      if [[ -z "$invoking_home" || ! -x "$cargo_bin" ]]; then
+        echo "ERROR: cargo toolchain not found for sudo user $SUDO_USER" >&2
+        return 2
+      fi
+      runuser -u "$SUDO_USER" -- env \
+        HOME="$invoking_home" CARGO_HOME="$invoking_home/.cargo" \
+        RUSTUP_HOME="$invoking_home/.rustup" \
+        "$cargo_bin" build --manifest-path "$RB_E2E_ROOT/Cargo.toml" \
+        --release --all-features
+    else
+      (cd "$RB_E2E_ROOT" && cargo build --release --all-features)
+    fi
   fi
 }
 
@@ -84,6 +102,46 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
         elif kind == b'l':
             h.update(os.readlink(path).encode() + b'\n')
 print(h.hexdigest())
+PY
+}
+
+# Human-readable counterpart to rb_tree_digest, emitted only on failures so an
+# e2e mismatch identifies the exact metadata/content field instead of a pair of
+# opaque hashes.
+rb_tree_manifest() {
+  python3 - "$1" <<'PY'
+import hashlib, os, stat, sys
+root = os.path.abspath(sys.argv[1])
+hardlinks = {}
+next_hardlink = 1
+for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
+    dirs.sort(); names.sort()
+    for name in dirs + names:
+        path = os.path.join(base, name)
+        rel = os.path.relpath(path, root)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode): kind = 'f'
+        elif stat.S_ISDIR(st.st_mode): kind = 'd'
+        elif stat.S_ISLNK(st.st_mode): kind = 'l'
+        else: kind = '?'
+        link_group = '-'
+        if kind == 'f' and st.st_nlink > 1:
+            key = (st.st_dev, st.st_ino)
+            if key not in hardlinks:
+                hardlinks[key] = next_hardlink
+                next_hardlink += 1
+            link_group = str(hardlinks[key])
+        payload = '-'
+        if kind == 'f':
+            h = hashlib.sha256()
+            with open(path, 'rb', buffering=0) as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    h.update(chunk)
+            payload = h.hexdigest()
+        elif kind == 'l':
+            payload = os.readlink(path)
+        print('\t'.join((kind, rel, oct(stat.S_IMODE(st.st_mode)), str(st.st_uid),
+            str(st.st_gid), str(st.st_mtime_ns), str(st.st_size), link_group, payload)))
 PY
 }
 

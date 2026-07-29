@@ -14,7 +14,8 @@ use tokio::time::timeout;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
@@ -37,18 +38,15 @@ pub fn load_server_tls(cert_file: &str, key_file: &str) -> Result<TlsAcceptor> {
 
 /// Build a control-channel TLS acceptor from PEM bytes.
 pub fn server_tls_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
-    let mut cert_reader = std::io::BufReader::new(cert_pem);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to parse TLS certificate PEM")?;
     anyhow::ensure!(
         !certs.is_empty(),
         "no certificates found in TLS certificate PEM"
     );
-    let mut key_reader = std::io::BufReader::new(key_pem);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse TLS private-key PEM")?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in TLS private-key PEM"))?;
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem).context("failed to parse TLS private-key PEM")?;
     let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
     ))

@@ -87,12 +87,12 @@ pub trait ChunkSource: Send {
 }
 
 /// A [`ChunkSink`] backed by a single transport substream.
-pub struct StreamChunkSink<S: DuplexStream> {
+pub struct StreamChunkSink<S: AsyncWrite + Unpin + Send> {
     stream: S,
     progress: Option<Progress>,
 }
 
-impl<S: DuplexStream> StreamChunkSink<S> {
+impl<S: AsyncWrite + Unpin + Send> StreamChunkSink<S> {
     pub fn new(stream: S) -> Self {
         Self {
             stream,
@@ -113,7 +113,7 @@ impl<S: DuplexStream> StreamChunkSink<S> {
 }
 
 #[async_trait]
-impl<S: DuplexStream> ChunkSink for StreamChunkSink<S> {
+impl<S: AsyncWrite + Unpin + Send> ChunkSink for StreamChunkSink<S> {
     async fn send_chunk(&mut self, item_id: u32, offset: u64, data: &[u8]) -> Result<()> {
         if data.len() > wire::CHUNK_SIZE {
             return Err(BackupError::phase(
@@ -237,7 +237,21 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
     async fn next(&mut self) -> Result<ChunkEvent> {
         let frame: Option<DataFrame> = wire::recv_frame(&mut self.stream).await?;
         match frame {
-            None | Some(DataFrame::StreamEnd) => Ok(ChunkEvent::End),
+            None => Err(BackupError::phase(
+                Phase::Transfer,
+                "data carrier closed before StreamEnd",
+            )),
+            Some(DataFrame::StreamEnd) => {
+                if !self.item_hashers.is_empty() {
+                    let mut incomplete: Vec<_> = self.item_hashers.keys().copied().collect();
+                    incomplete.sort_unstable();
+                    return Err(BackupError::phase(
+                        Phase::Transfer,
+                        format!("StreamEnd with incomplete items={incomplete:?}"),
+                    ));
+                }
+                Ok(ChunkEvent::End)
+            }
             Some(DataFrame::CarrierHello { carrier }) => Err(BackupError::phase(
                 Phase::Transfer,
                 format!("unexpected CarrierHello carrier={carrier} after data stream setup"),
@@ -259,6 +273,15 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                     return Err(BackupError::phase(
                         Phase::Transfer,
                         format!("incoming chunk len {len} exceeds CHUNK_SIZE"),
+                    ));
+                }
+                let expected_offset = self.item_totals.get(&item_id).copied().unwrap_or_default();
+                if offset != expected_offset {
+                    return Err(BackupError::phase(
+                        Phase::Transfer,
+                        format!(
+                            "non-contiguous chunk for item={item_id}: offset={offset} expected={expected_offset}"
+                        ),
                     ));
                 }
                 let mut data = vec![0u8; len as usize];
@@ -559,6 +582,7 @@ pub async fn send_plan<S: DuplexStream>(
         &ControlFrame::Plan {
             plan: Box::new(plan.clone()),
             carriers: carriers.clamp(1, u32::MAX as usize) as u32,
+            separate_data_streams: true,
         },
     )
     .await
@@ -569,9 +593,15 @@ pub async fn send_plan<S: DuplexStream>(
 /// A plan whose `format_version` this build does not understand is rejected here
 /// (the plan is self-contained, so a version we cannot interpret must never be
 /// half-applied).
-pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<(crate::plan::BackupPlan, u32)> {
+pub async fn recv_plan<S: DuplexStream>(
+    ctrl: &mut S,
+) -> Result<(crate::plan::BackupPlan, u32, bool)> {
     match wire::recv_frame::<_, ControlFrame>(ctrl).await? {
-        Some(ControlFrame::Plan { plan: p, carriers }) => {
+        Some(ControlFrame::Plan {
+            plan: p,
+            carriers,
+            separate_data_streams,
+        }) => {
             if p.format_version != crate::plan::PLAN_FORMAT_VERSION {
                 return Err(BackupError::PlanRejected(format!(
                     "unsupported plan format_version {} (this build understands {})",
@@ -580,7 +610,7 @@ pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<(crate::plan::Ba
                 )));
             }
             validate_plan_bounds(&p)?;
-            Ok((*p, carriers.max(1)))
+            Ok((*p, carriers.max(1), separate_data_streams))
         }
         Some(ControlFrame::Abort { reason }) => Err(BackupError::PlanRejected(reason)),
         other => Err(BackupError::phase(
@@ -636,6 +666,7 @@ pub async fn send_ack<S: DuplexStream>(
     accepted: bool,
     reason: &str,
     carriers: usize,
+    separate_data_streams: bool,
 ) -> Result<()> {
     wire::send_frame(
         ctrl,
@@ -643,19 +674,21 @@ pub async fn send_ack<S: DuplexStream>(
             accepted,
             reason: reason.to_string(),
             carriers: carriers.clamp(1, u32::MAX as usize) as u32,
+            separate_data_streams,
         },
     )
     .await
 }
 
 /// Source: await the destination's decision.
-pub async fn recv_ack<S: DuplexStream>(ctrl: &mut S) -> Result<u32> {
+pub async fn recv_ack<S: DuplexStream>(ctrl: &mut S) -> Result<(u32, bool)> {
     match wire::recv_frame::<_, ControlFrame>(ctrl).await? {
         Some(ControlFrame::PlanAck {
             accepted: true,
             carriers,
+            separate_data_streams,
             ..
-        }) => Ok(carriers.max(1)),
+        }) => Ok((carriers.max(1), separate_data_streams)),
         Some(ControlFrame::PlanAck { reason, .. }) => Err(BackupError::PlanRejected(reason)),
         other => Err(BackupError::phase(
             Phase::Connect,

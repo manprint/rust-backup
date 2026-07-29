@@ -15,6 +15,10 @@ deletes pre-existing entries as part of a restore.
 | **uid / gid (ownership)** | always (recorded in plan) | **only when privileged** | **root or `CAP_CHOWN`** |
 | xattrs | not yet supported | not yet supported | — |
 
+On privileged restores ownership is applied before the final permission bits:
+POSIX `chown` clears setuid/setgid on regular files, so the reverse order would
+silently turn modes such as `04755` into `0755`.
+
 ## The sudo / ownership case (important)
 
 `chown`-ing a restored file to an arbitrary `uid`/`gid` is a privileged operation on
@@ -54,6 +58,9 @@ running-user ownership.
   fingerprint (path + metadata + content hash) before and after and asserts equality.
 - **I-NOTEMP**: files stream in 64 KiB reads straight into the channel; nothing is
   copied to a staging directory.
-- Implementation status: Phase 4 core path is implemented and unit-tested;
-  privileged root/CAP_CHOWN and interrupted-transfer cases still need the
-  documented live Linux e2e coverage.
+- An item is published directly at its final path, but its active file is removed
+  on EOF, Abort, integrity failure, write error, or ENOSPC; a truncated active
+  file is never left looking committed.
+- Implementation status: the core path and interrupted-file cleanup are
+  unit-tested; privileged root/CAP_CHOWN live coverage still requires the
+  documented sudo matrix.

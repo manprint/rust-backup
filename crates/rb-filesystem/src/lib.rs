@@ -230,7 +230,7 @@ mod tests {
         fs::write(root.join("nested/data.bin"), data).unwrap();
         fs::set_permissions(
             root.join("nested/data.bin"),
-            fs::Permissions::from_mode(0o640),
+            fs::Permissions::from_mode(0o4640),
         )
         .unwrap();
         std::os::unix::fs::symlink("nested/data.bin", root.join("data-link")).unwrap();
@@ -345,7 +345,45 @@ mod tests {
                 .unwrap()
                 .mode()
                 & 0o7777,
-            0o640
+            0o4640
+        );
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_restore_removes_the_active_partial_file() {
+        let source_root = tempdir("partial-source");
+        let destination_root = tempdir("partial-destination");
+        fixture(&source_root);
+        let source = FilesystemSource {
+            params: params(&source_root),
+        };
+        let plan = source.analyze().await.unwrap();
+        let item = plan
+            .items
+            .iter()
+            .find(|item| item.estimated_bytes > 16)
+            .expect("fixture has a data item")
+            .clone();
+        let mut events = VecDeque::from([
+            ChunkEvent::Chunk {
+                item_id: item.id,
+                offset: 0,
+                data: vec![0x5a; 16],
+            },
+            ChunkEvent::End,
+        ]);
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        destination
+            .stream_in(&plan, &mut EventSource(std::mem::take(&mut events)))
+            .await
+            .expect_err("truncated item must fail");
+        assert!(
+            !destination_root.join(&item.name).exists(),
+            "an interrupted item must not remain at its final path"
         );
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();

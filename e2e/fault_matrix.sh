@@ -24,9 +24,10 @@ trap cleanup EXIT INT TERM
 pass() { printf 'PASS: %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 
-# Deterministic in-process faults: rejected plan, source error and immutability.
-if cargo test -p rb-core --test session_test >/dev/null; then
-  pass 'core protocol faults are phase-tagged and source immutability is audited'
+# Deterministic in-process faults: the 26-case wire bank plus session-level
+# rejection, source-error, completion and immutability paths.
+if cargo test -p rb-core --test fault_injection --test session_test >/dev/null; then
+  pass '26-case core protocol bank is phase-tagged and source immutability is audited'
 else
   fail 'core protocol fault bank failed'
 fi

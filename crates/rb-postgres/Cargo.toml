@@ -20,5 +20,4 @@ tokio-postgres = { workspace = true }
 tokio-postgres-rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
-rustls-pemfile.workspace = true
 tracing.workspace = true

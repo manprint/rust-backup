@@ -4,14 +4,19 @@ use rb_core::channel::DataChannel;
 use rb_core::config::TransportConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local addr").port()
+}
+
 #[tokio::test]
 async fn relay_roundtrip() {
-    let port = 9999;
+    let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
     let cfg = rb_core::config::ServerConfig {
         bind_addr: "127.0.0.1".to_string(),
-        control_port: port as u16,
+        control_port: port,
         secret: None,
         tls_cert: None,
         tls_key: None,
@@ -71,4 +76,57 @@ async fn relay_roundtrip() {
     buf.clear();
     stream1.read_to_end(&mut buf).await.expect("read failed");
     assert_eq!(&buf, b"hello from source");
+}
+
+#[tokio::test]
+async fn consumer_stream_can_arrive_before_provider_registration() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = rb_core::config::ServerConfig {
+        bind_addr: "127.0.0.1".to_string(),
+        control_port: port,
+        secret: None,
+        tls_cert: None,
+        tls_key: None,
+        max_conns: 256,
+        udp: false,
+    };
+    let server = tokio::spawn(async move { rb_transport::run_server(&cfg).await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let transport = TransportConfig {
+        to: addr,
+        channel: "consumer-first".into(),
+        secret: None,
+        carriers: 1,
+        udp: false,
+        insecure: true,
+        max_rate: None,
+    };
+
+    let destination = rb_transport::connect_destination(&transport)
+        .await
+        .expect("destination connects first");
+    let mut destination_stream = destination
+        .open_stream()
+        .await
+        .expect("consumer opens before provider exists");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let source = rb_transport::connect_source(&transport)
+        .await
+        .expect("provider registers later");
+    let mut source_stream =
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), source.accept_stream())
+            .await
+            .expect("provider accept must be bounded")
+            .expect("provider accepts waiting consumer stream");
+
+    destination_stream
+        .write_all(b"consumer-first")
+        .await
+        .unwrap();
+    destination_stream.shutdown().await.unwrap();
+    let mut received = Vec::new();
+    source_stream.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, b"consumer-first");
+    server.abort();
 }

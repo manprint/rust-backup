@@ -24,6 +24,10 @@ use crate::transport::load_server_tls;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const UDP_BROKER_TIMEOUT: Duration = Duration::from_secs(10);
+/// A consumer is allowed to arrive first.  Its first relay stream waits briefly
+/// for the provider registration instead of being irreversibly dropped by a
+/// lookup race.
+const PROVIDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Control substream recv deadline: the coordination server reaps a registry
 /// entry whose control substream has been silent this long. A yamux substream
@@ -520,10 +524,16 @@ async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Resul
     let mut marker = [0u8; 1];
     consumer.read_exact(&mut marker).await?;
 
-    let pool = registry
-        .get(id)
-        .map(|entry| Arc::clone(entry.value()))
-        .ok_or_else(|| anyhow::anyhow!("no provider registered for '{id}'"))?;
+    let pool = tokio::time::timeout(PROVIDER_REGISTRATION_TIMEOUT, async {
+        loop {
+            if let Some(pool) = registry.get(id).map(|entry| Arc::clone(entry.value())) {
+                break pool;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("provider registration timed out for '{id}'"))?;
     let opener = pool.pick().context("no live provider carrier")?;
     let mut provider = opener.open().await.context("provider unavailable")?;
     provider.write_all(&[mux::STREAM_READY]).await?;

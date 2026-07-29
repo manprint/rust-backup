@@ -7,6 +7,21 @@
 - Multi-carrier transfers now negotiate the safe count on the wire and bind
   relay data streams by explicit carrier identity; filesystem restores are
   plan-ordered and item-pinned without intra-item striping.
+- Added a final `CompleteAck`/`CompleteAckAck` handshake: a source cannot report
+  success before destination apply and digest verification finish, and the
+  destination does not close before the acknowledgement is known to be received.
+  Destination aborts now interrupt source pacing and blocked chunk writes, and
+  truncated carriers/offset gaps are rejected.
+- Interrupted filesystem items remove their partial final-path file. S3 fidelity
+  preflight now rejects non-default ACLs and has a credential-gated real-AWS smoke.
+- Direct QUIC streams now use an explicit readiness byte, privileged restores
+  apply ownership before setuid/setgid mode bits, and current peers negotiate a
+  dedicated data stream even at one carrier so destination aborts interrupt
+  blocked source writes without concurrently splitting a yamux stream.
+- Privileged QA now covers real ext4 ENOSPC and correctly shapes relay egress for
+  the 200 MiB netem/backpressure measurement.
+- Updated vulnerable dependencies and removed the obsolete `rustls-pemfile` and
+  legacy rustls 0.21 dependency path; `cargo audit` is clean.
 
 ## Versioning
 

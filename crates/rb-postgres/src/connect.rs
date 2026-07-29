@@ -133,14 +133,15 @@ async fn connect_client(
 }
 
 fn postgres_tls(params: &PostgresParams) -> Result<MakeRustlsConnect> {
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = &params.sslrootcert {
         let pem = std::fs::read(path).map_err(|e| {
             BackupError::phase_src(Phase::Connect, format!("read sslrootcert {path}"), e)
         })?;
-        let mut reader = std::io::BufReader::new(pem.as_slice());
-        let certs = rustls_pemfile::certs(&mut reader)
+        let certs = tokio_rustls::rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| BackupError::phase_src(Phase::Connect, "parse sslrootcert", e))?;
         if certs.is_empty() {

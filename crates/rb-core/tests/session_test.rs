@@ -1,6 +1,6 @@
 //! End-to-end session orchestration tests over an in-memory channel (T-SESS*).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -25,7 +25,11 @@ impl TestChannel {
     }
 
     fn pair_carriers(carriers: usize) -> Arc<Self> {
-        let streams = if carriers == 1 { 1 } else { carriers + 1 };
+        // Current peers always negotiate one control stream plus N data streams,
+        // including the single-carrier case. Legacy peers may still multiplex
+        // control and payload on one stream, but this harness models both current
+        // endpoints and must therefore provision the negotiated layout.
+        let streams = carriers + 1;
         let mut consumer = Vec::with_capacity(streams);
         let mut provider = Vec::with_capacity(streams);
         for _ in 0..streams {
@@ -319,6 +323,152 @@ impl Destination for FailingPreflightDest {
     }
 }
 
+/// Fails only after consuming the final ItemEnd.  Without CompleteAck the
+/// source could race ahead, send Done, and incorrectly report success.
+struct FailingLastItemDest;
+
+#[async_trait]
+impl Destination for FailingLastItemDest {
+    fn max_carriers(&self) -> usize {
+        32
+    }
+
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        loop {
+            match src.next().await? {
+                ChunkEvent::ItemEnd { .. } => {
+                    return Err(rb_core::error::BackupError::phase(
+                        rb_core::error::Phase::Apply,
+                        "injected failure on final item",
+                    ));
+                }
+                ChunkEvent::End => return Ok(()),
+                ChunkEvent::Chunk { .. } => {}
+            }
+        }
+    }
+}
+
+struct FloodSource;
+
+#[async_trait]
+impl Source for FloodSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        let mut plan = demo_plan();
+        plan.items[0].estimated_bytes = 8 * 1024 * 1024;
+        plan.estimated_bytes = plan.items[0].estimated_bytes;
+        Ok(plan)
+    }
+
+    async fn stream_out(&self, _plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        let chunk = [9u8; 64 * 1024];
+        for index in 0..128 {
+            sink.send_chunk(1, index * chunk.len() as u64, &chunk)
+                .await?;
+        }
+        sink.finish_item(
+            1,
+            128 * chunk.len() as u64,
+            &rb_core::wire::blake3_hex(&vec![9u8; 128 * chunk.len()]),
+        )
+        .await
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable-flood".into())
+    }
+}
+
+struct FailFirstChunkDest;
+
+#[async_trait]
+impl Destination for FailFirstChunkDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        match src.next().await? {
+            ChunkEvent::Chunk { .. } => Err(rb_core::error::BackupError::phase(
+                rb_core::error::Phase::Apply,
+                "injected ENOSPC on first chunk",
+            )),
+            other => panic!("expected first chunk, got {other:?}"),
+        }
+    }
+}
+
+struct FiftyItemSource {
+    started_items: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Source for FiftyItemSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        const ITEM_BYTES: u64 = 512 * 1024;
+        let mut plan = demo_plan();
+        plan.items = (1..=50)
+            .map(|id| PlanItem {
+                id,
+                ordinal: id - 1,
+                kind: "blob".into(),
+                name: format!("item-{id}"),
+                estimated_bytes: ITEM_BYTES,
+                meta: serde_json::Value::Null,
+            })
+            .collect();
+        plan.estimated_bytes = 50 * ITEM_BYTES;
+        Ok(plan)
+    }
+
+    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        for item in &plan.items {
+            self.started_items.fetch_add(1, Ordering::SeqCst);
+            let data = vec![item.id as u8; item.estimated_bytes as usize];
+            sink.send_chunk(item.id, 0, &data).await?;
+            sink.finish_item(
+                item.id,
+                item.estimated_bytes,
+                &rb_core::wire::blake3_hex(&data),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable-fifty".into())
+    }
+}
+
+struct FailAfterFirstItemDest;
+
+#[async_trait]
+impl Destination for FailAfterFirstItemDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        loop {
+            match src.next().await? {
+                ChunkEvent::ItemEnd { item_id: 1, .. } => {
+                    return Err(rb_core::error::BackupError::phase(
+                        rb_core::error::Phase::Apply,
+                        "injected abort after item 1",
+                    ));
+                }
+                ChunkEvent::End => panic!("expected item 1 before stream end"),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// T-SESS4: a source that fails mid-stream propagates its own error, tells the
 /// destination why, and is still audited for immutability.
 #[tokio::test]
@@ -347,6 +497,155 @@ async fn source_failure_aborts_destination_with_reason() {
         format!("{derr}").contains("source aborted mid-stream"),
         "destination should learn the reason: {derr}"
     );
+}
+
+#[tokio::test]
+async fn source_waits_for_destination_completion_on_one_and_four_carriers() {
+    for carriers in [1, 4] {
+        let ch = TestChannel::pair_carriers(carriers);
+        let src = MockSource {
+            fp: "stable".into(),
+            payload: vec![7; 4096],
+        };
+        let peer = ch.clone();
+        let source =
+            tokio::spawn(
+                async move { session::run_source(&src, &*ch, &Progress::default()).await },
+            );
+        let destination = tokio::spawn(async move {
+            let mut yes = |_: &BackupPlan| true;
+            session::run_destination(&FailingLastItemDest, &*peer, &Progress::default(), &mut yes)
+                .await
+        });
+        let source_error = source
+            .await
+            .expect("source task")
+            .expect_err("source must not report success before destination ack");
+        assert!(
+            source_error
+                .to_string()
+                .contains("injected failure on final item"),
+            "carriers={carriers}: source lost destination reason: {source_error}"
+        );
+        destination
+            .await
+            .expect("destination task")
+            .expect_err("injected destination failure");
+    }
+}
+
+#[tokio::test]
+async fn single_carrier_destination_abort_interrupts_a_blocked_source_write() {
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source = tokio::spawn(async move {
+        session::run_source(&FloodSource, &*channel, &Progress::default()).await
+    });
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&FailFirstChunkDest, &*peer, &Progress::default(), &mut yes).await
+    });
+
+    let source_error = tokio::time::timeout(std::time::Duration::from_secs(2), source)
+        .await
+        .expect("destination abort must bound the source")
+        .expect("source task")
+        .expect_err("source must fail");
+    assert!(
+        source_error.to_string().contains("injected ENOSPC"),
+        "source lost destination reason: {source_error}"
+    );
+    destination
+        .await
+        .expect("destination task")
+        .expect_err("injected destination failure");
+}
+
+/// F1.4: an abort after item 1 bounds further backend reads even when 50 items
+/// were planned; the same workload has no spurious abort on the happy path.
+#[tokio::test]
+async fn destination_abort_bounds_fifty_item_source_work() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source_started = started.clone();
+    let source = tokio::spawn(async move {
+        session::run_source(
+            &FiftyItemSource {
+                started_items: source_started,
+            },
+            &*channel,
+            &Progress::default(),
+        )
+        .await
+    });
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(
+            &FailAfterFirstItemDest,
+            &*peer,
+            &Progress::default(),
+            &mut yes,
+        )
+        .await
+    });
+
+    let source_error = tokio::time::timeout(std::time::Duration::from_secs(2), source)
+        .await
+        .expect("destination abort must bound fifty-item source work")
+        .expect("source task")
+        .expect_err("source must observe destination abort");
+    assert!(
+        source_error
+            .to_string()
+            .contains("injected abort after item 1"),
+        "source lost destination reason: {source_error}"
+    );
+    assert!(
+        started.load(Ordering::SeqCst) <= 3,
+        "source started too many backend items after abort: {}",
+        started.load(Ordering::SeqCst)
+    );
+    destination
+        .await
+        .expect("destination task")
+        .expect_err("injected destination failure");
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source_started = started.clone();
+    let source = tokio::spawn(async move {
+        session::run_source(
+            &FiftyItemSource {
+                started_items: source_started,
+            },
+            &*channel,
+            &Progress::default(),
+        )
+        .await
+    });
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let destination_ends = ends.clone();
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(
+            &OrderedDest {
+                ends: destination_ends,
+            },
+            &*peer,
+            &Progress::default(),
+            &mut yes,
+        )
+        .await
+    });
+    source.await.expect("source task").expect("source success");
+    destination
+        .await
+        .expect("destination task")
+        .expect("destination success");
+    assert_eq!(started.load(Ordering::SeqCst), 50);
+    assert_eq!(ends.lock().unwrap().len(), 50);
 }
 
 /// T-SESS5: the immutability audit also runs when the run FAILED — a source that
@@ -615,7 +914,12 @@ async fn completion_requires_every_data_bearing_plan_item() {
         .await
         .expect("destination task")
         .expect_err("missing item must fail verification");
-    assert!(format!("{err}").contains("missing=[2]"), "got: {err}");
+    let message = format!("{err}");
+    assert!(
+        message.contains("missing=[2]")
+            || (message.contains("planned item=2") && message.contains("completed")),
+        "got: {err}"
+    );
     let _ = source.await.expect("source task");
 
     let ch = TestChannel::pair();

@@ -16,12 +16,10 @@ dst_pid=
 cleanup() {
   status=$?
   if [[ $status -ne 0 ]]; then
-    printf -- '--- relay log ---\n' >&2
-    sed -n '1,240p' "$work/server.log" >&2 2>/dev/null || true
-    printf -- '--- source log ---\n' >&2
-    sed -n '1,240p' "$work/source.log" >&2 2>/dev/null || true
-    printf -- '--- destination log ---\n' >&2
-    sed -n '1,240p' "$work/destination.log" >&2 2>/dev/null || true
+    for log in server source destination abort-source abort-destination; do
+      printf -- '--- %s log ---\n' "$log" >&2
+      sed -n '1,240p' "$work/$log.log" >&2 2>/dev/null || true
+    done
   fi
   [[ -n "${dst_pid:-}" ]] && kill "$dst_pid" 2>/dev/null || true
   [[ -n "${source_pid:-}" ]] && kill "$source_pid" 2>/dev/null || true
@@ -56,10 +54,16 @@ start_minio() { # name host-port
 }
 start_minio "$src_name" 19000
 start_minio "$dst_name" 19001
+minio_ready=0
 for _ in {1..30}; do
-  if curl -fsS http://127.0.0.1:19000/minio/health/live >/dev/null && curl -fsS http://127.0.0.1:19001/minio/health/live >/dev/null; then break; fi
+  if curl -fsS http://127.0.0.1:19000/minio/health/live >/dev/null 2>&1 \
+    && curl -fsS http://127.0.0.1:19001/minio/health/live >/dev/null 2>&1; then
+    minio_ready=1
+    break
+  fi
   sleep 1
 done
+(( minio_ready == 1 )) || { echo 'MinIO health checks did not become ready' >&2; exit 1; }
 mc() {
   docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh minio/mc:latest -c \
     'mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && mc alias set dst http://127.0.0.1:19001 minioadmin minioadmin >/dev/null && mc "$@"' sh "$@"

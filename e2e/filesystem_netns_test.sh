@@ -58,6 +58,9 @@ rb_seed_filesystem_fixture "$root_src" $((2 * 1024 * 1024 + 13))
 chown 0:0 "$root_src/nested/hello.txt"
 chown 1:1 "$root_src/hard-a" "$root_src/hard-b" || true
 chown 65534:65534 "$root_src/empty" || true
+# chown clears setuid/setgid; set the special bit afterwards so the root case
+# really exercises privileged mode fidelity instead of comparing two 0755 files.
+chmod 4755 "$root_src/nested/hello.txt"
 port=$(rb_free_port)
 if start_server "$port" "$work/root-server.log" && transfer "$root_src" "$root_dst" "$port" fs-root; then
   if [[ "$(rb_tree_digest "$root_src")" == "$(rb_tree_digest "$root_dst")" ]] && [[ "$(stat -c '%d:%i' "$root_dst/hard-a")" == "$(stat -c '%d:%i' "$root_dst/hard-b")" ]]; then

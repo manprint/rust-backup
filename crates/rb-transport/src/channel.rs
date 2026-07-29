@@ -196,9 +196,24 @@ impl DataChannel for PairedChannel {
                     }
                     .await;
                     match result {
-                        Ok(qt) => {
-                            *direct_streams += 1;
-                            return Ok(Box::new(qt));
+                        Ok(mut qt) => {
+                            // QUIC does not expose a newly opened bidi stream to
+                            // the peer until the opener writes data.  Without
+                            // this marker the destination waited for Plan while
+                            // the source waited in accept_bi: a symmetric
+                            // ten-second deadlock followed by split fallback.
+                            if let Err(e) = qt.write_all(&[mux::STREAM_READY]).await {
+                                tracing::warn!(
+                                    "direct stream ready write failed, falling back to relay: {e}"
+                                );
+                            } else if let Err(e) = qt.flush().await {
+                                tracing::warn!(
+                                    "direct stream ready flush failed, falling back to relay: {e}"
+                                );
+                            } else {
+                                *direct_streams += 1;
+                                return Ok(Box::new(qt));
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("direct stream open failed, falling back to relay: {e}");
@@ -259,9 +274,25 @@ impl DataChannel for PairedChannel {
                     }
                     .await;
                     match result {
-                        Ok(qt) => {
-                            *direct_streams += 1;
-                            return Ok(Box::new(qt));
+                        Ok(mut qt) => {
+                            let mut marker = [0u8; 1];
+                            let ready =
+                                timeout(DIRECT_SETUP_TIMEOUT, qt.read_exact(&mut marker)).await;
+                            match ready {
+                                Ok(Ok(_)) if marker[0] == mux::STREAM_READY => {
+                                    *direct_streams += 1;
+                                    return Ok(Box::new(qt));
+                                }
+                                Ok(Ok(_)) => tracing::warn!(
+                                    "invalid direct stream ready marker, falling back to relay"
+                                ),
+                                Ok(Err(e)) => tracing::warn!(
+                                    "direct stream ready read failed, falling back to relay: {e}"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    "direct stream ready read timed out, falling back to relay"
+                                ),
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(

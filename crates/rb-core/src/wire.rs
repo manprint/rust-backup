@@ -39,6 +39,11 @@ pub enum ControlFrame {
         /// emitted; it is accepted defensively as one for malformed old peers.
         #[serde(default = "default_carriers")]
         carriers: u32,
+        /// New peers keep payload off this control stream even for one carrier,
+        /// allowing abort/completion reads to run concurrently without splitting
+        /// a yamux data stream. False preserves the legacy wire layout.
+        #[serde(default)]
+        separate_data_streams: bool,
     },
     /// Destination → Source: accept/reject decision (async-accept mode).
     PlanAck {
@@ -48,9 +53,18 @@ pub enum ControlFrame {
         /// to one so a newer provider safely interoperates with an old peer.
         #[serde(default = "default_carriers")]
         carriers: u32,
+        /// Echoes the source capability above. Missing on legacy peers.
+        #[serde(default)]
+        separate_data_streams: bool,
     },
     /// Source → Destination: all items streamed; final whole-payload digest.
     Done { total_bytes: u64, blake3: String },
+    /// Destination → Source: apply and final verification both succeeded.
+    /// The source must not report success before receiving this frame.
+    CompleteAck,
+    /// Source → Destination: confirms `CompleteAck` was received, allowing the
+    /// destination to close TLS/yamux without racing buffered delivery.
+    CompleteAckAck,
     /// Either side: abort with reason (clean teardown, no partial apply).
     Abort { reason: String },
 }
@@ -63,7 +77,7 @@ const fn default_carriers() -> u32 {
 /// immediately by exactly `len` raw payload bytes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DataFrame {
-    /// First frame on every negotiated multi-carrier substream.  Relay stream
+    /// First frame on every negotiated separate data substream. Relay stream
     /// accept order is not a carrier identity, so the receiver must bind it
     /// explicitly before applying item-pinning.
     CarrierHello { carrier: u16 },
@@ -186,4 +200,61 @@ where
 /// Hex BLAKE3 digest of a byte slice.
 pub fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlFrame;
+
+    #[test]
+    fn legacy_plan_defaults_to_one_multiplexed_carrier() {
+        let frame: ControlFrame = serde_json::from_value(serde_json::json!({
+            "Plan": {
+                "plan": {
+                    "format_version": 1,
+                    "module": "test",
+                    "mode": "copy1to1",
+                    "created_at": "1970-01-01T00:00:00Z",
+                    "source_summary": "legacy",
+                    "items": [],
+                    "estimated_bytes": 0,
+                    "integrity": { "algorithm": "blake3", "per_item": true },
+                    "payload": null
+                }
+            }
+        }))
+        .expect("legacy Plan must remain decodable");
+
+        match frame {
+            ControlFrame::Plan {
+                carriers,
+                separate_data_streams,
+                ..
+            } => {
+                assert_eq!(carriers, 1);
+                assert!(!separate_data_streams);
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_plan_ack_defaults_to_one_multiplexed_carrier() {
+        let frame: ControlFrame = serde_json::from_value(serde_json::json!({
+            "PlanAck": { "accepted": true, "reason": "" }
+        }))
+        .expect("legacy PlanAck must remain decodable");
+
+        match frame {
+            ControlFrame::PlanAck {
+                carriers,
+                separate_data_streams,
+                ..
+            } => {
+                assert_eq!(carriers, 1);
+                assert!(!separate_data_streams);
+            }
+            other => panic!("expected PlanAck, got {other:?}"),
+        }
+    }
 }

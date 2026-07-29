@@ -9,11 +9,14 @@ cd "$root"
 run bash e2e/resource_hygiene_check.sh
 run bash e2e/relay_smoke.sh
 run env RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
+run env RUST_BACKUP_E2E_TLS=1 bash e2e/relay_smoke.sh
+run env RUST_BACKUP_E2E_TLS=1 RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
 run bash e2e/session_two_targets.sh
 run bash e2e/fault_matrix.sh
 run bash e2e/s3_minio_test.sh
 if [[ ${RUST_BACKUP_PRIVILEGED:-0} == 1 ]]; then
   run sudo -n "$root/e2e/filesystem_netns_test.sh"
+  run sudo -n "$root/e2e/filesystem_disk_full.sh"
   run sudo -n "$root/e2e/transport_netns_test.sh"
   run sudo -n "$root/e2e/bandwidth_netem.sh"
 else

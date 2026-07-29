@@ -147,6 +147,7 @@ pub(crate) async fn stream_in(
                         item.name
                     )));
                 }
+                complete.commit();
             }
             ChunkEvent::End => break,
         }
@@ -168,6 +169,7 @@ struct ActiveFile {
     file: File,
     offset: u64,
     hasher: blake3::Hasher,
+    committed: bool,
 }
 
 impl ActiveFile {
@@ -188,10 +190,26 @@ impl ActiveFile {
             file,
             offset: 0,
             hasher: blake3::Hasher::new(),
+            committed: false,
         })
     }
     fn digest(&self) -> String {
         self.hasher.finalize().to_hex().to_string()
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ActiveFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            // The destination starts empty, so this path was created by this
+            // restore.  Never leave a truncated file looking like committed
+            // state after EOF, Abort, an integrity error, or ENOSPC.
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -250,10 +268,6 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
             continue;
         }
         let path = at_root(root, &entry.path, Phase::Apply)?;
-        if entry.kind != "symlink" {
-            fs::set_permissions(&path, fs::Permissions::from_mode(entry.mode & 0o7777))
-                .map_err(|e| io_error(Phase::Apply, &path, e))?;
-        }
         if chown {
             fchownat(
                 None,
@@ -263,6 +277,13 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
                 AtFlags::AT_SYMLINK_NOFOLLOW,
             )
             .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())))?;
+        }
+        if entry.kind != "symlink" {
+            // chown(2) clears setuid/setgid on regular files. Apply ownership
+            // first and the exact permission bits last, otherwise a successful
+            // privileged restore silently turns 04755 into 0755.
+            fs::set_permissions(&path, fs::Permissions::from_mode(entry.mode & 0o7777))
+                .map_err(|e| io_error(Phase::Apply, &path, e))?;
         }
         let mtime = TimeSpec::new(entry.mtime as i64, entry.mtime_nsec as i64);
         utimensat(

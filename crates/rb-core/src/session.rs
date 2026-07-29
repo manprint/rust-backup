@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -55,6 +56,65 @@ async fn exchange_timeout_with<T>(
             format!("plan exchange timed out waiting for {side}"),
         )
     })?
+}
+
+fn validate_completion_ack(frame: Option<ControlFrame>) -> Result<()> {
+    match frame {
+        Some(ControlFrame::CompleteAck) => Ok(()),
+        Some(ControlFrame::Abort { reason }) => Err(BackupError::phase(
+            Phase::Apply,
+            format!("destination aborted: {reason}"),
+        )),
+        other => Err(BackupError::phase(
+            Phase::Verify,
+            format!("expected CompleteAck, got {other:?}"),
+        )),
+    }
+}
+
+async fn send_completion_ack<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    wire::send_frame(stream, &ControlFrame::CompleteAck).await?;
+    let ack = tokio::time::timeout(
+        wire::IO_IDLE_TIMEOUT,
+        wire::recv_frame::<_, ControlFrame>(stream),
+    )
+    .await
+    .map_err(|_| {
+        BackupError::phase(
+            Phase::Verify,
+            "timed out waiting for source completion acknowledgement",
+        )
+    })??;
+    if !matches!(ack, Some(ControlFrame::CompleteAckAck)) {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!("expected CompleteAckAck, got {ack:?}"),
+        ));
+    }
+    stream.shutdown().await.map_err(|error| {
+        BackupError::phase_src(
+            Phase::Transfer,
+            "gracefully close destination completion stream",
+            error,
+        )
+    })
+}
+
+async fn send_completion_ack_ack<S>(stream: &mut S) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    wire::send_frame(stream, &ControlFrame::CompleteAckAck).await?;
+    stream.shutdown().await.map_err(|error| {
+        BackupError::phase_src(
+            Phase::Transfer,
+            "gracefully close source completion stream",
+            error,
+        )
+    })
 }
 
 /// Outcome of a completed source run (returned for logging/tests).
@@ -139,7 +199,7 @@ async fn source_run(
     let mut stream = stream;
     channel::send_plan(&mut stream, &plan, channel.carriers()).await?;
     // recv_ack errors out (PlanRejected) without ever touching the source.
-    let peer_carriers =
+    let (peer_carriers, separate_data_streams) =
         exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
     let agreed_carriers = channel.carriers().min(peer_carriers as usize).max(1);
     if agreed_carriers != channel.carriers() {
@@ -151,7 +211,7 @@ async fn source_run(
     }
     info!("destination accepted plan; streaming payload");
 
-    if agreed_carriers > 1 {
+    if separate_data_streams || agreed_carriers > 1 {
         return source_stream_multi(
             source,
             channel,
@@ -164,7 +224,9 @@ async fn source_run(
         .await;
     }
 
-    // 4. Stream the payload (no temp files; backpressure consumer-paced).
+    // Legacy peer layout: plan/control and payload share one substream. New
+    // peers negotiate a separate data stream above so their control reader can
+    // observe aborts concurrently without splitting a yamux payload stream.
     let mut stream_sink = StreamChunkSink::new_counted(stream, progress.clone());
     let (streamed, payload_digest) = {
         let mut sink = PacedSink::new(&mut stream_sink, max_rate);
@@ -187,6 +249,7 @@ async fn source_run(
             },
         )
         .await;
+        let _ = stream.shutdown().await;
         return Err(e);
     }
 
@@ -200,12 +263,26 @@ async fn source_run(
         },
     )
     .await?;
+    let completion = tokio::time::timeout(
+        wire::IO_IDLE_TIMEOUT,
+        wire::recv_frame::<_, ControlFrame>(&mut stream),
+    )
+    .await
+    .map_err(|_| {
+        BackupError::phase(
+            Phase::Verify,
+            "timed out waiting for destination completion acknowledgement",
+        )
+    })??;
+    validate_completion_ack(completion)?;
+    send_completion_ack_ack(&mut stream).await?;
 
     Ok(SourceOutcome { plan, bytes_sent })
 }
 
-/// Source payload path for `carriers > 1`. The plan/control stream is kept out
-/// of the data plane; an item always maps to one data substream.
+/// Source payload path for the negotiated separate-data layout. The plan/control
+/// stream is kept out of the data plane even with one carrier; an item always
+/// maps to exactly one data substream.
 async fn source_stream_multi(
     source: &dyn Source,
     channel: &dyn DataChannel,
@@ -215,20 +292,6 @@ async fn source_stream_multi(
     control: Box<dyn crate::channel::DuplexStream>,
     carriers: usize,
 ) -> Result<SourceOutcome> {
-    let (control_read, mut control_write) = tokio::io::split(control);
-    let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
-    // This is the one control-plane reader.  It is explicitly cancelled below;
-    // carrier readers are deliberately not spawned (ordered pull owns them).
-    let abort_task = tokio::spawn(async move {
-        let mut control_read = control_read;
-        let observed = match wire::recv_frame::<_, ControlFrame>(&mut control_read).await {
-            Ok(Some(ControlFrame::Abort { reason })) => format!("destination aborted: {reason}"),
-            Ok(Some(other)) => format!("unexpected control frame while streaming: {other:?}"),
-            Ok(None) => "control stream closed while streaming".to_string(),
-            Err(error) => error.to_string(),
-        };
-        let _ = abort_tx.send(Some(observed));
-    });
     let mut streams = Vec::with_capacity(carriers);
     for index in 0..carriers {
         let mut stream = exchange_timeout(
@@ -245,6 +308,30 @@ async fn source_stream_multi(
         .await?;
         streams.push(stream);
     }
+    // Start the sole control reader only after carrier setup.  Starting it
+    // before a fallible setup step detached the task whenever `?` returned.
+    // An Abort sent during setup remains buffered on the control stream.
+    let (control_read, mut control_write) = tokio::io::split(control);
+    let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
+    let abort_task = tokio::spawn(async move {
+        let mut control_read = control_read;
+        let received = wire::recv_frame::<_, ControlFrame>(&mut control_read).await;
+        let observed = match &received {
+            Ok(Some(ControlFrame::CompleteAck)) => None,
+            Ok(Some(ControlFrame::Abort { reason })) => {
+                Some(format!("destination aborted: {reason}"))
+            }
+            Ok(Some(other)) => Some(format!(
+                "unexpected control frame while streaming: {other:?}"
+            )),
+            Ok(None) => Some("control stream closed while streaming".to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(observed) = observed {
+            let _ = abort_tx.send(Some(observed));
+        }
+        received
+    });
     let mut data_sink = MultiStreamChunkSink::new_counted(streams, progress.clone())?;
     let (streamed, payload_digest) = {
         let mut sink = PacedSink::new(&mut data_sink, max_rate).with_abort_watch(&mut abort_rx);
@@ -268,16 +355,35 @@ async fn source_stream_multi(
         return Err(error);
     }
     let bytes_sent = progress.bytes();
-    wire::send_frame(
+    let done_result = wire::send_frame(
         &mut control_write,
         &ControlFrame::Done {
             total_bytes: bytes_sent,
             blake3: payload_digest,
         },
     )
-    .await?;
-    abort_task.abort();
-    let _ = abort_task.await;
+    .await;
+    if let Err(error) = done_result {
+        abort_task.abort();
+        let _ = abort_task.await;
+        return Err(error);
+    }
+    let completion = tokio::time::timeout(wire::IO_IDLE_TIMEOUT, abort_task)
+        .await
+        .map_err(|_| {
+            BackupError::phase(
+                Phase::Verify,
+                "timed out waiting for destination completion acknowledgement",
+            )
+        })?
+        .map_err(|error| {
+            BackupError::phase(
+                Phase::Transfer,
+                format!("completion watcher task failed: {error}"),
+            )
+        })??;
+    validate_completion_ack(completion)?;
+    send_completion_ack_ack(&mut control_write).await?;
     Ok(SourceOutcome { plan, bytes_sent })
 }
 
@@ -308,20 +414,52 @@ impl<'a> PacedSink<'a> {
     fn delay_for(rate: u64, sent: u64, elapsed: Duration) -> Option<Duration> {
         Duration::from_secs_f64(sent as f64 / rate as f64).checked_sub(elapsed)
     }
-    async fn pace(&mut self, bytes: usize) {
-        let Some(rate) = self.rate else { return };
+    fn abort_error(abort_watch: &watch::Receiver<Option<String>>) -> BackupError {
+        BackupError::phase(
+            Phase::Transfer,
+            abort_watch
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "destination control stream closed".to_string()),
+        )
+    }
+    async fn pace(&mut self, bytes: usize) -> Result<()> {
+        let Some(rate) = self.rate else { return Ok(()) };
         self.sent = self.sent.saturating_add(bytes as u64);
         if let Some(delay) = Self::delay_for(rate, self.sent, self.started.elapsed()) {
-            tokio::time::sleep(delay).await;
+            if let Some(abort_watch) = self.abort_watch.as_deref_mut() {
+                if abort_watch.borrow().is_some() {
+                    return Err(Self::abort_error(abort_watch));
+                }
+                tokio::select! {
+                    biased;
+                    _ = abort_watch.changed() => return Err(Self::abort_error(abort_watch)),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
         }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl ChunkSink for PacedSink<'_> {
     async fn send_chunk(&mut self, item_id: u32, offset: u64, data: &[u8]) -> Result<()> {
-        self.pace(data.len()).await;
-        self.inner.send_chunk(item_id, offset, data).await
+        self.pace(data.len()).await?;
+        let inner = &mut self.inner;
+        let Some(abort_watch) = self.abort_watch.as_deref_mut() else {
+            return inner.send_chunk(item_id, offset, data).await;
+        };
+        if abort_watch.borrow().is_some() {
+            return Err(Self::abort_error(abort_watch));
+        }
+        tokio::select! {
+            biased;
+            _ = abort_watch.changed() => Err(Self::abort_error(abort_watch)),
+            result = inner.send_chunk(item_id, offset, data) => result,
+        }
     }
     async fn finish_item(&mut self, item_id: u32, total: u64, blake3: &str) -> Result<()> {
         if self.completed_items.contains_key(&item_id) {
@@ -330,19 +468,35 @@ impl ChunkSink for PacedSink<'_> {
                 format!("source emitted duplicate ItemEnd for item={item_id}"),
             ));
         }
-        self.inner.finish_item(item_id, total, blake3).await?;
-        self.completed_items.insert(item_id, blake3.to_string());
-        if let Some(abort_watch) = &mut self.abort_watch {
-            if abort_watch.has_changed().unwrap_or(false) {
-                if let Some(reason) = abort_watch.borrow_and_update().clone() {
-                    return Err(BackupError::phase(Phase::Transfer, reason));
-                }
+        let inner = &mut self.inner;
+        if let Some(abort_watch) = self.abort_watch.as_deref_mut() {
+            if abort_watch.borrow().is_some() {
+                return Err(Self::abort_error(abort_watch));
             }
+            tokio::select! {
+                biased;
+                _ = abort_watch.changed() => return Err(Self::abort_error(abort_watch)),
+                result = inner.finish_item(item_id, total, blake3) => result?,
+            }
+        } else {
+            inner.finish_item(item_id, total, blake3).await?;
         }
+        self.completed_items.insert(item_id, blake3.to_string());
         Ok(())
     }
     async fn finish(&mut self) -> Result<()> {
-        self.inner.finish().await
+        let inner = &mut self.inner;
+        let Some(abort_watch) = self.abort_watch.as_deref_mut() else {
+            return inner.finish().await;
+        };
+        if abort_watch.borrow().is_some() {
+            return Err(Self::abort_error(abort_watch));
+        }
+        tokio::select! {
+            biased;
+            _ = abort_watch.changed() => Err(Self::abort_error(abort_watch)),
+            result = inner.finish() => result,
+        }
     }
 }
 
@@ -381,11 +535,11 @@ where
     let mut stream = stream;
     // An unreadable/unsupported plan is refused on the wire too, so the source
     // fails fast with the reason instead of blocking on a PlanAck that never comes.
-    let (plan, source_requested_carriers) =
+    let (plan, source_requested_carriers, separate_data_streams) =
         match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
             Ok(plan) => plan,
             Err(e) => {
-                let _ = channel::send_ack(&mut stream, false, &e.to_string(), 1).await;
+                let _ = channel::send_ack(&mut stream, false, &e.to_string(), 1, false).await;
                 return Err(e);
             }
         };
@@ -416,7 +570,14 @@ where
         .min(channel.carriers())
         .min(dest.max_carriers())
         .max(1);
-    channel::send_ack(&mut stream, approved, &reason, agreed_carriers).await?;
+    channel::send_ack(
+        &mut stream,
+        approved,
+        &reason,
+        agreed_carriers,
+        separate_data_streams,
+    )
+    .await?;
     if !approved {
         return Err(if !preflight.ok {
             BackupError::Preflight(reason)
@@ -425,7 +586,7 @@ where
         });
     }
 
-    if agreed_carriers > 1 {
+    if separate_data_streams || agreed_carriers > 1 {
         return destination_stream_multi(dest, channel, progress, plan, stream, agreed_carriers)
             .await;
     }
@@ -446,6 +607,7 @@ where
             },
         )
         .await;
+        let _ = stream.shutdown().await;
         return Err(error);
     }
 
@@ -491,6 +653,7 @@ where
                     "Done.blake3 does not match verified item digests",
                 ));
             }
+            send_completion_ack(&mut stream).await?;
             info!(bytes = total_bytes, "destination done; restore complete");
         }
         Some(ControlFrame::Abort { reason }) => {
@@ -509,8 +672,9 @@ where
     Ok(plan)
 }
 
-/// Destination payload path for `carriers > 1`. Reader tasks merge independent
-/// item-pinned streams back into the module's one `ChunkSource` interface.
+/// Destination payload path for the negotiated separate-data layout. Reader
+/// tasks merge one or more independent item-pinned streams back into the
+/// module's single `ChunkSource` interface.
 async fn destination_stream_multi(
     dest: &dyn Destination,
     channel: &dyn DataChannel,
@@ -582,6 +746,7 @@ async fn destination_stream_multi(
             },
         )
         .await;
+        let _ = control.shutdown().await;
         return Err(error);
     }
 
@@ -626,6 +791,7 @@ async fn destination_stream_multi(
                     "Done.blake3 does not match verified item digests",
                 ));
             }
+            send_completion_ack(&mut control).await?;
             info!(
                 bytes = total_bytes,
                 carriers = channel.carriers(),
@@ -651,8 +817,28 @@ async fn destination_stream_multi(
 #[cfg(test)]
 mod pacing_tests {
     use super::{exchange_timeout_with, PacedSink};
+    use crate::channel::ChunkSink;
     use crate::error::Result;
+    use async_trait::async_trait;
     use std::time::Duration;
+    use tokio::sync::watch;
+
+    struct BlockingSink;
+
+    #[async_trait]
+    impl ChunkSink for BlockingSink {
+        async fn send_chunk(&mut self, _: u32, _: u64, _: &[u8]) -> Result<()> {
+            std::future::pending().await
+        }
+
+        async fn finish_item(&mut self, _: u32, _: u64, _: &str) -> Result<()> {
+            std::future::pending().await
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            std::future::pending().await
+        }
+    }
 
     #[test]
     fn limiter_waits_only_when_ahead_of_schedule() {
@@ -673,5 +859,25 @@ mod pacing_tests {
         .await
         .expect_err("pending plan exchange must time out");
         assert!(format!("{err}").contains("plan exchange timed out"));
+    }
+
+    #[tokio::test]
+    async fn destination_abort_interrupts_rate_wait_and_blocked_write() {
+        for rate in [Some(1), None] {
+            let mut inner = BlockingSink;
+            let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
+            let mut sink = PacedSink::new(&mut inner, rate).with_abort_watch(&mut abort_rx);
+            let notify = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                abort_tx.send(Some("injected apply failure".into())).ok();
+            });
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), sink.send_chunk(7, 0, &[0; 1024]))
+                    .await
+                    .expect("destination abort must bound the source")
+                    .expect_err("destination abort must fail the source");
+            assert!(error.to_string().contains("injected apply failure"));
+            notify.await.expect("abort notifier");
+        }
     }
 }

@@ -103,6 +103,9 @@ run_transfer() { # label initial-udp-block drop-after-direct
   local src="$work/$label-source" dst="$work/$label-destination"
   mkdir -p "$src" "$dst"
   rb_seed_filesystem_fixture "$src" "$NAT_PAYLOAD_BYTES"
+  local before_tree before_atime
+  before_tree=$(rb_tree_digest "$src")
+  before_atime=$(rb_atime_manifest "$src")
   if [[ "$blocked" == yes ]]; then ip netns exec "$nat" iptables -I FORWARD -p udp -j DROP; fi
   timeout --foreground "$TRANSFER_TIMEOUT" ip netns exec "$src_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "10.70.0.1:$port" --channel "$label" --insecure --max-rate 4194304 --root "$src" >"$work/$label-source.log" 2>&1 &
   local spid=$!; PIDS+=("$spid")
@@ -122,11 +125,50 @@ run_transfer() { # label initial-udp-block drop-after-direct
       fail "$label: direct path did not establish before UDP loss"
     fi
   fi
-  local rc=0
-  wait "$spid" || rc=1
-  wait "$dpid" || rc=1
+  local src_rc=0 dst_rc=0
+  wait "$spid" || src_rc=$?
+  wait "$dpid" || dst_rc=$?
   ip netns exec "$nat" iptables -F
-  if (( rc == 0 )) && [[ "$(rb_tree_digest "$src")" == "$(rb_tree_digest "$dst")" ]]; then pass "$label: transfer completed with identical tree"; else fail "$label: transfer/tree verification failed"; fi
+  if [[ "$drop_after" == yes ]]; then
+    # A byte stream that has already delivered a prefix cannot migrate to a new
+    # relay stream without sequence acknowledgements and replay. v0.1 explicitly
+    # rejects transparent resume of half-applied restores, so active-path loss
+    # must fail closed, promptly, and without mutating the source or publishing
+    # the active partial file.
+    if (( src_rc != 0 && dst_rc != 0 && src_rc != 124 && dst_rc != 124 )); then
+      pass "$label: active direct-stream loss fails both peers before watchdog"
+    else
+      fail "$label: active direct-stream loss was not a prompt bilateral failure"
+    fi
+    if [[ "$before_tree" == "$(rb_tree_digest "$src")" && "$before_atime" == "$(rb_atime_manifest "$src")" ]]; then
+      pass "$label: source tree and atimes remain immutable"
+    else
+      fail "$label: source tree or atimes changed"
+    fi
+    if [[ ! -e "$dst/nested/payload.bin" ]]; then
+      pass "$label: active partial destination file was removed"
+    else
+      fail "$label: active partial destination file was published"
+    fi
+    if grep -q '\[Transfer\].*connection lost' "$work/$label-source.log" && \
+       grep -q '\[Transfer\].*connection lost' "$work/$label-destination.log"; then
+      pass "$label: both peers report phase-tagged connection loss"
+    else
+      fail "$label: phase-tagged connection-loss diagnostics missing"
+    fi
+    return
+  fi
+  local src_digest dst_digest
+  src_digest=$(rb_tree_digest "$src")
+  dst_digest=$(rb_tree_digest "$dst")
+  if (( src_rc == 0 && dst_rc == 0 )) && [[ "$src_digest" == "$dst_digest" ]]; then
+    pass "$label: transfer completed with identical tree"
+  else
+    fail "$label: transfer/tree verification failed"
+    printf 'DIAG: %s source_rc=%d destination_rc=%d source_digest=%s destination_digest=%s\n' \
+      "$label" "$src_rc" "$dst_rc" "$src_digest" "$dst_digest" >&2
+    diff -u <(rb_tree_manifest "$src") <(rb_tree_manifest "$dst") >&2 || true
+  fi
 }
 
 run_transfer T-NET-DIRECT no no
@@ -136,7 +178,6 @@ run_transfer T-NET-BLOCKED-RELAY yes no
 if ! grep -q 'direct udp connection established' "$work/T-NET-BLOCKED-RELAY-source.log" "$work/T-NET-BLOCKED-RELAY-destination.log" && grep -qE 'using relay|falling back to relay|direct path.*timed out|direct path unavailable' "$work/T-NET-BLOCKED-RELAY-source.log" "$work/T-NET-BLOCKED-RELAY-destination.log"; then pass 'T-NET-BLOCKED-RELAY logged clean relay fallback'; else fail 'T-NET-BLOCKED-RELAY direct/fallback assertion failed'; fi
 
 run_transfer T-NET-MID-LOSS no yes
-if grep -qE 'falling back to relay|using relay' "$work/T-NET-MID-LOSS-source.log" "$work/T-NET-MID-LOSS-destination.log"; then pass 'T-NET-MID-LOSS logged per-connection relay fallback'; else fail 'T-NET-MID-LOSS fallback log missing'; fi
 
 printf 'T-NET1 summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

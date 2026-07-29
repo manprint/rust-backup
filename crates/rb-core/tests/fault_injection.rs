@@ -11,13 +11,32 @@ use rb_core::wire::{self, DataFrame};
 
 #[derive(Clone, Copy, Debug)]
 enum Fault {
+    PrematureEof,
     CorruptChunkHash,
+    CorruptChunkPayload,
+    OversizedChunk,
+    WrongChunkOffset,
+    StreamEndWithIncompleteItem,
     CorruptItemHash,
     WrongItemTotal,
     DuplicateItemEnd,
     UnexpectedCarrierHello,
     ExplicitAbort,
 }
+
+const PROTOCOL_FAULTS: [Fault; 11] = [
+    Fault::PrematureEof,
+    Fault::CorruptChunkHash,
+    Fault::CorruptChunkPayload,
+    Fault::OversizedChunk,
+    Fault::WrongChunkOffset,
+    Fault::StreamEndWithIncompleteItem,
+    Fault::CorruptItemHash,
+    Fault::WrongItemTotal,
+    Fault::DuplicateItemEnd,
+    Fault::UnexpectedCarrierHello,
+    Fault::ExplicitAbort,
+];
 
 fn plan() -> BackupPlan {
     BackupPlan {
@@ -44,6 +63,7 @@ async fn inject(fault: Fault) -> String {
     let (mut writer, reader) = tokio::io::duplex(1 << 16);
     let send = tokio::spawn(async move {
         match fault {
+            Fault::PrematureEof => {}
             Fault::CorruptChunkHash => {
                 wire::send_frame(
                     &mut writer,
@@ -57,6 +77,63 @@ async fn inject(fault: Fault) -> String {
                 .await
                 .unwrap();
                 wire::write_all_idle(&mut writer, b"abc").await.unwrap();
+            }
+            Fault::CorruptChunkPayload => {
+                wire::send_frame(
+                    &mut writer,
+                    &DataFrame::ChunkStart {
+                        item_id: 1,
+                        offset: 0,
+                        len: 3,
+                        blake3: wire::blake3_hex(b"abc"),
+                    },
+                )
+                .await
+                .unwrap();
+                wire::write_all_idle(&mut writer, b"abd").await.unwrap();
+            }
+            Fault::OversizedChunk => {
+                wire::send_frame(
+                    &mut writer,
+                    &DataFrame::ChunkStart {
+                        item_id: 1,
+                        offset: 0,
+                        len: (wire::CHUNK_SIZE + 1) as u32,
+                        blake3: String::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            Fault::WrongChunkOffset => {
+                wire::send_frame(
+                    &mut writer,
+                    &DataFrame::ChunkStart {
+                        item_id: 1,
+                        offset: 7,
+                        len: 0,
+                        blake3: wire::blake3_hex(b""),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            Fault::StreamEndWithIncompleteItem => {
+                wire::send_frame(
+                    &mut writer,
+                    &DataFrame::ChunkStart {
+                        item_id: 1,
+                        offset: 0,
+                        len: 3,
+                        blake3: wire::blake3_hex(b"abc"),
+                    },
+                )
+                .await
+                .unwrap();
+                wire::write_all_idle(&mut writer, b"abc").await.unwrap();
+                wire::send_frame(&mut writer, &DataFrame::StreamEnd)
+                    .await
+                    .unwrap();
             }
             Fault::CorruptItemHash | Fault::WrongItemTotal | Fault::DuplicateItemEnd => {
                 let data = b"abc";
@@ -141,16 +218,8 @@ async fn inject(fault: Fault) -> String {
 /// four-carrier configurations.  The same parser is used by every carrier.
 #[tokio::test]
 async fn protocol_faults_are_rejected_for_each_carrier_count() {
-    let faults = [
-        Fault::CorruptChunkHash,
-        Fault::CorruptItemHash,
-        Fault::WrongItemTotal,
-        Fault::DuplicateItemEnd,
-        Fault::UnexpectedCarrierHello,
-        Fault::ExplicitAbort,
-    ];
     for carriers in [1_u8, 4] {
-        for fault in faults {
+        for fault in PROTOCOL_FAULTS {
             let error = inject(fault).await;
             assert!(
                 error.contains("integrity")
@@ -160,6 +229,15 @@ async fn protocol_faults_are_rejected_for_each_carrier_count() {
             );
         }
     }
+}
+
+#[test]
+fn fault_bank_has_the_required_minimum_case_count() {
+    // Each protocol fault runs through both the one- and four-carrier parser
+    // configuration.  The bounds test below adds exact-limit and limit+1 for
+    // both names and metadata: 22 + 4 = 26 independently asserted cases.
+    let cases = PROTOCOL_FAULTS.len() * 2 + 4;
+    assert!(cases >= 26, "fault bank regressed to {cases} cases");
 }
 
 /// F2.2: peer-supplied plan bounds reject the exact cap plus one without

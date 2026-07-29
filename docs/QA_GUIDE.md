@@ -37,13 +37,23 @@ Run all non-privileged coverage with:
 bash e2e/full_matrix.sh
 ```
 
-It runs relay smoke (one and four carriers), two-target sessions, fault bank and
-MinIO. Add `RUST_BACKUP_FULL_DB_MATRIX=1` for Docker PostgreSQL/Mongo matrices.
-Privileged netns/bandwidth tests deliberately remain opt-in:
+It runs plain and TLS relay smoke with one and four carriers, two-target
+sessions, fault bank and MinIO. Add `RUST_BACKUP_FULL_DB_MATRIX=1` for Docker
+PostgreSQL/Mongo matrices.
+Run `e2e/s3_aws_test.sh` separately for the explicitly credential-gated AWS
+procedure described in `docs/modules/S3.md`.
+Privileged filesystem, real-ENOSPC, netns and bandwidth tests deliberately
+remain opt-in:
 
 ```bash
 RUST_BACKUP_PRIVILEGED=1 bash e2e/full_matrix.sh
 ```
 
 Those tests require the approved `sudo -n` setup and are never silently counted
-as passes when skipped.
+as passes when skipped. The aggregate invokes the exact paths
+`filesystem_netns_test.sh`, `filesystem_disk_full.sh`,
+`transport_netns_test.sh`, and `bandwidth_netem.sh`.
+The current wildcard rule over `e2e/*` is suitable only for a disposable test
+host: because the repository is user-writable, it is effectively an
+arbitrary-root grant. A persistent/shared runner should instead use a root-owned
+wrapper that validates every operation and input.
