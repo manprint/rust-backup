@@ -37,7 +37,8 @@ trap cleanup EXIT
 
 mkdir -p "$work/seed/nested"
 printf 'rust-backup S3 smoke\n' > "$work/seed/nested/hello.txt"
-dd if=/dev/urandom of="$work/seed/large.bin" bs=1M count=7 status=none
+# More than two 5 MiB parts: required to exercise a failure between uploads.
+dd if=/dev/urandom of="$work/seed/large.bin" bs=1M count=12 status=none
 touch "$work/seed/empty"
 
 docker run -d --name "$src_name" -p 19000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null
@@ -72,4 +73,24 @@ printf 'Destination finished\n' >&2
 after=$(mc ls --recursive --json src/source | sort)
 [[ "$before" == "$after" ]]
 mc diff --quiet src/source/in/ dst/destination/out/
-printf 'S3 MinIO e2e passed (streaming multipart + source immutability)\n'
+
+# Inject after the first completed multipart part. The destination returns a
+# phase-tagged Apply error only after `abort_upload` has removed the upload.
+source_pid= dst_pid=
+RUST_BACKUP_S3_TEST_FAIL_AFTER_PART=1 "$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-abort --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/abort-source.log" 2>&1 &
+source_pid=$!
+sleep 1
+RUST_BACKUP_S3_TEST_FAIL_AFTER_PART=1 "$RB_E2E_BIN" s3 destination --to 127.0.0.1:7840 --channel minio-abort --no-udp --yes --bucket destination --prefix abort/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style >"$work/abort-destination.log" 2>&1 &
+dst_pid=$!
+set +e
+wait "$source_pid"; abort_source_rc=$?
+wait "$dst_pid"; abort_destination_rc=$?
+set -e
+[[ $abort_source_rc -ne 0 && $abort_destination_rc -ne 0 ]]
+after_abort=$(mc ls --recursive --json src/source | sort)
+[[ "$before" == "$after_abort" ]]
+if mc ls --incomplete --recursive --json dst/destination 2>/dev/null | rg -q .; then
+  echo 'orphan multipart upload after injected abort' >&2
+  exit 1
+fi
+printf 'S3 MinIO e2e passed (streaming multipart, abort cleanup, source immutability)\n'

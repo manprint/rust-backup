@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::channel::{
@@ -136,13 +137,31 @@ async fn source_run(
     // 3. Provider accepts the consumer's substream; exchange plan + decision.
     let stream = channel.accept_stream().await?;
     let mut stream = stream;
-    channel::send_plan(&mut stream, &plan).await?;
+    channel::send_plan(&mut stream, &plan, channel.carriers()).await?;
     // recv_ack errors out (PlanRejected) without ever touching the source.
-    exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
+    let peer_carriers =
+        exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
+    let agreed_carriers = channel.carriers().min(peer_carriers as usize).max(1);
+    if agreed_carriers != channel.carriers() {
+        info!(
+            requested = channel.carriers(),
+            agreed = agreed_carriers,
+            "destination downgraded carrier count"
+        );
+    }
     info!("destination accepted plan; streaming payload");
 
-    if channel.carriers() > 1 {
-        return source_stream_multi(source, channel, progress, max_rate, plan, stream).await;
+    if agreed_carriers > 1 {
+        return source_stream_multi(
+            source,
+            channel,
+            progress,
+            max_rate,
+            plan,
+            stream,
+            agreed_carriers,
+        )
+        .await;
     }
 
     // 4. Stream the payload (no temp files; backpressure consumer-paced).
@@ -193,15 +212,42 @@ async fn source_stream_multi(
     progress: &Progress,
     max_rate: Option<u64>,
     plan: BackupPlan,
-    mut control: Box<dyn crate::channel::DuplexStream>,
+    control: Box<dyn crate::channel::DuplexStream>,
+    carriers: usize,
 ) -> Result<SourceOutcome> {
-    let mut streams = Vec::with_capacity(channel.carriers());
-    for _ in 0..channel.carriers() {
-        streams.push(channel.accept_stream().await?);
+    let (control_read, mut control_write) = tokio::io::split(control);
+    let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
+    // This is the one control-plane reader.  It is explicitly cancelled below;
+    // carrier readers are deliberately not spawned (ordered pull owns them).
+    let abort_task = tokio::spawn(async move {
+        let mut control_read = control_read;
+        let observed = match wire::recv_frame::<_, ControlFrame>(&mut control_read).await {
+            Ok(Some(ControlFrame::Abort { reason })) => format!("destination aborted: {reason}"),
+            Ok(Some(other)) => format!("unexpected control frame while streaming: {other:?}"),
+            Ok(None) => "control stream closed while streaming".to_string(),
+            Err(error) => error.to_string(),
+        };
+        let _ = abort_tx.send(Some(observed));
+    });
+    let mut streams = Vec::with_capacity(carriers);
+    for index in 0..carriers {
+        let mut stream = exchange_timeout(
+            &format!("destination opening data carrier {index}"),
+            channel.accept_stream(),
+        )
+        .await?;
+        wire::send_frame(
+            &mut stream,
+            &wire::DataFrame::CarrierHello {
+                carrier: index as u16,
+            },
+        )
+        .await?;
+        streams.push(stream);
     }
     let mut data_sink = MultiStreamChunkSink::new_counted(streams, progress.clone())?;
     let (streamed, payload_digest) = {
-        let mut sink = PacedSink::new(&mut data_sink, max_rate);
+        let mut sink = PacedSink::new(&mut data_sink, max_rate).with_abort_watch(&mut abort_rx);
         let result = match source.stream_out(&plan, &mut sink).await {
             Ok(()) => sink.finish().await,
             Err(e) => Err(e),
@@ -210,17 +256,28 @@ async fn source_stream_multi(
     };
     if let Err(error) = streamed {
         data_sink.abort(&error.to_string()).await;
+        let _ = wire::send_frame(
+            &mut control_write,
+            &ControlFrame::Abort {
+                reason: error.to_string(),
+            },
+        )
+        .await;
+        abort_task.abort();
+        let _ = abort_task.await;
         return Err(error);
     }
     let bytes_sent = progress.bytes();
     wire::send_frame(
-        &mut control,
+        &mut control_write,
         &ControlFrame::Done {
             total_bytes: bytes_sent,
             blake3: payload_digest,
         },
     )
     .await?;
+    abort_task.abort();
+    let _ = abort_task.await;
     Ok(SourceOutcome { plan, bytes_sent })
 }
 
@@ -230,6 +287,7 @@ struct PacedSink<'a> {
     started: Instant,
     sent: u64,
     completed_items: BTreeMap<u32, String>,
+    abort_watch: Option<&'a mut watch::Receiver<Option<String>>>,
 }
 
 impl<'a> PacedSink<'a> {
@@ -240,7 +298,12 @@ impl<'a> PacedSink<'a> {
             started: Instant::now(),
             sent: 0,
             completed_items: BTreeMap::new(),
+            abort_watch: None,
         }
+    }
+    fn with_abort_watch(mut self, abort_watch: &'a mut watch::Receiver<Option<String>>) -> Self {
+        self.abort_watch = Some(abort_watch);
+        self
     }
     fn delay_for(rate: u64, sent: u64, elapsed: Duration) -> Option<Duration> {
         Duration::from_secs_f64(sent as f64 / rate as f64).checked_sub(elapsed)
@@ -269,6 +332,13 @@ impl ChunkSink for PacedSink<'_> {
         }
         self.inner.finish_item(item_id, total, blake3).await?;
         self.completed_items.insert(item_id, blake3.to_string());
+        if let Some(abort_watch) = &mut self.abort_watch {
+            if abort_watch.has_changed().unwrap_or(false) {
+                if let Some(reason) = abort_watch.borrow_and_update().clone() {
+                    return Err(BackupError::phase(Phase::Transfer, reason));
+                }
+            }
+        }
         Ok(())
     }
     async fn finish(&mut self) -> Result<()> {
@@ -311,13 +381,14 @@ where
     let mut stream = stream;
     // An unreadable/unsupported plan is refused on the wire too, so the source
     // fails fast with the reason instead of blocking on a PlanAck that never comes.
-    let plan = match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
-        Ok(plan) => plan,
-        Err(e) => {
-            let _ = channel::send_ack(&mut stream, false, &e.to_string()).await;
-            return Err(e);
-        }
-    };
+    let (plan, source_requested_carriers) =
+        match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                let _ = channel::send_ack(&mut stream, false, &e.to_string(), 1).await;
+                return Err(e);
+            }
+        };
     progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, "destination received plan");
     info!("\n{}", plan.render());
@@ -341,7 +412,11 @@ where
     } else {
         "accepted".to_string()
     };
-    channel::send_ack(&mut stream, approved, &reason).await?;
+    let agreed_carriers = (source_requested_carriers as usize)
+        .min(channel.carriers())
+        .min(dest.max_carriers())
+        .max(1);
+    channel::send_ack(&mut stream, approved, &reason, agreed_carriers).await?;
     if !approved {
         return Err(if !preflight.ok {
             BackupError::Preflight(reason)
@@ -350,8 +425,9 @@ where
         });
     }
 
-    if channel.carriers() > 1 {
-        return destination_stream_multi(dest, channel, progress, plan, stream).await;
+    if agreed_carriers > 1 {
+        return destination_stream_multi(dest, channel, progress, plan, stream, agreed_carriers)
+            .await;
     }
 
     // 4. Apply the streamed payload (no temp files).
@@ -441,16 +517,73 @@ async fn destination_stream_multi(
     progress: &Progress,
     plan: BackupPlan,
     mut control: Box<dyn crate::channel::DuplexStream>,
+    carriers: usize,
 ) -> Result<BackupPlan> {
-    let mut streams = Vec::with_capacity(channel.carriers());
-    for _ in 0..channel.carriers() {
-        streams.push(channel.open_stream().await?);
+    let mut streams = Vec::with_capacity(carriers);
+    for index in 0..carriers {
+        streams.push(
+            exchange_timeout(
+                &format!("source accepting data carrier {index}"),
+                channel.open_stream(),
+            )
+            .await?,
+        );
     }
-    let mut src = MultiStreamChunkSource::new_counted(streams, progress.clone())?;
+    // `open_stream` and `accept_stream` are independently scheduled through
+    // the relay.  Bind their logical indexes from the explicit hello, never
+    // from arrival order.
+    let mut by_carrier: Vec<Option<Box<dyn crate::channel::DuplexStream>>> =
+        (0..carriers).map(|_| None).collect();
+    for mut stream in streams {
+        let hello = wire::recv_frame::<_, wire::DataFrame>(&mut stream).await?;
+        let Some(wire::DataFrame::CarrierHello { carrier }) = hello else {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                "data carrier missing CarrierHello",
+            ));
+        };
+        let carrier = carrier as usize;
+        if carrier >= carriers || by_carrier[carrier].is_some() {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                format!("invalid or duplicate data carrier index={carrier}"),
+            ));
+        }
+        by_carrier[carrier] = Some(stream);
+    }
+    let streams: Vec<_> = by_carrier
+        .into_iter()
+        .enumerate()
+        .map(|(carrier, stream)| {
+            stream.ok_or_else(|| {
+                BackupError::phase(
+                    Phase::Connect,
+                    format!("missing data carrier index={carrier}"),
+                )
+            })
+        })
+        .collect::<Result<_>>()?;
+    let expected_item_ids = plan
+        .items
+        .iter()
+        .filter(|item| item.expects_data())
+        .map(|item| item.id)
+        .collect();
+    let mut src =
+        MultiStreamChunkSource::new_ordered(streams, expected_item_ids, progress.clone())?;
     let apply_result = dest.stream_in(&plan, &mut src).await;
     let received_items = src.completed_item_ids();
     let received_digest = src.completion_digest();
-    apply_result?;
+    if let Err(error) = apply_result {
+        let _ = wire::send_frame(
+            &mut control,
+            &ControlFrame::Abort {
+                reason: error.to_string(),
+            },
+        )
+        .await;
+        return Err(error);
+    }
 
     let expected_items: BTreeSet<u32> = plan
         .items

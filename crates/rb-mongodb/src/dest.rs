@@ -237,7 +237,22 @@ async fn apply_data(
                     c.feed(conn, &data).await?;
                 }
             }
-            ChunkEvent::ItemEnd { .. } => {
+            ChunkEvent::ItemEnd { item_id, total, .. } => {
+                let open = current.as_ref().ok_or_else(|| {
+                    BackupError::phase(
+                        Phase::Apply,
+                        format!("ItemEnd item={item_id} without open collection"),
+                    )
+                })?;
+                if open.item_id != item_id || open.bytes != total {
+                    return Err(BackupError::phase(
+                        Phase::Verify,
+                        format!(
+                            "ItemEnd item={item_id} does not match open item={} bytes={}",
+                            open.item_id, open.bytes
+                        ),
+                    ));
+                }
                 if let Some(c) = current.take() {
                     c.finish(conn).await?;
                 }
@@ -261,6 +276,7 @@ struct CurrentItem {
     collection: String,
     buf: Vec<u8>,
     batch: Vec<Document>,
+    bytes: u64,
 }
 
 impl CurrentItem {
@@ -271,11 +287,13 @@ impl CurrentItem {
             collection: meta.collection.clone(),
             buf: Vec::new(),
             batch: Vec::new(),
+            bytes: 0,
         }
     }
 
     /// Append bytes, parse any whole documents, and flush full batches.
     async fn feed(&mut self, conn: &MongoConnection, data: &[u8]) -> Result<()> {
+        self.bytes += data.len() as u64;
         self.buf.extend_from_slice(data);
         take_documents(&mut self.buf, &mut self.batch)?;
         while self.batch.len() >= INSERT_BATCH {

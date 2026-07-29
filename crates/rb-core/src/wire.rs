@@ -33,19 +33,40 @@ pub const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ControlFrame {
     /// Source → Destination: the full backup plan.
-    Plan(Box<BackupPlan>),
+    Plan {
+        plan: Box<BackupPlan>,
+        /// Number of data carriers requested by the provider.  Zero is never
+        /// emitted; it is accepted defensively as one for malformed old peers.
+        #[serde(default = "default_carriers")]
+        carriers: u32,
+    },
     /// Destination → Source: accept/reject decision (async-accept mode).
-    PlanAck { accepted: bool, reason: String },
+    PlanAck {
+        accepted: bool,
+        reason: String,
+        /// Number of data carriers the consumer will actually open.  Defaults
+        /// to one so a newer provider safely interoperates with an old peer.
+        #[serde(default = "default_carriers")]
+        carriers: u32,
+    },
     /// Source → Destination: all items streamed; final whole-payload digest.
     Done { total_bytes: u64, blake3: String },
     /// Either side: abort with reason (clean teardown, no partial apply).
     Abort { reason: String },
 }
 
+const fn default_carriers() -> u32 {
+    1
+}
+
 /// Data-plane frames carried on each data substream. A `ChunkStart` is followed
 /// immediately by exactly `len` raw payload bytes.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DataFrame {
+    /// First frame on every negotiated multi-carrier substream.  Relay stream
+    /// accept order is not a carrier identity, so the receiver must bind it
+    /// explicitly before applying item-pinning.
+    CarrierHello { carrier: u16 },
     /// Header for one chunk of `item_id` at byte `offset`; `len` raw bytes follow.
     ChunkStart {
         item_id: u32,

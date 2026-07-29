@@ -95,6 +95,10 @@ impl BackupModule for Module {
         "filesystem"
     }
 
+    fn max_carriers(&self) -> u32 {
+        32
+    }
+
     fn version_support(&self) -> &'static str {
         "Filesystem (POSIX; ownership+perms preserved on Linux)"
     }
@@ -137,6 +141,10 @@ struct FilesystemDestination {
 
 #[async_trait]
 impl Destination for FilesystemDestination {
+    fn max_carriers(&self) -> usize {
+        32
+    }
+
     async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
         dest::validate(&self.params, plan).await
     }

@@ -8,6 +8,8 @@ use tracing::{debug, warn};
 
 use crate::auth::Authenticator;
 use crate::channel::PairedChannel;
+#[cfg(feature = "udp")]
+use crate::connectivity::{derive_check_key, run_connectivity_checks, CheckConfig, CheckRole};
 use crate::mux;
 use crate::proto::{
     ClientMsg, Delimited, ServerMsg, UdpCandidate, UdpCandidateKind, MAX_V2_OFFER_CANDIDATES,
@@ -91,8 +93,8 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
             };
             let channel = PairedChannel::source_with_carriers(acceptor, control, cfg.carriers);
             #[cfg(feature = "udp")]
-            if let Some(dc) = direct {
-                channel.set_direct(dc).await;
+            if let Some((dc, token)) = direct {
+                channel.set_direct_with_token(dc, token).await;
             }
             Ok(channel)
         }
@@ -161,8 +163,8 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
             };
             let channel = PairedChannel::destination_with_carriers(opener, control, cfg.carriers);
             #[cfg(feature = "udp")]
-            if let Some(dc) = direct {
-                channel.set_direct(dc).await;
+            if let Some((dc, token)) = direct {
+                channel.set_direct_with_token(dc, token).await;
             }
             Ok(channel)
         }
@@ -190,22 +192,24 @@ async fn setup_direct(
     role: DirectRole,
     channel_id: &str,
     secret: Option<&str>,
-) -> Option<DirectConn> {
+) -> Option<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
     match tokio::time::timeout(
         DIRECT_SETUP_TIMEOUT,
         setup_direct_inner(control, role, channel_id, secret),
     )
     .await
     {
-        Ok(Ok(dc)) => {
+        Ok(Ok((dc, token))) => {
             debug!("direct QUIC path established");
-            Some(dc)
+            Some((dc, token))
         }
         Ok(Err(e)) => {
+            crate::pair_cache::invalidate(channel_id);
             warn!("direct path unavailable, using relay: {e:#}");
             None
         }
         Err(_) => {
+            crate::pair_cache::invalidate(channel_id);
             warn!("direct path setup timed out, using relay");
             None
         }
@@ -218,31 +222,39 @@ async fn setup_direct_inner(
     role: DirectRole,
     channel_id: &str,
     secret: Option<&str>,
-) -> anyhow::Result<DirectConn> {
+) -> anyhow::Result<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
     let tuning = UdpDirectTuning::default();
     // One socket is used for both candidate gathering and QUIC, so any STUN
     // reflexive mapping stays valid for the hole-punched connection.
     let socket = bind_socket(0).await?;
-    let mut candidates = gather_candidates(&socket).await?;
-    crate::shared::sanitize_and_log("local offer", &mut candidates);
-    candidates.truncate(MAX_V2_OFFER_CANDIDATES);
-    if candidates.is_empty() {
+    let mut gathered = gather_candidates(&socket).await?;
+    crate::shared::sanitize_and_log("local offer", &mut gathered.candidates);
+    gathered.candidates.truncate(MAX_V2_OFFER_CANDIDATES);
+    if gathered.candidates.is_empty() {
         anyhow::bail!("no usable local candidates");
     }
     control
         .send_client(ClientMsg::UdpCandidateOffer {
-            candidates: candidates
+            candidates: gathered
+                .candidates
                 .iter()
                 .enumerate()
                 .map(|(index, addr)| UdpCandidate {
                     addr: *addr,
-                    kind: UdpCandidateKind::Host,
+                    kind: if gathered.reflexive_addrs.contains(addr) {
+                        UdpCandidateKind::Reflexive
+                    } else {
+                        UdpCandidateKind::Host
+                    },
                     priority: u16::MAX.saturating_sub(index as u16),
                 })
                 .collect(),
-            addrs: candidates,
+            addrs: gathered.candidates,
             generation: 0,
-            nat_profile: crate::adaptive_nat::NatProfile::default(),
+            nat_profile: crate::adaptive_nat::NatProfile {
+                mapping: Some(crate::adaptive_nat::classify_nat(&gathered.reflexive_addrs)),
+                reflexive_addrs: gathered.reflexive_addrs,
+            },
         })
         .await
         .map_err(|e| anyhow::anyhow!("send candidate offer: {e}"))?;
@@ -251,19 +263,46 @@ async fn setup_direct_inner(
     // Defense in depth: the broker already sanitizes, but the punch/dial entry
     // point never trusts a peer-controlled list either.
     crate::shared::sanitize_and_log("peer punch", &mut peer_addrs);
+    if let Some(cached) = crate::pair_cache::recall(channel_id) {
+        if peer_addrs.contains(&cached) {
+            peer_addrs.retain(|address| *address != cached);
+            peer_addrs.insert(0, cached);
+        }
+    }
     if peer_addrs.is_empty() {
         anyhow::bail!("no peer candidates");
     }
     // Both sides derive the same token from the shared secret + channel id.
     let token = derive_token(secret, channel_id.as_bytes())?;
+    let check_role = match role {
+        DirectRole::Provider => CheckRole::Listener,
+        DirectRole::Consumer => CheckRole::Dialer,
+    };
+    let checks = run_connectivity_checks(
+        &socket,
+        &peer_addrs,
+        &CheckConfig {
+            key: derive_check_key(&token),
+            generation: 0,
+            role: check_role,
+            window: Duration::from_millis(500),
+        },
+    )
+    .await;
+    if let Some(nominated) = checks.nominated {
+        peer_addrs.retain(|address| *address != nominated);
+        peer_addrs.insert(0, nominated);
+    }
 
-    match role {
+    let direct = match role {
         DirectRole::Provider => {
             let listener = DirectListener::new(socket, peer_addrs, tuning).await?;
-            Ok(listener.accept(token).await?)
+            listener.accept(token).await?
         }
-        DirectRole::Consumer => Ok(connect_direct(socket, peer_addrs, token, tuning).await?),
-    }
+        DirectRole::Consumer => connect_direct(socket, peer_addrs, token, tuning).await?,
+    };
+    crate::pair_cache::remember(channel_id, direct.remote_address());
+    Ok((direct, token))
 }
 
 /// Await the server's hole-punch decision, tolerating interleaved heartbeats.
@@ -288,12 +327,18 @@ async fn recv_punch(control: &mut Delimited<mux::Stream>) -> anyhow::Result<Vec<
 /// best-effort STUN reflexive address when `RUST_BACKUP_STUN_SERVER` is set
 /// (failure is non-fatal — local candidates suffice on the same network).
 #[cfg(feature = "udp")]
-async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<Vec<SocketAddr>> {
+struct GatheredCandidates {
+    candidates: Vec<SocketAddr>,
+    reflexive_addrs: Vec<SocketAddr>,
+}
+
+async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<GatheredCandidates> {
     use std::net::{IpAddr, Ipv4Addr};
 
     let local = socket.local_addr()?;
     let port = local.port();
     let mut candidates = Vec::new();
+    let mut reflexive_addrs = Vec::new();
     if local.ip().is_unspecified() {
         // A wildcard bind (`0.0.0.0`/`::`) is not a routable candidate — the peer
         // cannot dial it (quinn rejects it). Offer the loopback (same-host) and
@@ -310,12 +355,19 @@ async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<Vec
     }
     for stun in stun_targets() {
         match discover_reflexive(socket, &stun).await {
-            Ok(addr) if !candidates.contains(&addr) => candidates.push(addr),
+            Ok(addr) if !candidates.contains(&addr) => {
+                candidates.push(addr);
+                reflexive_addrs.push(addr);
+            }
+            Ok(addr) if !reflexive_addrs.contains(&addr) => reflexive_addrs.push(addr),
             Ok(_) => {}
             Err(e) => warn!("STUN reflexive discovery failed ({stun}): {e:#}"),
         }
     }
-    Ok(candidates)
+    Ok(GatheredCandidates {
+        candidates,
+        reflexive_addrs,
+    })
 }
 
 /// Ordered best-effort STUN chain. Operators may replace it with a comma-separated

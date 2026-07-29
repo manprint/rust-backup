@@ -96,6 +96,11 @@ impl BackupModule for Module {
     fn name(&self) -> &'static str {
         "s3"
     }
+
+    fn max_carriers(&self) -> u32 {
+        // Multipart upload processing follows strict plan order.
+        1
+    }
     fn version_support(&self) -> &'static str {
         "S3-compatible (AWS S3, MinIO)"
     }
@@ -604,7 +609,7 @@ async fn restore_object(
                 hasher.update(&data);
                 part.extend_from_slice(&data);
                 if part.len() >= part_size {
-                    upload_part(
+                    if let Err(error) = upload_part(
                         client,
                         bucket,
                         key,
@@ -613,7 +618,21 @@ async fn restore_object(
                         std::mem::take(&mut part),
                         &mut parts,
                     )
-                    .await?;
+                    .await
+                    {
+                        return abort_upload(client, bucket, key, &upload_id, &error.to_string())
+                            .await;
+                    }
+                    if multipart_fault_after_part(part_number) {
+                        return abort_upload(
+                            client,
+                            bucket,
+                            key,
+                            &upload_id,
+                            "injected multipart failure after upload_part",
+                        )
+                        .await;
+                    }
                     part_number += 1;
                 }
             }
@@ -651,7 +670,7 @@ async fn restore_object(
         }
     }
     if !part.is_empty() {
-        upload_part(
+        if let Err(error) = upload_part(
             client,
             bucket,
             key,
@@ -660,26 +679,53 @@ async fn restore_object(
             part,
             &mut parts,
         )
-        .await?;
+        .await
+        {
+            return abort_upload(client, bucket, key, &upload_id, &error.to_string()).await;
+        }
+        if multipart_fault_after_part(part_number) {
+            return abort_upload(
+                client,
+                bucket,
+                key,
+                &upload_id,
+                "injected multipart failure after upload_part",
+            )
+            .await;
+        }
     }
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
-    client
+    let completed = client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
-        .upload_id(upload_id)
+        .upload_id(&upload_id)
         .multipart_upload(completed)
         .send()
-        .await
-        .map_err(|e| {
-            BackupError::phase(
-                Phase::Apply,
-                format!("complete multipart upload {key:?}: {e}"),
-            )
-        })?;
+        .await;
+    if let Err(error) = completed {
+        return abort_upload(
+            client,
+            bucket,
+            key,
+            &upload_id,
+            &format!("complete multipart upload {key:?}: {error}"),
+        )
+        .await;
+    }
     Ok(())
+}
+
+/// Test-only process fault hook.  It is opt-in and deliberately outside the
+/// public configuration surface; MinIO e2e uses it to exercise cleanup after a
+/// real uploaded part without killing the process before `abort_upload` runs.
+fn multipart_fault_after_part(number: i32) -> bool {
+    std::env::var("RUST_BACKUP_S3_TEST_FAIL_AFTER_PART")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        == Some(number)
 }
 
 async fn upload_part(

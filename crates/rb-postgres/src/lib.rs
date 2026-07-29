@@ -97,6 +97,11 @@ impl BackupModule for Module {
         "postgres"
     }
 
+    fn max_carriers(&self) -> u32 {
+        // One COPY sink is tied to one connection for v0.1.
+        1
+    }
+
     fn version_support(&self) -> &'static str {
         "PostgreSQL 10..=18 (logical, pure Rust)"
     }

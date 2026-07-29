@@ -8,11 +8,16 @@ run() { if "$@"; then printf 'PASS: %s\n' "$*"; passed=$((passed + 1)); else pri
 cd "$root"
 run bash e2e/relay_smoke.sh
 run env RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
+run bash e2e/session_two_targets.sh
 run bash e2e/fault_matrix.sh
-run sudo -n "$root/e2e/filesystem_netns_test.sh"
-run sudo -n "$root/e2e/transport_netns_test.sh"
-run sudo -n "$root/e2e/bandwidth_netem.sh"
 run bash e2e/s3_minio_test.sh
+if [[ ${RUST_BACKUP_PRIVILEGED:-0} == 1 ]]; then
+  run sudo -n "$root/e2e/filesystem_netns_test.sh"
+  run sudo -n "$root/e2e/transport_netns_test.sh"
+  run sudo -n "$root/e2e/bandwidth_netem.sh"
+else
+  printf 'SKIP: privileged netns/bandwidth tests (set RUST_BACKUP_PRIVILEGED=1)\n'
+fi
 if [[ ${RUST_BACKUP_FULL_DB_MATRIX:-0} == 1 ]]; then
   run bash e2e/postgres_introspect.sh 16
   run bash e2e/postgres_matrix.sh 10 12 14 16 18

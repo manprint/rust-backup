@@ -12,6 +12,12 @@ rust-backup run --config session.yml    run a multi-target session from YAML
 rust-backup plan <module> source [PARAMS]  dry-run: analyze + print the plan, no transfer
 ```
 
+Every surface accepts `--help`; the top-level also accepts `--version` and
+`--verbose` (repeatable). Module roles accept `--param` / `-P key=value` for a
+module-specific setting that has no dedicated flag. `run` accepts
+`--parallel-targets` and `--fail-fast`. Filesystem destinations accept
+`--no-preserve-ownership` when restoring without ownership changes.
+
 ## Transport flags (all module roles)
 
 | Flag | Env | Default | Meaning |
@@ -19,7 +25,7 @@ rust-backup plan <module> source [PARAMS]  dry-run: analyze + print the plan, no
 | `--to <host:port>` | `RUST_BACKUP_TO` | — | coordination server address |
 | `--channel <id>` | `RUST_BACKUP_CHANNEL` | — | rendezvous channel id (source & dest must match) |
 | `--secret <s>` / `--secret-file <path>` | `RUST_BACKUP_SECRET` / `RUST_BACKUP_SECRET_FILE` | none | shared HMAC secret; prefer file or environment over argv |
-| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | only `1` is currently accepted; multi-carrier transfer is not implemented |
+| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | requested data carriers (1..32); filesystem may use all, PostgreSQL/MongoDB/S3 safely negotiate to 1 |
 | `--udp` / `--no-udp` | `RUST_BACKUP_UDP` | on | try the direct UDP/QUIC path (falls back to relay) |
 | `--insecure` | `RUST_BACKUP_INSECURE` | off | skip TLS verification (testing only) |
 | `--max-rate <bytes/s>` | `RUST_BACKUP_MAX_RATE` | unlimited | aggregate source payload rate cap |

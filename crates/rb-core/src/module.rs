@@ -56,6 +56,11 @@ pub trait Source: Send + Sync {
 /// The destination side of a target: validate and apply the streamed payload.
 #[async_trait]
 pub trait Destination: Send + Sync {
+    /// Maximum independent data carriers this destination can apply safely.
+    /// The conservative default protects new modules until they opt in.
+    fn max_carriers(&self) -> usize {
+        1
+    }
     /// Preflight the plan: disk space, accessibility, version compatibility,
     /// privilege checks. The transfer proceeds only if `Preflight::ok`.
     async fn validate(&self, plan: &BackupPlan) -> Result<Preflight>;
@@ -69,6 +74,12 @@ pub trait Destination: Send + Sync {
 pub trait BackupModule: Send + Sync {
     /// CLI/identifier name ("postgres", "mongodb", "filesystem", "s3").
     fn name(&self) -> &'static str;
+
+    /// Maximum independent data carriers this module can restore safely.
+    /// Defaulting to one keeps third-party modules conservative by design.
+    fn max_carriers(&self) -> u32 {
+        1
+    }
 
     /// Human-readable supported-version range (e.g. "PostgreSQL 10..=latest").
     fn version_support(&self) -> &'static str;

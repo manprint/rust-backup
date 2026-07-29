@@ -10,10 +10,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use rb_transport::adaptive_nat::{NatMappingClass, NatProfile};
 use rb_transport::proto::{
     ClientMsg, ServerMsg, UdpCandidate, UdpCandidateKind, MAX_FRAME_LENGTH, MAX_V2_OFFER_CANDIDATES,
 };
-use rb_transport::server::UdpMatchmaker;
+use rb_transport::server::{UdpMatchmaker, UdpOffer};
 
 fn addr(s: &str) -> SocketAddr {
     s.parse().expect("valid socket addr")
@@ -97,6 +98,38 @@ fn udp_punch_round_trip() {
     assert_eq!(roundtrip_server(&msg), msg);
 }
 
+#[tokio::test]
+async fn broker_preserves_v2_candidate_metadata_and_profile() {
+    let m = UdpMatchmaker::default();
+    let provider = UdpOffer {
+        addrs: vec![addr("198.51.100.9:9000")],
+        candidates: vec![UdpCandidate {
+            addr: addr("198.51.100.9:9000"),
+            kind: UdpCandidateKind::Reflexive,
+            priority: 99,
+        }],
+        profile: NatProfile {
+            mapping: Some(NatMappingClass::AddressDependent),
+            reflexive_addrs: vec![addr("198.51.100.9:9000")],
+        },
+    };
+    let consumer = UdpOffer {
+        addrs: vec![addr("203.0.113.9:9001")],
+        candidates: vec![],
+        profile: NatProfile::default(),
+    };
+    let provider_rx = m.register_provider();
+    let consumer_rx = m.register_consumer();
+    m.offer_provider_v2(provider.clone());
+    m.offer_consumer_v2(consumer.clone());
+    let seen_by_consumer = consumer_rx.await.expect("consumer notified");
+    let seen_by_provider = provider_rx.await.expect("provider notified");
+    assert_eq!(seen_by_consumer.addrs, provider.addrs);
+    assert_eq!(seen_by_consumer.candidates, provider.candidates);
+    assert_eq!(seen_by_consumer.profile, provider.profile);
+    assert_eq!(seen_by_provider.addrs, consumer.addrs);
+}
+
 #[test]
 fn udp_unavailable_round_trip() {
     let msg = ServerMsg::UdpUnavailable;
@@ -119,8 +152,8 @@ async fn broker_happy_path_provider_first() {
     m.offer_provider(prov.clone());
     m.offer_consumer(cons.clone());
 
-    assert_eq!(prx.await.expect("provider notified"), cons);
-    assert_eq!(crx.await.expect("consumer notified"), prov);
+    assert_eq!(prx.await.expect("provider notified").addrs, cons);
+    assert_eq!(crx.await.expect("consumer notified").addrs, prov);
 }
 
 /// Consumer offers first, then provider — the ordering the broken broker failed.
@@ -138,8 +171,8 @@ async fn broker_happy_path_consumer_first() {
     m.offer_consumer(cons.clone());
     m.offer_provider(prov.clone());
 
-    assert_eq!(crx.await.expect("consumer notified"), prov);
-    assert_eq!(prx.await.expect("provider notified"), cons);
+    assert_eq!(crx.await.expect("consumer notified").addrs, prov);
+    assert_eq!(prx.await.expect("provider notified").addrs, cons);
 }
 
 /// A side whose peer never offers must NOT be matched; in the real serve loop its
@@ -182,7 +215,7 @@ async fn broker_matched_side_beats_deadline() {
     let deadline = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(deadline);
     let got = tokio::select! {
-        r = &mut crx => Some(r.expect("consumer notified")),
+        r = &mut crx => Some(r.expect("consumer notified").addrs),
         _ = &mut deadline => None,
     };
     assert_eq!(

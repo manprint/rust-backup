@@ -18,7 +18,7 @@ use rb_core::config::ServerConfig;
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::pool::{CarrierPool, PendingCarriers};
-use crate::proto::{ClientMsg, Delimited, ServerMsg};
+use crate::proto::{ClientMsg, Delimited, ServerMsg, UdpCandidate};
 use crate::shared::{proxy_buffer_size, tune_tcp};
 use crate::transport::load_server_tls;
 
@@ -69,12 +69,29 @@ pub struct UdpMatchmaker {
 
 #[derive(Default)]
 struct UdpMatchInner {
-    provider_addrs: Option<Vec<SocketAddr>>,
-    consumer_addrs: Option<Vec<SocketAddr>>,
+    provider_addrs: Option<UdpOffer>,
+    consumer_addrs: Option<UdpOffer>,
     /// Delivers the consumer's addresses to the provider task.
-    to_provider: Option<oneshot::Sender<Vec<SocketAddr>>>,
+    to_provider: Option<oneshot::Sender<UdpOffer>>,
     /// Delivers the provider's addresses to the consumer task.
-    to_consumer: Option<oneshot::Sender<Vec<SocketAddr>>>,
+    to_consumer: Option<oneshot::Sender<UdpOffer>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpOffer {
+    pub addrs: Vec<SocketAddr>,
+    pub candidates: Vec<UdpCandidate>,
+    pub profile: crate::adaptive_nat::NatProfile,
+}
+
+impl UdpOffer {
+    fn legacy(addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            addrs,
+            candidates: Vec::new(),
+            profile: Default::default(),
+        }
+    }
 }
 
 impl UdpMatchmaker {
@@ -87,7 +104,7 @@ impl UdpMatchmaker {
     }
 
     /// Provider task: register the sink for the consumer's addresses.
-    pub fn register_provider(&self) -> oneshot::Receiver<Vec<SocketAddr>> {
+    pub fn register_provider(&self) -> oneshot::Receiver<UdpOffer> {
         let (tx, rx) = oneshot::channel();
         let mut g = self.lock();
         g.to_provider = Some(tx);
@@ -96,7 +113,7 @@ impl UdpMatchmaker {
     }
 
     /// Consumer task: register the sink for the provider's addresses.
-    pub fn register_consumer(&self) -> oneshot::Receiver<Vec<SocketAddr>> {
+    pub fn register_consumer(&self) -> oneshot::Receiver<UdpOffer> {
         let (tx, rx) = oneshot::channel();
         let mut g = self.lock();
         g.to_consumer = Some(tx);
@@ -106,15 +123,23 @@ impl UdpMatchmaker {
 
     /// Provider task: record this side's offered candidates.
     pub fn offer_provider(&self, addrs: Vec<SocketAddr>) {
+        self.offer_provider_v2(UdpOffer::legacy(addrs));
+    }
+
+    pub fn offer_provider_v2(&self, offer: UdpOffer) {
         let mut g = self.lock();
-        g.provider_addrs = Some(addrs);
+        g.provider_addrs = Some(offer);
         Self::try_match(&mut g);
     }
 
     /// Consumer task: record this side's offered candidates.
     pub fn offer_consumer(&self, addrs: Vec<SocketAddr>) {
+        self.offer_consumer_v2(UdpOffer::legacy(addrs));
+    }
+
+    pub fn offer_consumer_v2(&self, offer: UdpOffer) {
         let mut g = self.lock();
-        g.consumer_addrs = Some(addrs);
+        g.consumer_addrs = Some(offer);
         Self::try_match(&mut g);
     }
 
@@ -178,14 +203,14 @@ where
             }
             res = &mut udp_rx, if udp_pending => {
                 udp_pending = false;
-                if let Ok(peer_addrs) = res {
-                    info!(%id, peer_candidate_count = peer_addrs.len(), "received peer candidates");
+                if let Ok(peer) = res {
+                    info!(%id, peer_candidate_count = peer.addrs.len(), "received peer candidates");
                     if !send_control(
                         control,
                         ServerMsg::UdpPunch {
-                            peer_addrs,
-                            peer_candidates: Vec::new(),
-                            peer_profile: crate::adaptive_nat::NatProfile::default(),
+                            peer_addrs: peer.addrs,
+                            peer_candidates: peer.candidates,
+                            peer_profile: peer.profile,
                         },
                     ).await {
                         return Ok(());
@@ -208,17 +233,19 @@ where
                 reap.as_mut().reset(Instant::now() + reap_timeout);
                 match msg? {
                     Some(ClientMsg::Heartbeat) => {}
-                    Some(ClientMsg::UdpCandidateOffer { addrs, .. }) => {
+                    Some(ClientMsg::UdpCandidateOffer { addrs, mut candidates, nat_profile, .. }) => {
                         // A peer-controlled list is sanitized BEFORE it is stored or
                         // forwarded: invalid entries dropped, deduped, capped at
                         // MAX_UDP_CANDIDATES so the far side never fans out more
                         // dials/punches than the contract allows.
                         let mut addrs = addrs;
                         crate::shared::sanitize_and_log("broker offer", &mut addrs);
+                        candidates.retain(|candidate| addrs.contains(&candidate.addr));
+                        candidates.truncate(crate::shared::MAX_UDP_CANDIDATES);
                         info!(%id, candidate_count = addrs.len(), "peer offered udp candidates");
                         match side {
-                            BrokerSide::Provider => matchmaker.offer_provider(addrs),
-                            BrokerSide::Consumer => matchmaker.offer_consumer(addrs),
+                            BrokerSide::Provider => matchmaker.offer_provider_v2(UdpOffer { addrs, candidates, profile: nat_profile }),
+                            BrokerSide::Consumer => matchmaker.offer_consumer_v2(UdpOffer { addrs, candidates, profile: nat_profile }),
                         }
                     }
                     Some(_) => warn!(%id, "unexpected control message"),

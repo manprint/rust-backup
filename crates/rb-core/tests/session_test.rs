@@ -96,9 +96,57 @@ fn two_item_plan() -> BackupPlan {
     plan
 }
 
+fn many_item_plan(count: u32) -> BackupPlan {
+    let mut plan = demo_plan();
+    plan.items = (1..=count)
+        .map(|id| PlanItem {
+            id,
+            ordinal: id - 1,
+            kind: "blob".into(),
+            name: format!("item-{id}"),
+            estimated_bytes: if matches!(id, 3 | 7) { 0 } else { 1 },
+            meta: if matches!(id, 3 | 7) {
+                serde_json::json!({"expects_data": false})
+            } else {
+                serde_json::Value::Null
+            },
+        })
+        .collect();
+    plan.estimated_bytes = count.saturating_sub(2) as u64;
+    plan
+}
+
 struct MockSource {
     fp: String,
     payload: Vec<u8>,
+}
+
+struct ManyItemSource {
+    count: u32,
+}
+
+#[async_trait]
+impl Source for ManyItemSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        Ok(many_item_plan(self.count))
+    }
+
+    async fn stream_out(&self, _plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        for item_id in 1..=self.count {
+            if matches!(item_id, 3 | 7) {
+                continue;
+            }
+            let data = [item_id as u8];
+            sink.send_chunk(item_id, 0, &data).await?;
+            sink.finish_item(item_id, 1, &rb_core::wire::blake3_hex(&data))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable-many".into())
+    }
 }
 
 struct MetadataOnlySource;
@@ -173,8 +221,37 @@ impl Source for MutatingSource {
 struct MockDest {
     received: Arc<Mutex<Vec<u8>>>,
 }
+
+struct OrderedDest {
+    ends: Arc<Mutex<Vec<u32>>>,
+}
+
+#[async_trait]
+impl Destination for OrderedDest {
+    fn max_carriers(&self) -> usize {
+        32
+    }
+
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        loop {
+            match src.next().await? {
+                ChunkEvent::ItemEnd { item_id, .. } => self.ends.lock().unwrap().push(item_id),
+                ChunkEvent::End => return Ok(()),
+                ChunkEvent::Chunk { .. } => {}
+            }
+        }
+    }
+}
 #[async_trait]
 impl Destination for MockDest {
+    fn max_carriers(&self) -> usize {
+        32
+    }
+
     async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
         Ok(Preflight::pass().check("space", true, "ok"))
     }
@@ -485,6 +562,38 @@ async fn multi_carrier_run_ok() {
     source.await.unwrap().unwrap();
     destination.await.unwrap().unwrap();
     assert_eq!(*received.lock().unwrap(), payload);
+}
+
+/// F1.1: the module-facing sequence is identical for one and four carriers.
+/// The plan interleaves two metadata-only items, which must be skipped by the
+/// carrier cursor rather than awaited on a data stream.
+#[tokio::test]
+async fn ordered_demux_matches_single_carrier_for_nine_items() {
+    async fn run(carriers: usize) -> (Vec<u32>, String) {
+        let ch = TestChannel::pair_carriers(carriers);
+        let ends = Arc::new(Mutex::new(Vec::new()));
+        let dest = OrderedDest { ends: ends.clone() };
+        let (p1, p2) = (Progress::default(), Progress::default());
+        let peer = ch.clone();
+        let source = tokio::spawn(async move {
+            session::run_source(&ManyItemSource { count: 9 }, &*ch, &p1).await
+        });
+        let destination = tokio::spawn(async move {
+            let mut yes = |_: &BackupPlan| true;
+            session::run_destination(&dest, &*peer, &p2, &mut yes).await
+        });
+        let source = source.await.unwrap().unwrap();
+        destination.await.unwrap().unwrap();
+        let order = ends.lock().unwrap().clone();
+        (order, source.plan.render())
+    }
+
+    let (single_order, single_plan) = run(1).await;
+    let (multi_order, multi_plan) = run(4).await;
+    let expected = vec![1, 2, 4, 5, 6, 8, 9];
+    assert_eq!(single_order, expected);
+    assert_eq!(multi_order, expected);
+    assert_eq!(single_plan, multi_plan);
 }
 
 /// V3.1: a source cannot report success after silently skipping a data-bearing

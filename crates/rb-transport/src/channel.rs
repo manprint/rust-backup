@@ -41,11 +41,19 @@ enum PairedChannelInner {
         acceptor: mux::Acceptor,
         #[cfg(feature = "udp")]
         direct: Option<DirectConn>,
+        #[cfg(feature = "udp")]
+        direct_token: Option<[u8; crate::direct::TOKEN_LEN]>,
+        #[cfg(feature = "udp")]
+        direct_streams: usize,
     },
     Destination {
         opener: mux::Opener,
         #[cfg(feature = "udp")]
         direct: Option<DirectConn>,
+        #[cfg(feature = "udp")]
+        direct_token: Option<[u8; crate::direct::TOKEN_LEN]>,
+        #[cfg(feature = "udp")]
+        direct_streams: usize,
     },
 }
 
@@ -67,6 +75,10 @@ impl PairedChannel {
                 acceptor,
                 #[cfg(feature = "udp")]
                 direct: None,
+                #[cfg(feature = "udp")]
+                direct_token: None,
+                #[cfg(feature = "udp")]
+                direct_streams: 0,
             })),
             carriers: carriers.clamp(1, 32) as usize,
             _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
@@ -90,6 +102,10 @@ impl PairedChannel {
                 opener,
                 #[cfg(feature = "udp")]
                 direct: None,
+                #[cfg(feature = "udp")]
+                direct_token: None,
+                #[cfg(feature = "udp")]
+                direct_streams: 0,
             })),
             carriers: carriers.clamp(1, 32) as usize,
             _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
@@ -99,10 +115,40 @@ impl PairedChannel {
     /// Set the direct QUIC connection (Phase 1.3).
     #[cfg(feature = "udp")]
     pub async fn set_direct(&self, direct: DirectConn) {
+        self.set_direct_with_token(direct, [0; crate::direct::TOKEN_LEN])
+            .await;
+    }
+
+    /// Install a direct path plus its authentication token for sibling carrier
+    /// connections. The compatibility setter above remains single-stream only.
+    #[cfg(feature = "udp")]
+    pub async fn set_direct_with_token(
+        &self,
+        direct: DirectConn,
+        token: [u8; crate::direct::TOKEN_LEN],
+    ) {
         let mut inner = self.inner.lock().await;
         match &mut *inner {
-            PairedChannelInner::Source { direct: d, .. } => *d = Some(direct),
-            PairedChannelInner::Destination { direct: d, .. } => *d = Some(direct),
+            PairedChannelInner::Source {
+                direct: d,
+                direct_token,
+                direct_streams,
+                ..
+            } => {
+                *d = Some(direct);
+                *direct_token = Some(token);
+                *direct_streams = 0;
+            }
+            PairedChannelInner::Destination {
+                direct: d,
+                direct_token,
+                direct_streams,
+                ..
+            } => {
+                *d = Some(direct);
+                *direct_token = Some(token);
+                *direct_streams = 0;
+            }
         }
     }
 
@@ -126,19 +172,36 @@ impl DataChannel for PairedChannel {
                 opener,
                 #[cfg(feature = "udp")]
                 direct,
+                #[cfg(feature = "udp")]
+                direct_token,
+                #[cfg(feature = "udp")]
+                direct_streams,
                 ..
             } => {
                 #[cfg(feature = "udp")]
-                if let Some(dc) = direct {
-                    match timeout(DIRECT_SETUP_TIMEOUT, dc.open_stream()).await {
-                        Ok(Ok(qt)) => {
+                if let (Some(dc), Some(token)) = (direct, direct_token) {
+                    let result: anyhow::Result<_> = async {
+                        if *direct_streams == 0 {
+                            timeout(DIRECT_SETUP_TIMEOUT, dc.open_stream())
+                                .await
+                                .map_err(|_| anyhow::anyhow!("direct stream open timed out"))?
+                        } else {
+                            let sibling = timeout(DIRECT_SETUP_TIMEOUT, dc.open_sibling(*token))
+                                .await
+                                .map_err(|_| anyhow::anyhow!("direct sibling open timed out"))??;
+                            timeout(DIRECT_SETUP_TIMEOUT, sibling.open_stream())
+                                .await
+                                .map_err(|_| anyhow::anyhow!("direct sibling stream timed out"))?
+                        }
+                    }
+                    .await;
+                    match result {
+                        Ok(qt) => {
+                            *direct_streams += 1;
                             return Ok(Box::new(qt));
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             tracing::warn!("direct stream open failed, falling back to relay: {e}");
-                        }
-                        Err(_) => {
-                            tracing::warn!("direct stream open timed out, falling back to relay");
                         }
                     }
                 }
@@ -168,21 +231,42 @@ impl DataChannel for PairedChannel {
                 acceptor,
                 #[cfg(feature = "udp")]
                 direct,
+                #[cfg(feature = "udp")]
+                direct_token,
+                #[cfg(feature = "udp")]
+                direct_streams,
                 ..
             } => {
                 #[cfg(feature = "udp")]
-                if let Some(dc) = direct {
-                    match timeout(DIRECT_SETUP_TIMEOUT, dc.accept_stream()).await {
-                        Ok(Ok(qt)) => {
+                if let (Some(dc), Some(token)) = (direct, direct_token) {
+                    let result: anyhow::Result<_> = async {
+                        if *direct_streams == 0 {
+                            timeout(DIRECT_SETUP_TIMEOUT, dc.accept_stream())
+                                .await
+                                .map_err(|_| anyhow::anyhow!("direct stream accept timed out"))?
+                        } else {
+                            let sibling = timeout(DIRECT_SETUP_TIMEOUT, dc.accept_sibling(*token))
+                                .await
+                                .map_err(|_| {
+                                    anyhow::anyhow!("direct sibling accept timed out")
+                                })??;
+                            timeout(DIRECT_SETUP_TIMEOUT, sibling.accept_stream())
+                                .await
+                                .map_err(|_| {
+                                    anyhow::anyhow!("direct sibling stream accept timed out")
+                                })?
+                        }
+                    }
+                    .await;
+                    match result {
+                        Ok(qt) => {
+                            *direct_streams += 1;
                             return Ok(Box::new(qt));
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             tracing::warn!(
                                 "direct stream accept failed, falling back to relay: {e}"
                             );
-                        }
-                        Err(_) => {
-                            tracing::warn!("direct stream accept timed out, falling back to relay");
                         }
                     }
                 }

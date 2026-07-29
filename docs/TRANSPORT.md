@@ -19,3 +19,26 @@ Current limits: one data carrier is implemented. Advanced NAT classification,
 connectivity checks, PCP/UPnP mapping, address cache, symmetric-NAT prediction,
 and multi-carrier item pinning remain future work; direct-path failure must never
 break the relay path.
+# Carrier contract
+
+The source requests a carrier count in the plan exchange; the destination replies
+with the safe count it will open. Both peers use the negotiated minimum before
+opening any data stream, and each open/accept is bounded by the plan-exchange
+timeout. Filesystem permits up to 32 carriers. PostgreSQL, MongoDB and S3
+currently negotiate to one because their restore sinks are respectively a COPY
+connection, a batch accumulator and an ordered multipart loop.
+
+For a negotiated multi-carrier transfer, `item_id % carriers` selects exactly one
+carrier. Every carrier identifies itself with a setup frame because relay accept
+order is not identity. The destination pulls items only in plan order from their
+assigned carrier; it never exposes interleaved items to a module, and it never
+stripes one item. A control-plane abort is watched between item boundaries, so a
+destination failure stops source reads in bounded work.
+
+## Coordination reconnect decision
+
+There is no transparent control-plane reconnect in v0.1. A coordination loss
+before the plan exchange fails in `Connect`; a loss after exchange aborts the
+current transfer with its phase-tagged error. The data plane never resumes a
+half-applied restore. The unused reconnect scaffold was removed rather than
+leaving an implied, untested recovery guarantee.

@@ -526,6 +526,32 @@ impl DirectConn {
             endpoint: self.endpoint.clone(),
         })
     }
+
+    /// Accept an additional authenticated carrier connection on the same UDP
+    /// endpoint.  Carrier setup is independent: a failed sibling can fall back
+    /// to relay without closing the primary connection/control stream.
+    pub async fn accept_sibling(&self, token: [u8; TOKEN_LEN]) -> Result<DirectConn> {
+        loop {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .context("accept sibling connection")?;
+            let conn = timeout(NETWORK_TIMEOUT, incoming)
+                .await
+                .context("sibling handshake timed out")??;
+            match timeout(
+                NETWORK_TIMEOUT,
+                DirectListener::auth_accept(&conn, &self.endpoint, token),
+            )
+            .await
+            {
+                Ok(Ok(direct)) => return Ok(direct),
+                Ok(Err(error)) => debug!(%error, "rejected direct sibling"),
+                Err(_) => debug!("direct sibling authentication timed out"),
+            }
+        }
+    }
 }
 
 /// A long-lived QUIC server endpoint that accepts direct connections from punched consumers.

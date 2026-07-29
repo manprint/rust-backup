@@ -248,14 +248,14 @@ async fn apply_data(
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
     // The open COPY sink for the item currently being loaded.
-    let mut current: Option<(u32, Pin<Box<CopyInSink<Bytes>>>)> = None;
+    let mut current: Option<ActiveCopy> = None;
 
     loop {
         match src.next().await? {
             ChunkEvent::Chunk { item_id, data, .. } => {
                 let reopen = current
                     .as_ref()
-                    .map(|(id, _)| *id != item_id)
+                    .map(|(id, _, _)| *id != item_id)
                     .unwrap_or(true);
                 if reopen {
                     finish_current(&mut current).await?;
@@ -276,15 +276,30 @@ async fn apply_data(
                             e,
                         )
                     })?;
-                    current = Some((item_id, Box::pin(sink)));
+                    current = Some((item_id, 0, Box::pin(sink)));
                 }
-                if let Some((_, sink)) = &mut current {
+                if let Some((_, received, sink)) = &mut current {
+                    *received += data.len() as u64;
                     sink.send(Bytes::from(data))
                         .await
                         .map_err(|e| BackupError::phase_src(Phase::Apply, "copy_in send", e))?;
                 }
             }
-            ChunkEvent::ItemEnd { .. } => finish_current(&mut current).await?,
+            ChunkEvent::ItemEnd { item_id, total, .. } => {
+                let (open_id, received, _) = current.as_ref().ok_or_else(|| {
+                    BackupError::phase(
+                        Phase::Apply,
+                        format!("ItemEnd item={item_id} without open COPY"),
+                    )
+                })?;
+                if *open_id != item_id || *received != total {
+                    return Err(BackupError::phase(
+                        Phase::Verify,
+                        format!("ItemEnd item={item_id} does not match open item={open_id} bytes={received}"),
+                    ));
+                }
+                finish_current(&mut current).await?
+            }
             ChunkEvent::End => {
                 finish_current(&mut current).await?;
                 break;
@@ -294,8 +309,10 @@ async fn apply_data(
     Ok(())
 }
 
-async fn finish_current(current: &mut Option<(u32, Pin<Box<CopyInSink<Bytes>>>)>) -> Result<()> {
-    if let Some((_, mut sink)) = current.take() {
+type ActiveCopy = (u32, u64, Pin<Box<CopyInSink<Bytes>>>);
+
+async fn finish_current(current: &mut Option<ActiveCopy>) -> Result<()> {
+    if let Some((_, _, mut sink)) = current.take() {
         sink.as_mut()
             .finish()
             .await

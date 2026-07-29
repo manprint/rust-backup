@@ -97,6 +97,11 @@ impl BackupModule for Module {
         "mongodb"
     }
 
+    fn max_carriers(&self) -> u32 {
+        // One ordered batch accumulator is active during restore.
+        1
+    }
+
     fn version_support(&self) -> &'static str {
         "MongoDB 4..=8 (logical, pure Rust)"
     }

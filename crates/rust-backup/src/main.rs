@@ -451,6 +451,11 @@ async fn run_main() -> anyhow::Result<()> {
 
 /// Stable shell-facing error codes. Keep this independent from stderr wording.
 fn exit_code(error: &anyhow::Error) -> i32 {
+    if let Some(typed) = error.downcast_ref::<rb_core::BackupError>() {
+        return exit_code_backup(typed);
+    }
+    // Fallback only for errors that genuinely originate outside rb-core (clap,
+    // filesystem config reads, or a transport library before it is phase-wrapped).
     let text = error.to_string();
     if text.contains("[Config]")
         || text.contains("unknown module")
@@ -469,6 +474,26 @@ fn exit_code(error: &anyhow::Error) -> i32 {
         7
     } else {
         1
+    }
+}
+
+fn exit_code_backup(error: &rb_core::BackupError) -> i32 {
+    use rb_core::BackupError::{Config, Integrity, Phase, PlanRejected, Preflight, SourceMutated};
+    match error {
+        Config(_) => 2,
+        Preflight(_) => 3,
+        PlanRejected(_) => 4,
+        Integrity(_)
+        | Phase {
+            phase: rb_core::Phase::Apply | rb_core::Phase::Verify,
+            ..
+        } => 5,
+        SourceMutated(_) => 6,
+        Phase {
+            phase: rb_core::Phase::Connect,
+            ..
+        } => 7,
+        _ => 1,
     }
 }
 
@@ -654,22 +679,32 @@ async fn execute(
             let src = module
                 .open_source(params)
                 .await
-                .map_err(|e| anyhow!("{e}"))?;
-            let ch = rb_transport::connect_source(transport)
-                .await
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
+            let ch = rb_transport::connect_source(transport).await.map_err(|e| {
+                anyhow::Error::new(rb_core::BackupError::phase_src(
+                    rb_core::Phase::Connect,
+                    "connect source transport",
+                    e,
+                ))
+            })?;
             session::run_source_limited(&*src, &ch, &progress, transport.max_rate)
                 .await
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
         }
         Role::Destination => {
             let dst = module
                 .open_destination(params)
                 .await
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
             let ch = rb_transport::connect_destination(transport)
                 .await
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(|e| {
+                    anyhow::Error::new(rb_core::BackupError::phase_src(
+                        rb_core::Phase::Connect,
+                        "connect destination transport",
+                        e,
+                    ))
+                })?;
             let mut accept = move |plan: &BackupPlan| -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = bool> + Send>,
             > {
@@ -685,7 +720,7 @@ async fn execute(
             };
             session::run_destination_with_accept(&*dst, &ch, &progress, &mut accept)
                 .await
-                .map_err(|e| anyhow!("{e}"))?;
+                .map_err(anyhow::Error::new)?;
         }
     }
     Ok(())
@@ -733,6 +768,15 @@ mod tests {
             ("[Connect] bad", 7),
         ] {
             assert_eq!(exit_code(&anyhow!(message)), code);
+        }
+    }
+
+    #[test]
+    fn typed_exit_code_ignores_error_message_wording() {
+        for message in ["first wording", "a completely different wording"] {
+            let error =
+                anyhow::Error::new(rb_core::BackupError::phase(rb_core::Phase::Verify, message));
+            assert_eq!(exit_code(&error), 5);
         }
     }
 
