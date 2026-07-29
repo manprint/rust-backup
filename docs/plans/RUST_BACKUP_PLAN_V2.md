@@ -13,6 +13,40 @@
 
 ---
 
+## Status observed — 2026-07-29 (post-implementation)
+
+This section supersedes older “never run” wording below. “Complete” means code
+and the named proof were both run in this workspace; it does not imply a sudo
+test was run.
+
+| Area | Status | Observed proof |
+|------|--------|----------------|
+| V1 PostgreSQL | **complete** | `e2e/postgres_matrix.sh 10 12 14 16 18` → 25/25 |
+| V1 MongoDB | **complete** | `e2e/mongodb_matrix.sh 4 5 6 7 8` → 20/20 |
+| V3 session contract | **complete** | workspace gates green; plan bounds, completion digest, plan timeout and destination abort tests |
+| V5 TLS/secrets | **complete for coordination TLS and Postgres TLS** | plain + self-signed TLS relay e2e; secret redaction tests; Postgres TLS unit suite |
+| V6.1 relay multi-carrier | **implemented and proven** | deterministic 4-carrier core test and `RUST_BACKUP_E2E_CARRIERS=4 e2e/relay_smoke.sh` → 4/4; privileged netem speed proof remains sudo-pending |
+| V7.2/V7.3 | **complete** | production no-unwrap/expect/panic Clippy denies; bounds tests; `scripts/gates.sh` green |
+| V7.1 | **partial** | core fault suite + `e2e/fault_matrix.sh` → 3/3, including a live source-kill immutability case; the planned ~30 backend/disk/channel cases remain |
+| V10 CI matrix | **implemented** | CI now runs gates, TLS + 4-carrier relay, MinIO, session, fault bank, PostgreSQL 10/12/14/16/18 and MongoDB 4/5/6/7/8 |
+| sudo-only e2e | **deliberately pending** | `filesystem_netns_test.sh`, `transport_netns_test.sh`, `bandwidth_netem.sh` were not invoked |
+
+### V4 exact status
+
+V4 is **not complete**. The multi-STUN chain, pure NAT classifier/plan tests,
+backwards-compatible v2 candidate schema with frame bound, and bounded
+control-plane sends are implemented. Still required: gathering a populated
+reflexive profile, v2 broker rider propagation, keyed connectivity checks,
+PCP/UPnP mapping, learned-address cache, NAT lab and sudo netns execution.
+
+### Remaining non-sudo work
+
+V4.4–V4.7, full V7.1 fault bank, V7.4 reconnect, and the measured V6 netem
+speed proof remain. They are intentionally not marked complete. Sudo-only work
+remains suspended by request.
+
+---
+
 ## 0. State of the tree (measured, not assumed)
 
 * `bash scripts/gates.sh` → **green**: `cargo fmt --check`, `clippy --all-targets

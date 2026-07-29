@@ -12,12 +12,22 @@
 //! the producer never outruns the consumer and the source is never forced to
 //! buffer locally. This is how the producer/consumer bandwidth gap is balanced.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
 use crate::error::{BackupError, Phase, Result};
 use crate::progress::Progress;
 use crate::wire::{self, ControlFrame, DataFrame};
+
+/// Bounds for peer-supplied plan and stream bookkeeping. They prevent a valid
+/// frame from still forcing unbounded allocation or millions of hashers.
+pub const MAX_PLAN_ITEMS: usize = 100_000;
+pub const MAX_PLAN_ITEM_NAME_BYTES: usize = 4 * 1024;
+pub const MAX_PLAN_ITEM_META_BYTES: usize = 64 * 1024;
+pub const MAX_IN_FLIGHT_ITEM_HASHERS: usize = 1024;
 
 /// Any bidirectional byte stream usable as a substream.
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -153,7 +163,9 @@ pub struct StreamChunkSource<S: DuplexStream> {
     /// Running whole-item hashers, keyed by item id. An entry lives only while
     /// the item is in flight (removed at `ItemEnd`), so memory is O(items in
     /// flight), never O(bytes).
-    item_hashers: std::collections::HashMap<u32, blake3::Hasher>,
+    item_hashers: HashMap<u32, blake3::Hasher>,
+    /// Finished data-bearing item ids and their verified whole-item digests.
+    completed_items: BTreeMap<u32, String>,
 }
 
 impl<S: DuplexStream> StreamChunkSource<S> {
@@ -161,7 +173,8 @@ impl<S: DuplexStream> StreamChunkSource<S> {
         Self {
             stream,
             progress: None,
-            item_hashers: std::collections::HashMap::new(),
+            item_hashers: HashMap::new(),
+            completed_items: BTreeMap::new(),
         }
     }
     /// As [`Self::new`] but increments `progress` as chunks/items arrive.
@@ -169,13 +182,37 @@ impl<S: DuplexStream> StreamChunkSource<S> {
         Self {
             stream,
             progress: Some(progress),
-            item_hashers: std::collections::HashMap::new(),
+            item_hashers: HashMap::new(),
+            completed_items: BTreeMap::new(),
         }
     }
     /// Recover the underlying stream (e.g. to read a trailing control frame).
     pub fn into_inner(self) -> S {
         self.stream
     }
+
+    /// Verified item ids received before the stream ended.
+    pub fn completed_item_ids(&self) -> BTreeSet<u32> {
+        self.completed_items.keys().copied().collect()
+    }
+
+    /// Order-independent whole-payload commitment, derived from verified item
+    /// digests. Stable ordering by item id makes the trailing `Done` frame
+    /// meaningful without buffering payload bytes.
+    pub fn completion_digest(&self) -> String {
+        completion_digest(&self.completed_items)
+    }
+}
+
+/// Produce the session-level payload commitment from completed item digests.
+pub fn completion_digest(completed: &BTreeMap<u32, String>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (id, digest) in completed {
+        hasher.update(&id.to_le_bytes());
+        hasher.update(digest.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[async_trait]
@@ -211,6 +248,14 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                         "chunk item={item_id} offset={offset}: blake3 mismatch"
                     )));
                 }
+                if !self.item_hashers.contains_key(&item_id)
+                    && self.item_hashers.len() >= MAX_IN_FLIGHT_ITEM_HASHERS
+                {
+                    return Err(BackupError::phase(
+                        Phase::Transfer,
+                        format!("too many in-flight items (limit {MAX_IN_FLIGHT_ITEM_HASHERS})"),
+                    ));
+                }
                 self.item_hashers.entry(item_id).or_default().update(&data);
                 if let Some(p) = &self.progress {
                     p.add_bytes(data.len() as u64);
@@ -236,6 +281,12 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                         "item={item_id}: whole-item blake3 mismatch (declared {blake3}, computed {got})"
                     )));
                 }
+                if self.completed_items.insert(item_id, got).is_some() {
+                    return Err(BackupError::phase(
+                        Phase::Verify,
+                        format!("item={item_id}: duplicate ItemEnd"),
+                    ));
+                }
                 if let Some(p) = &self.progress {
                     p.item_done();
                 }
@@ -244,6 +295,162 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                     total,
                     blake3,
                 })
+            }
+        }
+    }
+}
+
+/// A set of item-pinned data carriers.  An item is always assigned to exactly
+/// one carrier (`item_id % carriers`), so chunks within an item cannot reorder.
+/// This deliberately does not stripe a single item across streams.
+pub struct MultiStreamChunkSink {
+    streams: Vec<StreamChunkSink<Box<dyn DuplexStream>>>,
+}
+
+impl MultiStreamChunkSink {
+    pub fn new_counted(streams: Vec<Box<dyn DuplexStream>>, progress: Progress) -> Result<Self> {
+        if streams.is_empty() {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                "no data carriers negotiated",
+            ));
+        }
+        Ok(Self {
+            streams: streams
+                .into_iter()
+                .map(|stream| StreamChunkSink::new_counted(stream, progress.clone()))
+                .collect(),
+        })
+    }
+
+    fn carrier(&self, item_id: u32) -> usize {
+        (item_id as usize) % self.streams.len()
+    }
+
+    /// Best-effort abort delivered to every carrier after a source failure.
+    pub async fn abort(&mut self, reason: &str) {
+        for stream in &mut self.streams {
+            let _ = wire::send_frame(
+                &mut stream.stream,
+                &DataFrame::Abort {
+                    reason: reason.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+}
+
+#[async_trait]
+impl ChunkSink for MultiStreamChunkSink {
+    async fn send_chunk(&mut self, item_id: u32, offset: u64, data: &[u8]) -> Result<()> {
+        let carrier = self.carrier(item_id);
+        self.streams[carrier]
+            .send_chunk(item_id, offset, data)
+            .await
+    }
+
+    async fn finish_item(&mut self, item_id: u32, total: u64, blake3: &str) -> Result<()> {
+        let carrier = self.carrier(item_id);
+        self.streams[carrier]
+            .finish_item(item_id, total, blake3)
+            .await
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        for stream in &mut self.streams {
+            stream.finish().await?;
+        }
+        Ok(())
+    }
+}
+
+/// Concurrently merges item-pinned carriers back into one module-facing source.
+/// Each reader owns one stream; events may interleave across items, while each
+/// individual item retains its wire order by construction.
+pub struct MultiStreamChunkSource {
+    events: mpsc::Receiver<Result<ChunkEvent>>,
+    remaining: usize,
+    completed_items: BTreeMap<u32, String>,
+}
+
+impl MultiStreamChunkSource {
+    pub fn new_counted(streams: Vec<Box<dyn DuplexStream>>, progress: Progress) -> Result<Self> {
+        if streams.is_empty() {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                "no data carriers negotiated",
+            ));
+        }
+        let remaining = streams.len();
+        let (tx, events) = mpsc::channel(remaining.saturating_mul(4));
+        for stream in streams {
+            let tx = tx.clone();
+            let progress = progress.clone();
+            tokio::spawn(async move {
+                let mut source = StreamChunkSource::new_counted(stream, progress);
+                loop {
+                    let event = source.next().await;
+                    let done = matches!(event, Ok(ChunkEvent::End)) || event.is_err();
+                    if tx.send(event).await.is_err() || done {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        Ok(Self {
+            events,
+            remaining,
+            completed_items: BTreeMap::new(),
+        })
+    }
+
+    pub fn completed_item_ids(&self) -> BTreeSet<u32> {
+        self.completed_items.keys().copied().collect()
+    }
+
+    pub fn completion_digest(&self) -> String {
+        completion_digest(&self.completed_items)
+    }
+}
+
+#[async_trait]
+impl ChunkSource for MultiStreamChunkSource {
+    async fn next(&mut self) -> Result<ChunkEvent> {
+        loop {
+            let event = self.events.recv().await.ok_or_else(|| {
+                BackupError::phase(Phase::Transfer, "data carrier closed before StreamEnd")
+            })??;
+            match event {
+                ChunkEvent::End => {
+                    self.remaining = self.remaining.saturating_sub(1);
+                    if self.remaining == 0 {
+                        return Ok(ChunkEvent::End);
+                    }
+                }
+                ChunkEvent::ItemEnd {
+                    item_id,
+                    total,
+                    blake3,
+                } => {
+                    if self
+                        .completed_items
+                        .insert(item_id, blake3.clone())
+                        .is_some()
+                    {
+                        return Err(BackupError::phase(
+                            Phase::Verify,
+                            format!("item={item_id}: duplicate ItemEnd across carriers"),
+                        ));
+                    }
+                    return Ok(ChunkEvent::ItemEnd {
+                        item_id,
+                        total,
+                        blake3,
+                    });
+                }
+                chunk @ ChunkEvent::Chunk { .. } => return Ok(chunk),
             }
         }
     }
@@ -274,6 +481,7 @@ pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<crate::plan::Bac
                     crate::plan::PLAN_FORMAT_VERSION
                 )));
             }
+            validate_plan_bounds(&p)?;
             Ok(*p)
         }
         Some(ControlFrame::Abort { reason }) => Err(BackupError::PlanRejected(reason)),
@@ -282,6 +490,46 @@ pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<crate::plan::Bac
             format!("expected Plan frame, got {other:?}"),
         )),
     }
+}
+
+/// Validate allocations induced by an otherwise syntactically valid plan.
+pub fn validate_plan_bounds(plan: &crate::plan::BackupPlan) -> Result<()> {
+    if plan.items.len() > MAX_PLAN_ITEMS {
+        return Err(BackupError::phase(
+            Phase::Connect,
+            format!(
+                "plan has {} items; limit is {MAX_PLAN_ITEMS}",
+                plan.items.len()
+            ),
+        ));
+    }
+    for item in &plan.items {
+        if item.name.len() > MAX_PLAN_ITEM_NAME_BYTES || item.kind.len() > MAX_PLAN_ITEM_NAME_BYTES
+        {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                format!(
+                    "plan item {} name/kind exceeds {MAX_PLAN_ITEM_NAME_BYTES} bytes",
+                    item.id
+                ),
+            ));
+        }
+        let meta_size = serde_json::to_vec(&item.meta)
+            .map_err(|error| {
+                BackupError::phase_src(Phase::Connect, "plan item meta serialize", error)
+            })?
+            .len();
+        if meta_size > MAX_PLAN_ITEM_META_BYTES {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                format!(
+                    "plan item {} meta exceeds {MAX_PLAN_ITEM_META_BYTES} bytes",
+                    item.id
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Destination → Source: send the accept/reject decision.

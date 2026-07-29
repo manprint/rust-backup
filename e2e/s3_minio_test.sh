@@ -3,11 +3,14 @@
 # Requires docker and cargo. The script leaves no containers or host files behind.
 set -euo pipefail
 
+source "$(dirname "$0")/lib.sh"
+rb_build_release
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 src_name=rb-s3-src-$$
 dst_name=rb-s3-dst-$$
 server_pid=
+source_pid=
 dst_pid=
 cleanup() {
   status=$?
@@ -20,9 +23,14 @@ cleanup() {
     sed -n '1,240p' "$work/destination.log" >&2 2>/dev/null || true
   fi
   [[ -n "${dst_pid:-}" ]] && kill "$dst_pid" 2>/dev/null || true
+  [[ -n "${source_pid:-}" ]] && kill "$source_pid" 2>/dev/null || true
   [[ -n "${server_pid:-}" ]] && kill "$server_pid" 2>/dev/null || true
   docker rm -f "$src_name" "$dst_name" >/dev/null 2>&1 || true
-  rm -rf "$work"
+  if [[ ${RUST_BACKUP_E2E_KEEP:-0} == 1 ]]; then
+    printf 'kept e2e workdir: %s\n' "$work" >&2
+  else
+    rm -rf "$work"
+  fi
   return "$status"
 }
 trap cleanup EXIT
@@ -48,14 +56,16 @@ before=$(mc ls --recursive --json src/source | sort)
 printf 'MinIO seeded\n' >&2
 
 cd "$root"
-cargo run -q -p rust-backup -- server --bind-addr 127.0.0.1 --control-port 7840 >"$work/server.log" 2>&1 &
+"$RB_E2E_BIN" server --bind-addr 127.0.0.1 --control-port 7840 >"$work/server.log" 2>&1 &
 server_pid=$!
 sleep 1
-cargo run -q -p rust-backup -- s3 destination --to 127.0.0.1:7840 --channel minio-e2e --no-udp --yes --bucket destination --prefix out/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style -P create_bucket=true >"$work/destination.log" 2>&1 &
-dst_pid=$!
+"$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-e2e --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/source.log" 2>&1 &
+source_pid=$!
 sleep 1
-printf 'Relay and destination started\n' >&2
-cargo run -q -p rust-backup -- s3 source --to 127.0.0.1:7840 --channel minio-e2e --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/source.log" 2>&1
+"$RB_E2E_BIN" s3 destination --to 127.0.0.1:7840 --channel minio-e2e --no-udp --yes --bucket destination --prefix out/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style -P create_bucket=true >"$work/destination.log" 2>&1 &
+dst_pid=$!
+printf 'Relay, source and destination started\n' >&2
+wait "$source_pid"
 printf 'Source finished\n' >&2
 wait "$dst_pid"
 printf 'Destination finished\n' >&2

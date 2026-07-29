@@ -29,6 +29,7 @@ const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 /// A paired byte channel between source and destination.
 pub struct PairedChannel {
     inner: std::sync::Arc<Mutex<PairedChannelInner>>,
+    carriers: usize,
     /// Drives the control-plane keepalive (client→server heartbeats) and drains
     /// inbound server frames. Owns the control substream — nothing else uses it
     /// after setup. Aborted when the channel drops.
@@ -51,24 +52,46 @@ enum PairedChannelInner {
 impl PairedChannel {
     /// Create a new source-side PairedChannel (provider).
     pub fn source(acceptor: mux::Acceptor, control: Delimited<mux::Stream>) -> Self {
+        Self::source_with_carriers(acceptor, control, 1)
+    }
+
+    /// Create a source channel with a negotiated number of item-pinned data
+    /// carriers. Carrier zero is never the control stream when this is >1.
+    pub fn source_with_carriers(
+        acceptor: mux::Acceptor,
+        control: Delimited<mux::Stream>,
+        carriers: u32,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(Mutex::new(PairedChannelInner::Source {
                 acceptor,
                 #[cfg(feature = "udp")]
                 direct: None,
             })),
+            carriers: carriers.clamp(1, 32) as usize,
             _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
         }
     }
 
     /// Create a new destination-side PairedChannel (consumer).
     pub fn destination(opener: mux::Opener, control: Delimited<mux::Stream>) -> Self {
+        Self::destination_with_carriers(opener, control, 1)
+    }
+
+    /// Create a destination channel with a negotiated number of item-pinned
+    /// data carriers. The destination opens each data substream after PlanAck.
+    pub fn destination_with_carriers(
+        opener: mux::Opener,
+        control: Delimited<mux::Stream>,
+        carriers: u32,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(Mutex::new(PairedChannelInner::Destination {
                 opener,
                 #[cfg(feature = "udp")]
                 direct: None,
             })),
+            carriers: carriers.clamp(1, 32) as usize,
             _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
         }
     }
@@ -190,7 +213,7 @@ impl DataChannel for PairedChannel {
     }
 
     fn carriers(&self) -> usize {
-        1
+        self.carriers
     }
 }
 

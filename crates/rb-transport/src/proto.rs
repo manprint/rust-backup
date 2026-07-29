@@ -5,8 +5,30 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::adaptive_nat::NatProfile;
+
 /// Max frame length for a JSON message on the control channel.
 pub const MAX_FRAME_LENGTH: usize = 1024;
+/// A v2 offer carries both the legacy address list and richer candidates. Eight
+/// entries keep its maximum emitted JSON frame below [`MAX_FRAME_LENGTH`].
+pub const MAX_V2_OFFER_CANDIDATES: usize = 8;
+
+/// Candidate metadata added in UDP offer v2. `addrs` remains in the message for
+/// old peers; new peers use this to retain priority and provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpCandidateKind {
+    Host,
+    Reflexive,
+    Mapped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpCandidate {
+    pub addr: SocketAddr,
+    pub kind: UdpCandidateKind,
+    pub priority: u16,
+}
 
 /// Client → Server: protocol messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +43,16 @@ pub enum ClientMsg {
     /// Heartbeat to keep the connection alive.
     Heartbeat,
     /// Offer UDP candidate addresses for hole-punching to the server.
-    UdpCandidateOffer { addrs: Vec<SocketAddr> },
+    UdpCandidateOffer {
+        /// Legacy v1 address list. Kept for old peer compatibility.
+        addrs: Vec<SocketAddr>,
+        #[serde(default)]
+        candidates: Vec<UdpCandidate>,
+        #[serde(default)]
+        generation: u32,
+        #[serde(default)]
+        nat_profile: NatProfile,
+    },
 }
 
 /// Server → Client: protocol messages.
@@ -37,7 +68,13 @@ pub enum ServerMsg {
     /// Error message; connection will close.
     Error(String),
     /// Forward the peer's UDP candidate addresses for hole-punching.
-    UdpPunch { peer_addrs: Vec<SocketAddr> },
+    UdpPunch {
+        peer_addrs: Vec<SocketAddr>,
+        #[serde(default)]
+        peer_candidates: Vec<UdpCandidate>,
+        #[serde(default)]
+        peer_profile: NatProfile,
+    },
     /// Direct UDP path unavailable; proceed with relay fallback.
     UdpUnavailable,
 }

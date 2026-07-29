@@ -44,6 +44,7 @@ futures-util = { version = "0.3.21", features = ["sink"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 ring = "0.17"
+rustls-pemfile = "2"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 serde_yaml = "0.9"
@@ -53,6 +54,7 @@ socket2 = "0.6.4"
 thiserror = "1"
 tokio = { version = "1.41.0", features = ["fs", "rt-multi-thread", "io-std", "io-util", "macros", "net", "signal", "sync", "time"] }
 tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.1", features = ["codec", "compat"] }
 tracing = "0.1.32"

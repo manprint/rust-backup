@@ -18,10 +18,47 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{
     ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme,
 };
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub const CONTROL_PORT: u16 = 7835;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Build a control-channel TLS acceptor from PEM files.
+///
+/// This intentionally accepts no client certificate: peers are authenticated by
+/// the optional shared secret after the yamux control stream is established.
+pub fn load_server_tls(cert_file: &str, key_file: &str) -> Result<TlsAcceptor> {
+    let cert_pem = std::fs::read(cert_file)
+        .with_context(|| format!("failed to read TLS certificate {cert_file}"))?;
+    let key_pem = std::fs::read(key_file)
+        .with_context(|| format!("failed to read TLS private key {key_file}"))?;
+    server_tls_from_pem(&cert_pem, &key_pem)
+}
+
+/// Build a control-channel TLS acceptor from PEM bytes.
+pub fn server_tls_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
+    let mut cert_reader = std::io::BufReader::new(cert_pem);
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
+        .context("failed to parse TLS certificate PEM")?;
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "no certificates found in TLS certificate PEM"
+    );
+    let mut key_reader = std::io::BufReader::new(key_pem);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("failed to parse TLS private-key PEM")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in TLS private-key PEM"))?;
+    let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("failed to configure TLS protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .context("invalid TLS certificate/key pair")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
 
 pub enum ControlStream {
     Plain(TcpStream),
@@ -128,7 +165,7 @@ pub async fn connect(endpoint: &Endpoint, insecure: bool) -> Result<ControlStrea
         insecure_client_config()
     } else {
         default_client_config()
-    };
+    }?;
     let connector = TlsConnector::from(Arc::new(tls));
     let server_name = ServerName::try_from(endpoint.host.as_str())
         .context("invalid server name")?
@@ -136,7 +173,7 @@ pub async fn connect(endpoint: &Endpoint, insecure: bool) -> Result<ControlStrea
     let tls_stream = connector
         .connect(server_name, tcp)
         .await
-        .context("tls handshake failed")?;
+        .map_err(|e| anyhow::anyhow!("tls handshake failed: {e}"))?;
     Ok(ControlStream::Tls(Box::new(tls_stream)))
 }
 
@@ -147,15 +184,19 @@ pub async fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
         .context("failed to connect")
 }
 
-fn default_client_config() -> ClientConfig {
+fn default_client_config() -> Result<ClientConfig> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+    Ok(ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("failed to configure TLS protocol versions")?
+    .with_root_certificates(root_store)
+    .with_no_client_auth())
 }
 
-fn insecure_client_config() -> ClientConfig {
+fn insecure_client_config() -> Result<ClientConfig> {
     #[derive(Debug)]
     struct InsecureVerifier;
 
@@ -190,16 +231,18 @@ fn insecure_client_config() -> ClientConfig {
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ED25519,
-            ]
+            tokio_rustls::rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 
-    ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
-        .with_no_client_auth()
+    Ok(ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("failed to configure TLS protocol versions")?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+    .with_no_client_auth())
 }

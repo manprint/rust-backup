@@ -457,23 +457,51 @@ fn build_database_ddl(d: &PgDatabase) -> DatabaseDdl {
         post.extend(grants_from_acl("SCHEMA", &quote_ident(&sc.name), &sc.acl));
     }
 
+    // PostgreSQL creates an owned sequence itself for every IDENTITY column. Do
+    // not create a second sequence before the CREATE TABLE; retain post-data
+    // setval/ownership work so the generated sequence receives source state.
+    let identity_owned: Vec<String> = d
+        .schemas
+        .iter()
+        .flat_map(|schema| {
+            schema.tables.iter().flat_map(move |table| {
+                table.columns.iter().filter_map(move |column| {
+                    column
+                        .identity
+                        .as_ref()
+                        .map(|_| format!("{}.{}.{}", schema.name, table.name, column.name))
+                })
+            })
+        })
+        .collect();
+
     // Sequences (definitions before tables, since column defaults may reference
     // them); values/ownership after data.
     for sc in &d.schemas {
         for seq in &sc.sequences {
-            pre.push(create_sequence(seq));
+            let is_identity_sequence = seq
+                .owned_by
+                .as_ref()
+                .is_some_and(|owned| identity_owned.contains(owned));
+            if !is_identity_sequence {
+                pre.push(create_sequence(seq));
+            }
             let qual = quote_qualified(&seq.schema, &seq.name);
-            post.push(alter_table_owner(&seq.schema, &seq.name, &seq.owner));
-            if let Some(o) = sequence_owned_by(seq) {
-                post.push(o);
+            if !is_identity_sequence {
+                post.push(alter_table_owner(&seq.schema, &seq.name, &seq.owner));
+                if let Some(o) = sequence_owned_by(seq) {
+                    post.push(o);
+                }
             }
             if let Some(v) = sequence_setval(seq) {
                 post.push(v);
             }
-            if let Some(c) = &seq.comment {
-                post.push(comment_on("SEQUENCE", &qual, c));
+            if !is_identity_sequence {
+                if let Some(c) = &seq.comment {
+                    post.push(comment_on("SEQUENCE", &qual, c));
+                }
+                post.extend(grants_from_acl("SEQUENCE", &qual, &seq.acl));
             }
-            post.extend(grants_from_acl("SEQUENCE", &qual, &seq.acl));
         }
     }
 

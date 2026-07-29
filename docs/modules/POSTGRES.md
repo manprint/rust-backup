@@ -1,0 +1,28 @@
+# PostgreSQL module
+
+`postgres` performs a logical PostgreSQL 10..=18 copy with pure-Rust catalog
+introspection and binary `COPY`; it never calls `pg_dump`.
+
+## Captured and restore order
+
+The source captures cluster roles, memberships, databases, schemas, extensions,
+tables, sequence state, table data, constraints, indexes, grants and ownership
+metadata. The destination restores in dependency order: roles and databases,
+pre-data DDL, streamed table data, then post-data constraints/indexes, sequences
+and grants. Source reads are read-only; data streams straight into the tunnel.
+
+## Privileges
+
+Use a read-only source account able to inspect the required catalogs and `SELECT`
+the copied tables. The destination needs an administrative account: it creates
+roles/databases/schemas and applies ownership/grants. `--admin` marks this intent;
+`overwrite=true` is required when restoring over existing target databases.
+
+## Limits
+
+- PostgreSQL passwords are never captured or restored.
+- This is logical, not physical/PITR replication.
+- `sslmode=require`, `verify-ca`, and `verify-full` use rustls. Pass a private
+  root CA as `-P sslrootcert=/path/to/ca.pem`; TLS modes are never downgraded.
+- Live version-matrix verification requires Docker: `e2e/postgres_matrix.sh
+  10 12 14 16 18`.

@@ -7,10 +7,10 @@ of `BackupPlan.payload`), a `Source` (read-only analyze + stream out), and a
 
 | Module | Crate | Versions | Driver (Phase 2+) | Status |
 |--------|-------|----------|-------------------|--------|
-| postgres | `rb-postgres` | 10..=latest | `tokio-postgres` (pure Rust) | stub |
-| mongodb | `rb-mongodb` | 4..=8 | `mongodb` (pure Rust) | stub |
+| postgres | `rb-postgres` | 10..=18 | `tokio-postgres` (pure Rust) | logical copy; live matrix pending — see [POSTGRES.md](POSTGRES.md) |
+| mongodb | `rb-mongodb` | 4..=8 | `mongodb` (pure Rust) | logical copy; live matrix pending — see [MONGODB.md](MONGODB.md) |
 | filesystem | `rb-filesystem` | POSIX | `std` + `nix` | core path implemented; privileged/live e2e pending — see [FILESYSTEM.md](FILESYSTEM.md) |
-| s3 | `rb-s3` | AWS S3 / MinIO | `aws-sdk-s3` | stub |
+| s3 | `rb-s3` | AWS S3 / MinIO | `aws-sdk-s3` | streaming prototype; fidelity limits — see [S3.md](S3.md) |
 
 ## Adding a new module (I-MODULAR)
 

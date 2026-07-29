@@ -1,7 +1,10 @@
 //! rb-core wire/channel roundtrip + integrity tests (T-CORE*).
 
-use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource, StreamChunkSink, StreamChunkSource};
-use rb_core::plan::{human_bytes, BackupMode, BackupPlan, IntegritySpec};
+use rb_core::channel::{
+    validate_plan_bounds, ChunkEvent, ChunkSink, ChunkSource, StreamChunkSink, StreamChunkSource,
+    MAX_PLAN_ITEM_META_BYTES, MAX_PLAN_ITEM_NAME_BYTES,
+};
+use rb_core::plan::{human_bytes, BackupMode, BackupPlan, IntegritySpec, PlanItem};
 use rb_core::wire;
 
 /// T-CORE1: a chunk written by the sink is read back identically by the source.
@@ -74,6 +77,44 @@ async fn plan_serde_roundtrip() {
     let back: BackupPlan = serde_json::from_str(&js).unwrap();
     assert_eq!(back.module, "filesystem");
     assert!(back.render().contains("filesystem"));
+}
+
+fn bounded_plan() -> BackupPlan {
+    BackupPlan {
+        format_version: rb_core::plan::PLAN_FORMAT_VERSION,
+        module: "filesystem".into(),
+        mode: BackupMode::Copy1to1,
+        created_at: "2026-06-20T00:00:00Z".into(),
+        source_summary: "bounded test".into(),
+        items: vec![PlanItem {
+            id: 1,
+            ordinal: 0,
+            kind: "file".into(),
+            name: "one".into(),
+            estimated_bytes: 0,
+            meta: serde_json::Value::Null,
+        }],
+        estimated_bytes: 0,
+        integrity: IntegritySpec::default(),
+        payload: serde_json::Value::Null,
+    }
+}
+
+/// V7.3: all peer-controlled plan strings and JSON metadata have explicit caps.
+#[test]
+fn plan_bounds_reject_oversized_item_fields() {
+    let mut plan = bounded_plan();
+    plan.items[0].name = "x".repeat(MAX_PLAN_ITEM_NAME_BYTES + 1);
+    assert!(
+        format!("{}", validate_plan_bounds(&plan).expect_err("name cap"))
+            .contains("name/kind exceeds")
+    );
+
+    let mut plan = bounded_plan();
+    plan.items[0].meta = serde_json::Value::String("x".repeat(MAX_PLAN_ITEM_META_BYTES));
+    assert!(
+        format!("{}", validate_plan_bounds(&plan).expect_err("meta cap")).contains("meta exceeds")
+    );
 }
 
 /// T-CORE5: a peer-declared chunk length above CHUNK_SIZE is refused BEFORE the

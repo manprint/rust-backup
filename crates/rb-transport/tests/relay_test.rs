@@ -13,6 +13,8 @@ async fn relay_roundtrip() {
         bind_addr: "127.0.0.1".to_string(),
         control_port: port as u16,
         secret: None,
+        tls_cert: None,
+        tls_key: None,
         max_conns: 256,
         udp: false,
     };

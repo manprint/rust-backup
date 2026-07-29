@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 //! rust-backup PostgreSQL module.
 //!
@@ -51,6 +55,9 @@ pub struct PostgresParams {
     /// SSL mode: disable, allow, prefer, require (default: prefer).
     #[serde(default = "default_sslmode")]
     pub sslmode: String,
+    /// PEM root CA used by verify-ca and verify-full.
+    #[serde(default)]
+    pub sslrootcert: Option<String>,
 
     /// Destination-only: whether to connect as an admin user (for restore).
     /// Read-only source connections do not set this.

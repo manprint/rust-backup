@@ -56,7 +56,12 @@ impl CarrierPool {
     }
 
     pub fn pick(&self) -> Option<mux::Opener> {
-        let mut carriers = self.carriers.lock().expect("carrier pool mutex");
+        // A panic while holding this short-lived bookkeeping lock must not take
+        // down a backup session; its vector remains valid after unwinding.
+        let mut carriers = self
+            .carriers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         carriers.retain(|c| c.alive.load(Ordering::Relaxed));
         if carriers.is_empty() {
             return None;

@@ -205,10 +205,22 @@ fn item_metas(plan: &BackupPlan) -> HashMap<u32, ItemMeta> {
 
 async fn run_statements(client: &Client, stmts: &[String]) -> Result<()> {
     for stmt in stmts {
-        client
-            .batch_execute(stmt)
-            .await
-            .map_err(|e| BackupError::phase_src(Phase::Apply, format!("apply DDL: {stmt}"), e))?;
+        if let Err(error) = client.batch_execute(stmt).await {
+            // Bootstrap roles such as `postgres` exist on every fresh cluster.
+            // Keep the restore idempotent there; subsequent ALTER/GRANT DDL still
+            // applies source settings where the destination account permits it.
+            if stmt.starts_with("CREATE ROLE ")
+                && error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_OBJECT)
+            {
+                tracing::debug!(%stmt, "role already exists; retaining destination bootstrap role");
+                continue;
+            }
+            return Err(BackupError::phase_src(
+                Phase::Apply,
+                format!("apply DDL: {stmt}"),
+                error,
+            ));
+        }
     }
     Ok(())
 }

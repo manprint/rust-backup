@@ -1,22 +1,60 @@
 //! Session orchestration — the run loops that tie a [`Source`]/[`Destination`]
 //! to a [`DataChannel`], enforcing the project invariants end to end.
 //!
-//! Skeleton uses a single substream (carriers == 1), which is byte-correct;
-//! multi-carrier parallel item distribution is a documented enhancement (see the
-//! plan, Phase 5). The control + data + completion frames ride that one stream
-//! sequentially: `Plan → PlanAck → [chunks…] → StreamEnd → Done`.
+//! With one carrier the control and data frames remain byte-identical to the
+//! original `Plan → PlanAck → [chunks…] → StreamEnd → Done` stream. With more
+//! carriers, that stream is control-only after PlanAck and item-pinned data
+//! frames use independent substreams.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::channel::{self, ChunkSink, DataChannel, StreamChunkSink, StreamChunkSource};
+use crate::channel::{
+    self, ChunkSink, DataChannel, MultiStreamChunkSink, MultiStreamChunkSource, StreamChunkSink,
+    StreamChunkSource,
+};
 use crate::error::{BackupError, Phase, Result};
 use crate::module::{Destination, Source};
 use crate::plan::BackupPlan;
 use crate::progress::Progress;
 use crate::wire::{self, ControlFrame};
+
+/// Budget for the plan/ack exchange. Data traffic has its independent idle
+/// timeout in `wire::IO_IDLE_TIMEOUT`; an operator may inspect a plan, but a
+/// half-open peer must not wedge a session forever.
+const DEFAULT_PLAN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+fn plan_exchange_timeout() -> Duration {
+    std::env::var("RUST_BACKUP_PLAN_TIMEOUT")
+        .ok()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PLAN_EXCHANGE_TIMEOUT)
+}
+
+async fn exchange_timeout<T>(
+    side: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    exchange_timeout_with(plan_exchange_timeout(), side, future).await
+}
+
+async fn exchange_timeout_with<T>(
+    timeout: Duration,
+    side: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        BackupError::phase(
+            Phase::Connect,
+            format!("plan exchange timed out waiting for {side}"),
+        )
+    })?
+}
 
 /// Outcome of a completed source run (returned for logging/tests).
 #[derive(Debug)]
@@ -100,17 +138,22 @@ async fn source_run(
     let mut stream = stream;
     channel::send_plan(&mut stream, &plan).await?;
     // recv_ack errors out (PlanRejected) without ever touching the source.
-    channel::recv_ack(&mut stream).await?;
+    exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
     info!("destination accepted plan; streaming payload");
+
+    if channel.carriers() > 1 {
+        return source_stream_multi(source, channel, progress, max_rate, plan, stream).await;
+    }
 
     // 4. Stream the payload (no temp files; backpressure consumer-paced).
     let mut stream_sink = StreamChunkSink::new_counted(stream, progress.clone());
-    let streamed = {
+    let (streamed, payload_digest) = {
         let mut sink = PacedSink::new(&mut stream_sink, max_rate);
-        match source.stream_out(&plan, &mut sink).await {
+        let result = match source.stream_out(&plan, &mut sink).await {
             Ok(()) => sink.finish().await,
             Err(e) => Err(e),
-        }
+        };
+        (result, channel::completion_digest(&sink.completed_items))
     };
     let mut stream = stream_sink.into_inner();
 
@@ -134,11 +177,50 @@ async fn source_run(
         &mut stream,
         &ControlFrame::Done {
             total_bytes: bytes_sent,
-            blake3: String::new(), // per-item integrity is the guarantee
+            blake3: payload_digest,
         },
     )
     .await?;
 
+    Ok(SourceOutcome { plan, bytes_sent })
+}
+
+/// Source payload path for `carriers > 1`. The plan/control stream is kept out
+/// of the data plane; an item always maps to one data substream.
+async fn source_stream_multi(
+    source: &dyn Source,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    max_rate: Option<u64>,
+    plan: BackupPlan,
+    mut control: Box<dyn crate::channel::DuplexStream>,
+) -> Result<SourceOutcome> {
+    let mut streams = Vec::with_capacity(channel.carriers());
+    for _ in 0..channel.carriers() {
+        streams.push(channel.accept_stream().await?);
+    }
+    let mut data_sink = MultiStreamChunkSink::new_counted(streams, progress.clone())?;
+    let (streamed, payload_digest) = {
+        let mut sink = PacedSink::new(&mut data_sink, max_rate);
+        let result = match source.stream_out(&plan, &mut sink).await {
+            Ok(()) => sink.finish().await,
+            Err(e) => Err(e),
+        };
+        (result, channel::completion_digest(&sink.completed_items))
+    };
+    if let Err(error) = streamed {
+        data_sink.abort(&error.to_string()).await;
+        return Err(error);
+    }
+    let bytes_sent = progress.bytes();
+    wire::send_frame(
+        &mut control,
+        &ControlFrame::Done {
+            total_bytes: bytes_sent,
+            blake3: payload_digest,
+        },
+    )
+    .await?;
     Ok(SourceOutcome { plan, bytes_sent })
 }
 
@@ -147,6 +229,7 @@ struct PacedSink<'a> {
     rate: Option<u64>,
     started: Instant,
     sent: u64,
+    completed_items: BTreeMap<u32, String>,
 }
 
 impl<'a> PacedSink<'a> {
@@ -156,6 +239,7 @@ impl<'a> PacedSink<'a> {
             rate: rate.filter(|rate| *rate > 0),
             started: Instant::now(),
             sent: 0,
+            completed_items: BTreeMap::new(),
         }
     }
     fn delay_for(rate: u64, sent: u64, elapsed: Duration) -> Option<Duration> {
@@ -177,7 +261,15 @@ impl ChunkSink for PacedSink<'_> {
         self.inner.send_chunk(item_id, offset, data).await
     }
     async fn finish_item(&mut self, item_id: u32, total: u64, blake3: &str) -> Result<()> {
-        self.inner.finish_item(item_id, total, blake3).await
+        if self.completed_items.contains_key(&item_id) {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("source emitted duplicate ItemEnd for item={item_id}"),
+            ));
+        }
+        self.inner.finish_item(item_id, total, blake3).await?;
+        self.completed_items.insert(item_id, blake3.to_string());
+        Ok(())
     }
     async fn finish(&mut self) -> Result<()> {
         self.inner.finish().await
@@ -196,12 +288,30 @@ pub async fn run_destination(
     progress: &Progress,
     accept: &mut (dyn FnMut(&BackupPlan) -> bool + Send),
 ) -> Result<BackupPlan> {
+    run_destination_with_accept(dest, channel, progress, &mut |plan| {
+        std::future::ready(accept(plan))
+    })
+    .await
+}
+
+/// Async form of [`run_destination`]. Interactive callers must use this so
+/// stdin reads can run in Tokio's blocking pool rather than stall I/O workers.
+pub async fn run_destination_with_accept<F, Fut>(
+    dest: &dyn Destination,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    accept: &mut F,
+) -> Result<BackupPlan>
+where
+    F: FnMut(&BackupPlan) -> Fut + Send,
+    Fut: std::future::Future<Output = bool> + Send,
+{
     // 1. Consumer opens the substream and receives the plan.
     let stream = channel.open_stream().await?;
     let mut stream = stream;
     // An unreadable/unsupported plan is refused on the wire too, so the source
     // fails fast with the reason instead of blocking on a PlanAck that never comes.
-    let plan = match channel::recv_plan(&mut stream).await {
+    let plan = match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
         Ok(plan) => plan,
         Err(e) => {
             let _ = channel::send_ack(&mut stream, false, &e.to_string()).await;
@@ -223,7 +333,7 @@ pub async fn run_destination(
     }
 
     // 3. Decide: preflight must pass AND the accept policy must approve.
-    let approved = preflight.ok && accept(&plan);
+    let approved = preflight.ok && accept(&plan).await;
     let reason = if !preflight.ok {
         "preflight failed".to_string()
     } else if !approved {
@@ -240,14 +350,71 @@ pub async fn run_destination(
         });
     }
 
+    if channel.carriers() > 1 {
+        return destination_stream_multi(dest, channel, progress, plan, stream).await;
+    }
+
     // 4. Apply the streamed payload (no temp files).
     let mut src = StreamChunkSource::new_counted(stream, progress.clone());
-    dest.stream_in(&plan, &mut src).await?;
+    let apply_result = dest.stream_in(&plan, &mut src).await;
+    let received_items = src.completed_item_ids();
+    let received_digest = src.completion_digest();
     let mut stream = src.into_inner();
+    if let Err(error) = apply_result {
+        // Same substream is parsing data frames at this point; a data-plane
+        // abort preserves the reason for a source that is between item writes.
+        let _ = wire::send_frame(
+            &mut stream,
+            &wire::DataFrame::Abort {
+                reason: error.to_string(),
+            },
+        )
+        .await;
+        return Err(error);
+    }
+
+    let expected_items: BTreeSet<u32> = plan
+        .items
+        .iter()
+        .filter(|item| item.expects_data())
+        .map(|item| item.id)
+        .collect();
+    if received_items != expected_items {
+        let missing: Vec<_> = expected_items
+            .difference(&received_items)
+            .copied()
+            .collect();
+        let unexpected: Vec<_> = received_items
+            .difference(&expected_items)
+            .copied()
+            .collect();
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!("item completion mismatch; missing={missing:?} unexpected={unexpected:?}"),
+        ));
+    }
 
     // 5. Completion frame.
     match wire::recv_frame::<_, ControlFrame>(&mut stream).await? {
-        Some(ControlFrame::Done { total_bytes, .. }) => {
+        Some(ControlFrame::Done {
+            total_bytes,
+            blake3,
+        }) => {
+            if total_bytes != progress.bytes() {
+                return Err(BackupError::phase(
+                    Phase::Verify,
+                    format!(
+                        "Done.total_bytes={total_bytes} but received={}",
+                        progress.bytes()
+                    ),
+                ));
+            }
+            if blake3 != received_digest {
+                return Err(BackupError::phase(
+                    Phase::Verify,
+                    "Done.blake3 does not match verified item digests",
+                ));
+            }
             info!(bytes = total_bytes, "destination done; restore complete");
         }
         Some(ControlFrame::Abort { reason }) => {
@@ -256,14 +423,102 @@ pub async fn run_destination(
                 format!("source aborted: {reason}"),
             ));
         }
-        other => warn!("expected Done, got {other:?}"),
+        other => {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("expected Done, got {other:?}"),
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// Destination payload path for `carriers > 1`. Reader tasks merge independent
+/// item-pinned streams back into the module's one `ChunkSource` interface.
+async fn destination_stream_multi(
+    dest: &dyn Destination,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    plan: BackupPlan,
+    mut control: Box<dyn crate::channel::DuplexStream>,
+) -> Result<BackupPlan> {
+    let mut streams = Vec::with_capacity(channel.carriers());
+    for _ in 0..channel.carriers() {
+        streams.push(channel.open_stream().await?);
+    }
+    let mut src = MultiStreamChunkSource::new_counted(streams, progress.clone())?;
+    let apply_result = dest.stream_in(&plan, &mut src).await;
+    let received_items = src.completed_item_ids();
+    let received_digest = src.completion_digest();
+    apply_result?;
+
+    let expected_items: BTreeSet<u32> = plan
+        .items
+        .iter()
+        .filter(|item| item.expects_data())
+        .map(|item| item.id)
+        .collect();
+    if received_items != expected_items {
+        let missing: Vec<_> = expected_items
+            .difference(&received_items)
+            .copied()
+            .collect();
+        let unexpected: Vec<_> = received_items
+            .difference(&expected_items)
+            .copied()
+            .collect();
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!("item completion mismatch; missing={missing:?} unexpected={unexpected:?}"),
+        ));
+    }
+
+    match wire::recv_frame::<_, ControlFrame>(&mut control).await? {
+        Some(ControlFrame::Done {
+            total_bytes,
+            blake3,
+        }) => {
+            if total_bytes != progress.bytes() {
+                return Err(BackupError::phase(
+                    Phase::Verify,
+                    format!(
+                        "Done.total_bytes={total_bytes} but received={}",
+                        progress.bytes()
+                    ),
+                ));
+            }
+            if blake3 != received_digest {
+                return Err(BackupError::phase(
+                    Phase::Verify,
+                    "Done.blake3 does not match verified item digests",
+                ));
+            }
+            info!(
+                bytes = total_bytes,
+                carriers = channel.carriers(),
+                "destination done; restore complete"
+            );
+        }
+        Some(ControlFrame::Abort { reason }) => {
+            return Err(BackupError::phase(
+                Phase::Apply,
+                format!("source aborted: {reason}"),
+            ));
+        }
+        other => {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("expected Done, got {other:?}"),
+            ));
+        }
     }
     Ok(plan)
 }
 
 #[cfg(test)]
 mod pacing_tests {
-    use super::PacedSink;
+    use super::{exchange_timeout_with, PacedSink};
+    use crate::error::Result;
     use std::time::Duration;
 
     #[test]
@@ -273,5 +528,17 @@ mod pacing_tests {
             Some(Duration::from_secs(1))
         );
         assert_eq!(PacedSink::delay_for(100, 100, Duration::from_secs(2)), None);
+    }
+
+    #[tokio::test]
+    async fn plan_exchange_has_an_explicit_timeout() {
+        let err = exchange_timeout_with(
+            Duration::from_millis(1),
+            "test peer",
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending plan exchange must time out");
+        assert!(format!("{err}").contains("plan exchange timed out"));
     }
 }

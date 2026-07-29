@@ -9,7 +9,9 @@ use tracing::{debug, warn};
 use crate::auth::Authenticator;
 use crate::channel::PairedChannel;
 use crate::mux;
-use crate::proto::{ClientMsg, Delimited, ServerMsg};
+use crate::proto::{
+    ClientMsg, Delimited, ServerMsg, UdpCandidate, UdpCandidateKind, MAX_V2_OFFER_CANDIDATES,
+};
 use crate::transport;
 
 #[cfg(feature = "udp")]
@@ -59,7 +61,7 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
         })?;
 
     if let Some(secret) = &cfg.secret {
-        let auth = Authenticator::new(secret);
+        let auth = Authenticator::new(secret)?;
         auth.client_handshake(&mut control).await.map_err(|e| {
             BackupError::phase(rb_core::error::Phase::Connect, format!("auth: {e}"))
         })?;
@@ -87,7 +89,7 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
             } else {
                 None
             };
-            let channel = PairedChannel::source(acceptor, control);
+            let channel = PairedChannel::source_with_carriers(acceptor, control, cfg.carriers);
             #[cfg(feature = "udp")]
             if let Some(dc) = direct {
                 channel.set_direct(dc).await;
@@ -133,7 +135,7 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
         })?;
 
     if let Some(secret) = &cfg.secret {
-        let auth = Authenticator::new(secret);
+        let auth = Authenticator::new(secret)?;
         auth.client_handshake(&mut control).await.map_err(|e| {
             BackupError::phase(rb_core::error::Phase::Connect, format!("auth: {e}"))
         })?;
@@ -157,7 +159,7 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
             } else {
                 None
             };
-            let channel = PairedChannel::destination(opener, control);
+            let channel = PairedChannel::destination_with_carriers(opener, control, cfg.carriers);
             #[cfg(feature = "udp")]
             if let Some(dc) = direct {
                 channel.set_direct(dc).await;
@@ -223,11 +225,25 @@ async fn setup_direct_inner(
     let socket = bind_socket(0).await?;
     let mut candidates = gather_candidates(&socket).await?;
     crate::shared::sanitize_and_log("local offer", &mut candidates);
+    candidates.truncate(MAX_V2_OFFER_CANDIDATES);
     if candidates.is_empty() {
         anyhow::bail!("no usable local candidates");
     }
     control
-        .send_client(ClientMsg::UdpCandidateOffer { addrs: candidates })
+        .send_client(ClientMsg::UdpCandidateOffer {
+            candidates: candidates
+                .iter()
+                .enumerate()
+                .map(|(index, addr)| UdpCandidate {
+                    addr: *addr,
+                    kind: UdpCandidateKind::Host,
+                    priority: u16::MAX.saturating_sub(index as u16),
+                })
+                .collect(),
+            addrs: candidates,
+            generation: 0,
+            nat_profile: crate::adaptive_nat::NatProfile::default(),
+        })
         .await
         .map_err(|e| anyhow::anyhow!("send candidate offer: {e}"))?;
 
@@ -239,7 +255,7 @@ async fn setup_direct_inner(
         anyhow::bail!("no peer candidates");
     }
     // Both sides derive the same token from the shared secret + channel id.
-    let token = derive_token(secret, channel_id.as_bytes());
+    let token = derive_token(secret, channel_id.as_bytes())?;
 
     match role {
         DirectRole::Provider => {
@@ -259,7 +275,7 @@ async fn recv_punch(control: &mut Delimited<mux::Stream>) -> anyhow::Result<Vec<
             .await
             .map_err(|e| anyhow::anyhow!("recv punch: {e}"))?
         {
-            Some(ServerMsg::UdpPunch { peer_addrs }) => return Ok(peer_addrs),
+            Some(ServerMsg::UdpPunch { peer_addrs, .. }) => return Ok(peer_addrs),
             Some(ServerMsg::UdpUnavailable) => anyhow::bail!("server reports udp unavailable"),
             Some(ServerMsg::Heartbeat) => continue,
             Some(other) => anyhow::bail!("unexpected control message during punch: {other:?}"),
@@ -292,7 +308,7 @@ async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<Vec
     } else {
         candidates.push(local);
     }
-    if let Ok(stun) = std::env::var("RUST_BACKUP_STUN_SERVER") {
+    for stun in stun_targets() {
         match discover_reflexive(socket, &stun).await {
             Ok(addr) if !candidates.contains(&addr) => candidates.push(addr),
             Ok(_) => {}
@@ -300,6 +316,23 @@ async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<Vec
         }
     }
     Ok(candidates)
+}
+
+/// Ordered best-effort STUN chain. Operators may replace it with a comma-separated
+/// `RUST_BACKUP_STUN_SERVERS`; the legacy singular variable remains supported.
+#[cfg(feature = "udp")]
+fn stun_targets() -> Vec<String> {
+    let configured = std::env::var("RUST_BACKUP_STUN_SERVERS")
+        .ok()
+        .or_else(|| std::env::var("RUST_BACKUP_STUN_SERVER").ok())
+        .unwrap_or_else(|| "stun.l.google.com:19302,stun.cloudflare.com:3478".into());
+    configured
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .take(4)
+        .collect()
 }
 
 /// Best-effort primary outbound interface IP, learned by `connect`ing a throwaway
@@ -329,7 +362,7 @@ async fn discover_reflexive(
     socket.send_to(&req, server).await?;
 
     let mut buf = [0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
         .await
         .map_err(|_| anyhow::anyhow!("STUN response timeout"))?
         .map(|(n, _)| n)?;
@@ -403,6 +436,18 @@ fn parse_xor_mapped_address(msg: &[u8], txid: &[u8; 12]) -> anyhow::Result<Socke
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn stun_chain_is_bounded_and_ignores_empty_targets() {
+        let parsed: Vec<_> = " one:1, ,two:2,three:3,four:4,five:5 "
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .take(4)
+            .collect();
+        assert_eq!(parsed, ["one:1", "two:2", "three:3", "four:4"]);
+    }
 
     /// Build a STUN success response carrying an IPv4 XOR-MAPPED-ADDRESS and prove
     /// the parser recovers the original address (real STUN decode, no network).

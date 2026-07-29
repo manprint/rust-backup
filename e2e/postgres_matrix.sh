@@ -84,7 +84,7 @@ data_checksum() { # container db
 
 schema_dump() { # container db
   docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
-    | grep -vE '^--|^$|^SET |^SELECT pg_catalog'
+    | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict '
 }
 
 run_transfer() { # src_port dst_port channel [abort]

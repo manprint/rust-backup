@@ -9,7 +9,8 @@ use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore};
-use tokio::time::{interval, Instant};
+use tokio::time::{interval, timeout, Instant};
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use rb_core::config::ServerConfig;
@@ -19,6 +20,7 @@ use crate::mux;
 use crate::pool::{CarrierPool, PendingCarriers};
 use crate::proto::{ClientMsg, Delimited, ServerMsg};
 use crate::shared::{proxy_buffer_size, tune_tcp};
+use crate::transport::load_server_tls;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const UDP_BROKER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,8 +30,24 @@ const UDP_BROKER_TIMEOUT: Duration = Duration::from_secs(10);
 /// hides a half-open peer, so liveness needs an app-level recv deadline; the
 /// provider/consumer must heartbeat well within it (see `CTRL_CLIENT_HEARTBEAT`).
 const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A peer that stops reading must not pin the control loop forever.
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type Registry = Arc<DashMap<String, Arc<CarrierPool>>>;
+
+async fn send_control<S>(control: &mut Delimited<S>, msg: ServerMsg) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match timeout(CONTROL_SEND_TIMEOUT, control.send_server(msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            debug_assert!(!error.to_string().is_empty());
+            false
+        }
+        Err(_) => false,
+    }
+}
 
 /// Registry of UDP hole-punch matchmakers, keyed by channel id. Both the provider
 /// and the consumer task `or_insert` the same matchmaker, so it exists regardless
@@ -154,7 +172,7 @@ where
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if control.send_server(ServerMsg::Heartbeat).await.is_err() {
+                if !send_control(control, ServerMsg::Heartbeat).await {
                     return Ok(());
                 }
             }
@@ -162,7 +180,14 @@ where
                 udp_pending = false;
                 if let Ok(peer_addrs) = res {
                     info!(%id, peer_candidate_count = peer_addrs.len(), "received peer candidates");
-                    if control.send_server(ServerMsg::UdpPunch { peer_addrs }).await.is_err() {
+                    if !send_control(
+                        control,
+                        ServerMsg::UdpPunch {
+                            peer_addrs,
+                            peer_candidates: Vec::new(),
+                            peer_profile: crate::adaptive_nat::NatProfile::default(),
+                        },
+                    ).await {
                         return Ok(());
                     }
                 }
@@ -170,7 +195,7 @@ where
             _ = &mut udp_deadline, if udp_pending => {
                 udp_pending = false;
                 warn!(%id, "udp broker timeout; falling back to relay");
-                if control.send_server(ServerMsg::UdpUnavailable).await.is_err() {
+                if !send_control(control, ServerMsg::UdpUnavailable).await {
                     return Ok(());
                 }
             }
@@ -183,7 +208,7 @@ where
                 reap.as_mut().reset(Instant::now() + reap_timeout);
                 match msg? {
                     Some(ClientMsg::Heartbeat) => {}
-                    Some(ClientMsg::UdpCandidateOffer { addrs }) => {
+                    Some(ClientMsg::UdpCandidateOffer { addrs, .. }) => {
                         // A peer-controlled list is sanitized BEFORE it is stored or
                         // forwarded: invalid entries dropped, deduped, capped at
                         // MAX_UDP_CANDIDATES so the far side never fans out more
@@ -215,7 +240,12 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
     let max_conns = Arc::new(Semaphore::new(cfg.max_conns));
     let pending_carriers = Arc::new(DashMap::new());
     let udp_registry = Arc::new(DashMap::new());
-    let auth = cfg.secret.as_ref().map(|s| Authenticator::new(s));
+    let auth = cfg.secret.as_deref().map(Authenticator::new).transpose()?;
+    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => Some(load_server_tls(cert, key)?),
+        _ => anyhow::bail!("--tls-cert and --tls-key must be supplied together"),
+    };
 
     loop {
         match listener.accept().await {
@@ -226,9 +256,11 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                 let pending_carriers = Arc::clone(&pending_carriers);
                 let udp_registry = Arc::clone(&udp_registry);
                 let auth_opt = auth.clone();
+                let tls = tls.clone();
                 tokio::spawn(
-                    handle_conn(
+                    handle_accepted_conn(
                         socket,
+                        tls,
                         peer,
                         registry,
                         max_conns,
@@ -246,8 +278,47 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
     }
 }
 
-async fn handle_conn(
+// Connection state is assembled at the accept boundary; grouping it would make
+// TLS/plain dispatch less explicit, so this handler keeps the boundary visible.
+#[allow(clippy::too_many_arguments)]
+async fn handle_accepted_conn(
     socket: TcpStream,
+    tls: Option<TlsAcceptor>,
+    peer: SocketAddr,
+    registry: Registry,
+    max_conns: Arc<Semaphore>,
+    pending_carriers: PendingCarriers,
+    udp_registry: UdpRegistry,
+    auth: Option<Authenticator>,
+) -> Result<()> {
+    if let Some(tls) = tls {
+        let stream = tls.accept(socket).await.context("TLS handshake failed")?;
+        handle_conn(
+            stream,
+            peer,
+            registry,
+            max_conns,
+            pending_carriers,
+            udp_registry,
+            auth,
+        )
+        .await
+    } else {
+        handle_conn(
+            socket,
+            peer,
+            registry,
+            max_conns,
+            pending_carriers,
+            udp_registry,
+            auth,
+        )
+        .await
+    }
+}
+
+async fn handle_conn<S: mux::Transport>(
+    socket: S,
     peer: SocketAddr,
     registry: Registry,
     max_conns: Arc<Semaphore>,

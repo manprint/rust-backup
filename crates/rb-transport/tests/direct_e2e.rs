@@ -27,6 +27,8 @@ async fn direct_path_activates_over_loopback() {
         bind_addr: "127.0.0.1".to_string(),
         control_port: port,
         secret: None,
+        tls_cert: None,
+        tls_key: None,
         max_conns: 256,
         udp: true,
     };

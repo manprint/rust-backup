@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 //! rb-transport — coordination server + paired byte-channel for rust-backup.
 //!
 //! Provides a TCP relay with yamux multiplexing vendored from bore, plus a
 //! minimal control protocol. The direct UDP/QUIC path is documented in `direct.rs`
 //! and deferred to Phase 1.
 
+pub mod adaptive_nat;
 pub mod auth;
 pub mod channel;
 pub mod client;

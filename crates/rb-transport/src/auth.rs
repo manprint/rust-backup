@@ -13,9 +13,11 @@ use crate::proto::{ClientMsg, Delimited, ServerMsg};
 pub struct Authenticator(Hmac<Sha256>);
 
 impl Authenticator {
-    pub fn new(secret: &str) -> Self {
+    pub fn new(secret: &str) -> Result<Self> {
         let hashed_secret = Sha256::new().chain_update(secret).finalize();
-        Self(Hmac::new_from_slice(&hashed_secret).expect("HMAC can take key of any size"))
+        let mac = Hmac::new_from_slice(&hashed_secret)
+            .map_err(|e| anyhow::anyhow!("initialize HMAC key: {e}"))?;
+        Ok(Self(mac))
     }
 
     pub fn answer(&self, challenge: &Uuid) -> String {

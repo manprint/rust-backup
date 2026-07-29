@@ -5,6 +5,8 @@
 //! reads env directly) and merges the YAML underneath. A single session may run
 //! multiple targets (the `targets:` list).
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BackupError, Result};
@@ -20,7 +22,7 @@ pub enum Role {
 }
 
 /// Transport / coordination-channel settings shared by all modules.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TransportConfig {
     /// Coordination server `host:port` (mirrors bore's `--to`).
     pub to: String,
@@ -41,6 +43,20 @@ pub struct TransportConfig {
     /// Optional aggregate payload cap in bytes/second. Zero means unlimited.
     #[serde(default)]
     pub max_rate: Option<u64>,
+}
+
+impl fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("to", &self.to)
+            .field("channel", &self.channel)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("carriers", &self.carriers)
+            .field("udp", &self.udp)
+            .field("insecure", &self.insecure)
+            .field("max_rate", &self.max_rate)
+            .finish()
+    }
 }
 
 fn default_carriers() -> u32 {
@@ -65,7 +81,7 @@ impl Default for TransportConfig {
 }
 
 /// One target to back up or restore in a session.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TargetSpec {
     /// Module name ("postgres", …).
     pub module: String,
@@ -83,8 +99,20 @@ pub struct TargetSpec {
     pub auto_accept: bool,
 }
 
+impl fmt::Debug for TargetSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TargetSpec")
+            .field("module", &self.module)
+            .field("role", &self.role)
+            .field("transport", &self.transport)
+            .field("params", &"[REDACTED]")
+            .field("auto_accept", &self.auto_accept)
+            .finish()
+    }
+}
+
 /// Coordination-server settings (for `rust-backup server`).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     /// Address to bind the control port on.
     #[serde(default = "default_bind")]
@@ -95,12 +123,32 @@ pub struct ServerConfig {
     /// Optional shared secret required of clients.
     #[serde(default)]
     pub secret: Option<String>,
+    /// PEM certificate for TLS on the coordination control port.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// PEM private key for TLS on the coordination control port.
+    #[serde(default)]
+    pub tls_key: Option<String>,
     /// Max concurrent relayed connections.
     #[serde(default = "default_max_conns")]
     pub max_conns: usize,
     /// Enable the UDP/QUIC direct path brokering.
     #[serde(default = "default_udp")]
     pub udp: bool,
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("control_port", &self.control_port)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("max_conns", &self.max_conns)
+            .field("udp", &self.udp)
+            .finish()
+    }
 }
 
 fn default_bind() -> String {
@@ -119,6 +167,8 @@ impl Default for ServerConfig {
             bind_addr: default_bind(),
             control_port: default_control_port(),
             secret: None,
+            tls_cert: None,
+            tls_key: None,
             max_conns: default_max_conns(),
             udp: default_udp(),
         }

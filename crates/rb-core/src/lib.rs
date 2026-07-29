@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 //! # rb-core
 //!
 //! Core abstractions for **rust-backup**: a modular, streaming, source→destination

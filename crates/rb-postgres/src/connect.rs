@@ -11,7 +11,10 @@
 //! until the rustls connector lands (tracked in the plan's Phase 2 TLS follow-up).
 
 use rb_core::error::{BackupError, Phase, Result};
+use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres_rustls::MakeRustlsConnect;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::PostgresParams;
 
@@ -68,24 +71,7 @@ impl PgConnection {
             cfg.options("-c default_transaction_read_only=on");
         }
 
-        let (client, connection) = cfg.connect(NoTls).await.map_err(|e| {
-            BackupError::phase_src(
-                Phase::Connect,
-                format!(
-                    "connect postgres {}:{}/{database}",
-                    params.host, params.port
-                ),
-                e,
-            )
-        })?;
-
-        // The connection future drives the wire protocol and must be polled for
-        // the client to function; it resolves when the client is dropped.
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::debug!(%e, "postgres connection closed");
-            }
-        });
+        let client = connect_client(&mut cfg, params, database).await?;
 
         let (server_version, server_major) = probe_version(&client).await?;
         if server_major < MIN_PG_MAJOR {
@@ -106,16 +92,82 @@ impl PgConnection {
     }
 }
 
-/// Reject the TLS-verifying sslmodes until a rustls connector is wired.
+async fn connect_client(
+    cfg: &mut Config,
+    params: &PostgresParams,
+    database: &str,
+) -> Result<Client> {
+    let label = || {
+        format!(
+            "connect postgres {}:{}/{database}",
+            params.host, params.port
+        )
+    };
+    if matches!(
+        params.sslmode.as_str(),
+        "require" | "verify-ca" | "verify-full"
+    ) {
+        cfg.ssl_mode(SslMode::Require);
+        let (client, connection) = cfg
+            .connect(postgres_tls(params)?)
+            .await
+            .map_err(|e| BackupError::phase_src(Phase::Connect, label(), e))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!(%e, "postgres connection closed");
+            }
+        });
+        Ok(client)
+    } else {
+        let (client, connection) = cfg
+            .connect(NoTls)
+            .await
+            .map_err(|e| BackupError::phase_src(Phase::Connect, label(), e))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!(%e, "postgres connection closed");
+            }
+        });
+        Ok(client)
+    }
+}
+
+fn postgres_tls(params: &PostgresParams) -> Result<MakeRustlsConnect> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = &params.sslrootcert {
+        let pem = std::fs::read(path).map_err(|e| {
+            BackupError::phase_src(Phase::Connect, format!("read sslrootcert {path}"), e)
+        })?;
+        let mut reader = std::io::BufReader::new(pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| BackupError::phase_src(Phase::Connect, "parse sslrootcert", e))?;
+        if certs.is_empty() {
+            return Err(BackupError::phase(
+                Phase::Connect,
+                "sslrootcert contains no certificate",
+            ));
+        }
+        roots.add_parsable_certificates(certs);
+    }
+    let cfg = ClientConfig::builder_with_provider(std::sync::Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| BackupError::phase_src(Phase::Connect, "configure PostgreSQL TLS", e))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(cfg))
+}
+
+/// Validate supported modes. TLS modes use rustls and are never downgraded.
 fn require_supported_sslmode(sslmode: &str) -> Result<()> {
     match sslmode {
-        "disable" | "allow" | "prefer" => Ok(()),
+        "disable" | "allow" | "prefer" | "require" | "verify-ca" | "verify-full" => Ok(()),
         other => Err(BackupError::phase(
             Phase::Connect,
-            format!(
-                "sslmode=\"{other}\": TLS is not yet supported \
-                 (use disable/allow/prefer); see the plan's Phase 2 TLS follow-up"
-            ),
+            format!("unsupported PostgreSQL sslmode {other:?}"),
         )),
     }
 }
@@ -180,15 +232,22 @@ mod tests {
     }
 
     #[test]
-    fn sslmode_gate_allows_plaintext_modes() {
-        for m in ["disable", "allow", "prefer"] {
+    fn sslmode_gate_accepts_plaintext_and_tls_modes() {
+        for m in [
+            "disable",
+            "allow",
+            "prefer",
+            "require",
+            "verify-ca",
+            "verify-full",
+        ] {
             assert!(require_supported_sslmode(m).is_ok(), "mode={m}");
         }
     }
 
     #[test]
-    fn sslmode_gate_rejects_tls_modes() {
-        for m in ["require", "verify-ca", "verify-full"] {
+    fn sslmode_gate_rejects_unknown_modes() {
+        for m in ["bogus", "verify-none"] {
             assert!(require_supported_sslmode(m).is_err(), "mode={m}");
         }
     }

@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 //! S3-compatible, read-only source and streaming restore module.
 //!
@@ -27,6 +31,8 @@ use rb_core::plan::{
 use rb_core::wire::CHUNK_SIZE;
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
+const MAX_MULTIPART_PARTS: u64 = 10_000;
+const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3Params {
@@ -75,6 +81,10 @@ pub struct S3Object {
     pub content_type: Option<String>,
     #[serde(default)]
     pub storage_class: Option<String>,
+    /// Source SSE mode. It is deliberately rejected because destination SSE
+    /// headers/keys are not portable across S3 providers.
+    #[serde(default)]
+    pub server_side_encryption: Option<String>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
@@ -119,6 +129,71 @@ fn validate_params(params: &S3Params) -> Result<()> {
         return Err(BackupError::Config(
             "s3.access_key and s3.secret_key must be supplied together".into(),
         ));
+    }
+    Ok(())
+}
+
+fn unsupported_object_features(object: &S3Object) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    if object.size > MAX_S3_OBJECT_BYTES {
+        unsupported.push("object exceeds S3's 5 TiB object limit".into());
+    }
+    if let Some(storage_class) = &object.storage_class {
+        if storage_class != "STANDARD" {
+            unsupported.push(format!("storage class {storage_class} is not preserved"));
+        }
+    }
+    if let Some(mode) = &object.server_side_encryption {
+        unsupported.push(format!("server-side encryption {mode} is not preserved"));
+    }
+    unsupported
+}
+
+async fn validate_source_fidelity(params: &S3Params, objects: &[S3Object]) -> Result<()> {
+    let client = client(params).await;
+    let versioning = client
+        .get_bucket_versioning()
+        .bucket(&params.bucket)
+        .send()
+        .await
+        .map_err(|e| {
+            BackupError::phase(Phase::Analyze, format!("read S3 bucket versioning: {e}"))
+        })?;
+    if versioning.status().is_some() {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            "versioned S3 buckets are unsupported: versions/delete markers cannot be reproduced",
+        ));
+    }
+    for object in objects {
+        let unsupported = unsupported_object_features(object);
+        if !unsupported.is_empty() {
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!("S3 object {:?}: {}", object.key, unsupported.join("; ")),
+            ));
+        }
+        let tags = client
+            .get_object_tagging()
+            .bucket(&params.bucket)
+            .key(&object.key)
+            .send()
+            .await
+            .map_err(|e| {
+                BackupError::phase(
+                    Phase::Analyze,
+                    format!("read S3 object tags {:?}: {e}", object.key),
+                )
+            })?;
+        if !tags.tag_set().is_empty() {
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "S3 object {:?} has tags; object tags are not preserved",
+                    object.key
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -174,6 +249,9 @@ async fn list_objects(params: &S3Params, phase: Phase) -> Result<Vec<S3Object>> 
                 etag: head.e_tag().map(str::to_owned),
                 content_type: head.content_type().map(str::to_owned),
                 storage_class: head.storage_class().map(|v| v.as_str().to_owned()),
+                server_side_encryption: head
+                    .server_side_encryption()
+                    .map(|v| v.as_str().to_owned()),
                 metadata: head
                     .metadata()
                     .cloned()
@@ -228,6 +306,7 @@ fn decode_plan(plan: &BackupPlan, phase: Phase) -> Result<S3Plan> {
 impl Source for S3Source {
     async fn analyze(&self) -> Result<BackupPlan> {
         let objects = list_objects(&self.params, Phase::Analyze).await?;
+        validate_source_fidelity(&self.params, &objects).await?;
         let policy = client(&self.params)
             .await
             .get_bucket_policy()
@@ -498,7 +577,9 @@ async fn restore_object(
     let mut bytes = 0_u64;
     let mut expected_offset = 0_u64;
     let mut hasher = blake3::Hasher::new();
-    let mut part = Vec::with_capacity(PART_SIZE);
+    let part_size =
+        (PART_SIZE as u64).max(item.estimated_bytes.div_ceil(MAX_MULTIPART_PARTS)) as usize;
+    let mut part = Vec::with_capacity(part_size);
     let mut parts = Vec::new();
     let mut part_number = 1_i32;
     loop {
@@ -522,7 +603,7 @@ async fn restore_object(
                 bytes += data.len() as u64;
                 hasher.update(&data);
                 part.extend_from_slice(&data);
-                if part.len() >= PART_SIZE {
+                if part.len() >= part_size {
                     upload_part(
                         client,
                         bucket,
@@ -676,5 +757,33 @@ mod tests {
             serde_json::json!({"bucket":"test","access_key":"a","secret_key":"b"}),
         );
         assert!(Module.open_source(&params).await.is_ok());
+    }
+
+    #[test]
+    fn fidelity_rejects_unrestorable_object_features() {
+        let standard = S3Object {
+            key: "ok+%/unicode-è".into(),
+            size: 0,
+            etag: None,
+            content_type: None,
+            storage_class: Some("STANDARD".into()),
+            server_side_encryption: None,
+            metadata: BTreeMap::new(),
+        };
+        assert!(unsupported_object_features(&standard).is_empty());
+        let glacier = S3Object {
+            storage_class: Some("GLACIER".into()),
+            ..standard.clone()
+        };
+        assert!(unsupported_object_features(&glacier)
+            .join(" ")
+            .contains("storage class"));
+        let huge = S3Object {
+            size: MAX_S3_OBJECT_BYTES + 1,
+            ..standard
+        };
+        assert!(unsupported_object_features(&huge)
+            .join(" ")
+            .contains("5 TiB"));
     }
 }

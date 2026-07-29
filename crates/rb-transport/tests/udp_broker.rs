@@ -10,7 +10,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rb_transport::proto::{ClientMsg, ServerMsg};
+use rb_transport::proto::{
+    ClientMsg, ServerMsg, UdpCandidate, UdpCandidateKind, MAX_FRAME_LENGTH, MAX_V2_OFFER_CANDIDATES,
+};
 use rb_transport::server::UdpMatchmaker;
 
 fn addr(s: &str) -> SocketAddr {
@@ -33,20 +35,64 @@ fn roundtrip_server(msg: &ServerMsg) -> ServerMsg {
 fn udp_candidate_offer_round_trip() {
     let msg = ClientMsg::UdpCandidateOffer {
         addrs: vec![addr("203.0.113.7:7000"), addr("[2001:db8::1]:7000")],
+        candidates: vec![],
+        generation: 0,
+        nat_profile: Default::default(),
     };
     assert_eq!(roundtrip_client(&msg), msg);
 }
 
 #[test]
 fn udp_candidate_offer_empty_round_trip() {
-    let msg = ClientMsg::UdpCandidateOffer { addrs: vec![] };
+    let msg = ClientMsg::UdpCandidateOffer {
+        addrs: vec![],
+        candidates: vec![],
+        generation: 0,
+        nat_profile: Default::default(),
+    };
     assert_eq!(roundtrip_client(&msg), msg);
+}
+
+#[test]
+fn udp_offer_v1_deserializes_into_v2_defaults() {
+    let old = br#"{"type":"udpcandidateoffer","addrs":["203.0.113.7:7000"]}"#;
+    let parsed: ClientMsg = serde_json::from_slice(old).expect("v1 frame must remain readable");
+    assert_eq!(
+        parsed,
+        ClientMsg::UdpCandidateOffer {
+            addrs: vec![addr("203.0.113.7:7000")],
+            candidates: vec![],
+            generation: 0,
+            nat_profile: Default::default(),
+        }
+    );
+}
+
+#[test]
+fn worst_case_v2_offer_stays_inside_control_frame_limit() {
+    let msg = ClientMsg::UdpCandidateOffer {
+        addrs: (0..MAX_V2_OFFER_CANDIDATES)
+            .map(|port| addr(&format!("203.0.113.7:{}", 7000 + port)))
+            .collect(),
+        candidates: (0..MAX_V2_OFFER_CANDIDATES)
+            .map(|port| UdpCandidate {
+                addr: addr(&format!("203.0.113.7:{}", 7000 + port)),
+                kind: UdpCandidateKind::Reflexive,
+                priority: u16::MAX - port as u16,
+            })
+            .collect(),
+        generation: u32::MAX,
+        nat_profile: Default::default(),
+    };
+    assert!(serde_json::to_vec(&msg).unwrap().len() <= MAX_FRAME_LENGTH);
 }
 
 #[test]
 fn udp_punch_round_trip() {
     let msg = ServerMsg::UdpPunch {
         peer_addrs: vec![addr("198.51.100.4:9000"), addr("[2001:db8::2]:9000")],
+        peer_candidates: vec![],
+        peer_profile: Default::default(),
     };
     assert_eq!(roundtrip_server(&msg), msg);
 }

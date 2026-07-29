@@ -18,10 +18,11 @@ rust-backup plan <module> source [PARAMS]  dry-run: analyze + print the plan, no
 |------|-----|---------|---------|
 | `--to <host:port>` | `RUST_BACKUP_TO` | — | coordination server address |
 | `--channel <id>` | `RUST_BACKUP_CHANNEL` | — | rendezvous channel id (source & dest must match) |
-| `--secret <s>` | `RUST_BACKUP_SECRET` | none | shared HMAC secret |
-| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | parallel relay/direct carriers (Phase 6) |
+| `--secret <s>` / `--secret-file <path>` | `RUST_BACKUP_SECRET` / `RUST_BACKUP_SECRET_FILE` | none | shared HMAC secret; prefer file or environment over argv |
+| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | only `1` is currently accepted; multi-carrier transfer is not implemented |
 | `--udp` / `--no-udp` | `RUST_BACKUP_UDP` | on | try the direct UDP/QUIC path (falls back to relay) |
 | `--insecure` | `RUST_BACKUP_INSECURE` | off | skip TLS verification (testing only) |
+| `--max-rate <bytes/s>` | `RUST_BACKUP_MAX_RATE` | unlimited | aggregate source payload rate cap |
 | `--yes` *(dest)* | `RUST_BACKUP_YES` | off | auto-accept the plan (skip interactive prompt) |
 | `--config <file>` | `RUST_BACKUP_CONFIG` | — | YAML config underlay |
 | `-v` | — | — | increase log verbosity (repeatable) |
@@ -29,9 +30,8 @@ rust-backup plan <module> source [PARAMS]  dry-run: analyze + print the plan, no
 ## Server
 
 ```sh
-rust-backup server \
-  --bind-addr 0.0.0.0 --control-port 7835 \
-  --secret s3cr3t --max-conns 256 --udp
+rust-backup server --bind-addr 0.0.0.0 --control-port 7835 \
+  --secret-file /run/secrets/rust-backup --tls-cert server.crt --tls-key server.key
 ```
 
 | Flag | Env | Default |
@@ -39,6 +39,9 @@ rust-backup server \
 | `--bind-addr` | `RUST_BACKUP_BIND_ADDR` | `0.0.0.0` |
 | `--control-port` | `RUST_BACKUP_CONTROL_PORT` | `7835` |
 | `--secret` | `RUST_BACKUP_SECRET` | none |
+| `--secret-file` | `RUST_BACKUP_SECRET_FILE` | none |
+| `--tls-cert` | `RUST_BACKUP_TLS_CERT` | none; TLS disabled |
+| `--tls-key` | `RUST_BACKUP_TLS_KEY` | none; required with `--tls-cert` |
 | `--max-conns` | `RUST_BACKUP_MAX_CONNS` | `256` |
 | `--udp` | `RUST_BACKUP_UDP` | on |
 
@@ -54,7 +57,8 @@ rust-backup postgres source --to coord:7835 --channel pg --secret s --host db-a 
 rust-backup postgres destination --to coord:7835 --channel pg --secret s --host db-b \
   --user postgres --password pw --admin --yes
 ```
-Params: `--host --port(5432) --user --password --database --sslmode` ; dest `--admin`.
+Params: `--host --port(5432) --user --password --database --sslmode` ; use
+`-P sslrootcert=/path/to/ca.pem` for a private PostgreSQL CA; dest `--admin`.
 The plan covers roles, grants, databases, schemas, tables, constraints, indexes,
 sequences, extensions, and ownership.
 
@@ -95,11 +99,6 @@ Params: `--endpoint(MinIO) --region --bucket --prefix --access-key --secret-key 
 Run several backups in one session (`rust-backup run --config session.yml`):
 
 ```yaml
-server:                       # only used by `rust-backup server --config`
-  bind_addr: 0.0.0.0
-  control_port: 7835
-  secret: s3cr3t
-  udp: true
 targets:
   - module: postgres
     role: source
@@ -112,7 +111,9 @@ targets:
     auto_accept: true
 ```
 
-CLI flags and env vars override matching YAML fields.
+`run --config` rejects a `server:` section: start the coordination service
+explicitly with `rust-backup server`. CLI flags and env vars override matching
+YAML fields; typed CLI options and `-P key=value` override module params.
 
 ## Async (non-automatic) mode
 
@@ -122,6 +123,5 @@ YAML) to proceed automatically.
 
 ## Exit codes
 
-`0` success · non-zero on any phase error (connect/analyze/validate/transfer/apply/
-verify). Errors are phase-tagged in the logs; a source-immutability violation is
-always a hard, distinct failure.
+`0` success · `2` config · `3` preflight · `4` operator rejection · `5`
+integrity/apply · `6` source mutation · `7` transport · `1` other failure.

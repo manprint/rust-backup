@@ -50,13 +50,13 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Derive the shared QUIC authentication token from the tunnel secret (if any)
 /// and the server-issued session nonce. Both peers compute the same value.
-pub fn derive_token(secret: Option<&str>, nonce: &[u8]) -> [u8; TOKEN_LEN] {
+pub fn derive_token(secret: Option<&str>, nonce: &[u8]) -> Result<[u8; TOKEN_LEN]> {
     let key = secret.map(str::as_bytes).unwrap_or(&[]);
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key).context("construct direct-path HMAC")?;
     mac.update(nonce);
     let mut token = [0u8; TOKEN_LEN];
     token.copy_from_slice(&mac.finalize().into_bytes());
-    token
+    Ok(token)
 }
 
 /// Constant-time comparison of two tokens.
@@ -672,7 +672,10 @@ pub async fn connect_direct(
                     Err(err) => {
                         let msg = format!("start failed: {err}");
                         debug!(%peer, %err, "failed to start direct QUIC candidate");
-                        errors.lock().unwrap().push((peer, msg));
+                        errors
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((peer, msg));
                         return Err(err.into());
                     }
                 };
@@ -681,7 +684,10 @@ pub async fn connect_direct(
                     Err(err) => {
                         let msg = format!("{err}");
                         debug!(%peer, %err, "direct QUIC candidate failed");
-                        errors.lock().unwrap().push((peer, msg));
+                        errors
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push((peer, msg));
                         return Err(err.into());
                     }
                 };
@@ -694,7 +700,10 @@ pub async fn connect_direct(
                 if !tokens_match(&token, &peer_token) {
                     let msg = "token mismatch".to_string();
                     warn!(%peer, "direct QUIC candidate failed token verification");
-                    errors.lock().unwrap().push((peer, msg));
+                    errors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((peer, msg));
                     bail!("direct path token mismatch");
                 }
                 let _ = send.finish();
@@ -715,7 +724,7 @@ pub async fn connect_direct(
         Ok(Err(err)) => {
             let err_summary: Vec<String> = errors
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .iter()
                 .map(|(addr, msg)| format!("{addr} → {msg}"))
                 .collect();

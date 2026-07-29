@@ -14,16 +14,29 @@ use rb_core::session;
 /// In-memory single-substream channel: consumer half via `open_stream`,
 /// provider half via `accept_stream`.
 struct TestChannel {
-    consumer: Mutex<Option<Box<dyn DuplexStream>>>,
-    provider: Mutex<Option<Box<dyn DuplexStream>>>,
+    consumer: Mutex<Vec<Box<dyn DuplexStream>>>,
+    provider: Mutex<Vec<Box<dyn DuplexStream>>>,
+    carriers: usize,
 }
 
 impl TestChannel {
     fn pair() -> Arc<Self> {
-        let (a, b) = tokio::io::duplex(1 << 20);
+        Self::pair_carriers(1)
+    }
+
+    fn pair_carriers(carriers: usize) -> Arc<Self> {
+        let streams = if carriers == 1 { 1 } else { carriers + 1 };
+        let mut consumer = Vec::with_capacity(streams);
+        let mut provider = Vec::with_capacity(streams);
+        for _ in 0..streams {
+            let (a, b) = tokio::io::duplex(1 << 20);
+            consumer.push(Box::new(a) as Box<dyn DuplexStream>);
+            provider.push(Box::new(b) as Box<dyn DuplexStream>);
+        }
         Arc::new(TestChannel {
-            consumer: Mutex::new(Some(Box::new(a))),
-            provider: Mutex::new(Some(Box::new(b))),
+            consumer: Mutex::new(consumer),
+            provider: Mutex::new(provider),
+            carriers,
         })
     }
 }
@@ -31,23 +44,13 @@ impl TestChannel {
 #[async_trait]
 impl DataChannel for TestChannel {
     async fn open_stream(&self) -> Result<Box<dyn DuplexStream>> {
-        Ok(self
-            .consumer
-            .lock()
-            .unwrap()
-            .take()
-            .expect("one open_stream"))
+        Ok(self.consumer.lock().unwrap().remove(0))
     }
     async fn accept_stream(&self) -> Result<Box<dyn DuplexStream>> {
-        Ok(self
-            .provider
-            .lock()
-            .unwrap()
-            .take()
-            .expect("one accept_stream"))
+        Ok(self.provider.lock().unwrap().remove(0))
     }
     fn carriers(&self) -> usize {
-        1
+        self.carriers
     }
 }
 
@@ -72,9 +75,60 @@ fn demo_plan() -> BackupPlan {
     }
 }
 
+fn metadata_only_plan() -> BackupPlan {
+    let mut plan = demo_plan();
+    plan.items[0].meta = serde_json::json!({"expects_data": false});
+    plan.items[0].estimated_bytes = 0;
+    plan.estimated_bytes = 0;
+    plan
+}
+
+fn two_item_plan() -> BackupPlan {
+    let mut plan = demo_plan();
+    plan.items.push(PlanItem {
+        id: 2,
+        ordinal: 1,
+        kind: "blob".into(),
+        name: "beta".into(),
+        estimated_bytes: 0,
+        meta: serde_json::Value::Null,
+    });
+    plan
+}
+
 struct MockSource {
     fp: String,
     payload: Vec<u8>,
+}
+
+struct MetadataOnlySource;
+#[async_trait]
+impl Source for MetadataOnlySource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        Ok(metadata_only_plan())
+    }
+    async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
+        Ok(())
+    }
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable".into())
+    }
+}
+
+struct SkippingSource;
+#[async_trait]
+impl Source for SkippingSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        Ok(two_item_plan())
+    }
+    async fn stream_out(&self, _plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        sink.send_chunk(1, 0, b"present").await?;
+        sink.finish_item(1, 7, &rb_core::wire::blake3_hex(b"present"))
+            .await
+    }
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable".into())
+    }
 }
 
 #[async_trait]
@@ -405,6 +459,76 @@ async fn full_run_ok() {
     s.await.unwrap().expect("source ok");
     d.await.unwrap().expect("dest ok");
     assert_eq!(*received.lock().unwrap(), payload);
+}
+
+/// T-SESS12: four data carriers preserve the same result as one carrier. The
+/// first in-memory substream is control; all payload rides item-pinned streams.
+#[tokio::test]
+async fn multi_carrier_run_ok() {
+    let ch = TestChannel::pair_carriers(4);
+    let payload = vec![99u8; 5000];
+    let src = MockSource {
+        fp: "stable".into(),
+        payload: payload.clone(),
+    };
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let dst = MockDest {
+        received: received.clone(),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let source = tokio::spawn(async move { session::run_source(&src, &*ch, &p1).await });
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&dst, &*ch2, &p2, &mut yes).await
+    });
+    source.await.unwrap().unwrap();
+    destination.await.unwrap().unwrap();
+    assert_eq!(*received.lock().unwrap(), payload);
+}
+
+/// V3.1: a source cannot report success after silently skipping a data-bearing
+/// plan item; metadata-only entries remain valid with no `ItemEnd`.
+#[tokio::test]
+async fn completion_requires_every_data_bearing_plan_item() {
+    let ch = TestChannel::pair();
+    let dst = MockDest {
+        received: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let source = tokio::spawn(async move { session::run_source(&SkippingSource, &*ch, &p1).await });
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&dst, &*ch2, &p2, &mut yes).await
+    });
+    let err = destination
+        .await
+        .expect("destination task")
+        .expect_err("missing item must fail verification");
+    assert!(format!("{err}").contains("missing=[2]"), "got: {err}");
+    let _ = source.await.expect("source task");
+
+    let ch = TestChannel::pair();
+    let dst = MockDest {
+        received: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let source =
+        tokio::spawn(async move { session::run_source(&MetadataOnlySource, &*ch, &p1).await });
+    let destination = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&dst, &*ch2, &p2, &mut yes).await
+    });
+    source
+        .await
+        .expect("source task")
+        .expect("metadata source ok");
+    destination
+        .await
+        .expect("destination task")
+        .expect("metadata-only item needs no ItemEnd");
 }
 
 /// T-SESS2: a destination that rejects the plan aborts cleanly; source sees it.

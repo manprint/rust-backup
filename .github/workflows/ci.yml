@@ -14,3 +14,40 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: bash e2e/s3_minio_test.sh
+  relay-smoke:
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash e2e/relay_smoke.sh
+      - run: RUST_BACKUP_E2E_TLS=1 bash e2e/relay_smoke.sh
+      - run: RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
+  session-two-targets:
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash e2e/session_two_targets.sh
+  fault-matrix:
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash e2e/fault_matrix.sh
+  postgres-matrix:
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash e2e/postgres_matrix.sh 10 12 14 16 18
+  mongodb-matrix:
+    runs-on: ubuntu-latest
+    needs: gates
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash e2e/mongodb_matrix.sh 4 5 6 7 8

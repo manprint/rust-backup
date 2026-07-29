@@ -113,6 +113,22 @@ impl BackupPlan {
     }
 }
 
+impl PlanItem {
+    /// Whether this item must emit an [`crate::channel::ChunkEvent::ItemEnd`].
+    ///
+    /// Most plan items carry data. Modules with metadata-only entries (for
+    /// example filesystem directories and symlinks) opt out with
+    /// `meta: {"expects_data": false}`. Keeping this convention in the opaque
+    /// metadata avoids a plan-format compatibility break while making the core
+    /// completion check unambiguous.
+    pub fn expects_data(&self) -> bool {
+        self.meta
+            .get("expects_data")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    }
+}
+
 /// One preflight check result on the destination side.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PreflightCheck {

@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 //! rust-backup — CLI entrypoint.
 //!
 //! Wires the module registry, transport, and session runner together. Module
@@ -68,10 +72,28 @@ struct ServerArgs {
     control_port: u16,
     #[arg(long, env = "RUST_BACKUP_SECRET")]
     secret: Option<String>,
+    /// Read the shared secret from a file (preferred to --secret).
+    #[arg(long, env = "RUST_BACKUP_SECRET_FILE")]
+    secret_file: Option<String>,
+    /// PEM certificate enabling TLS on the control listener.
+    #[arg(long, env = "RUST_BACKUP_TLS_CERT")]
+    tls_cert: Option<String>,
+    /// PEM private key enabling TLS on the control listener.
+    #[arg(long, env = "RUST_BACKUP_TLS_KEY")]
+    tls_key: Option<String>,
     #[arg(long, env = "RUST_BACKUP_MAX_CONNS", default_value_t = 256)]
     max_conns: usize,
     /// Enable the UDP/QUIC direct-path brokering.
-    #[arg(long, env = "RUST_BACKUP_UDP", default_value_t = true)]
+    // Accept both `--udp` and `--udp=false`: e2e/automation must be able to
+    // force relay-only server brokering without relying on an environment var.
+    #[arg(
+        long,
+        env = "RUST_BACKUP_UDP",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     udp: bool,
 }
 
@@ -182,6 +204,9 @@ struct TargetArgs {
     channel: Option<String>,
     #[arg(long, env = "RUST_BACKUP_SECRET")]
     secret: Option<String>,
+    /// Read the transport shared secret from a file (preferred to --secret).
+    #[arg(long, env = "RUST_BACKUP_SECRET_FILE")]
+    secret_file: Option<String>,
     #[arg(long, env = "RUST_BACKUP_CARRIERS")]
     carriers: Option<u32>,
     /// Disable the direct UDP/QUIC path (relay only).
@@ -308,8 +333,14 @@ fn resolve_target(
     if let Some(channel) = &a.channel {
         transport.channel = channel.clone();
     }
-    if a.secret.is_some() {
-        transport.secret = a.secret.clone();
+    if a.secret.is_some() && a.secret_file.is_some() {
+        return Err(anyhow!("--secret and --secret-file are mutually exclusive"));
+    }
+    if let Some(secret) = &a.secret {
+        transport.secret = Some(secret.clone());
+    }
+    if let Some(path) = &a.secret_file {
+        transport.secret = Some(read_secret_file(path)?);
     }
     if let Some(carriers) = a.carriers {
         transport.carriers = carriers;
@@ -330,12 +361,9 @@ fn resolve_target(
     if transport.channel.is_empty() {
         return Err(anyhow!("--channel is required (or set it in --config)"));
     }
-    // Multi-carrier item distribution is not implemented yet; accepting the flag
-    // silently would promise parallelism the session does not deliver.
-    if transport.carriers > 1 {
+    if !(1..=32).contains(&transport.carriers) {
         return Err(anyhow!(
-            "carriers={} requested but this build streams on a single carrier; \
-             use carriers=1",
+            "carriers={} is outside the supported range 1..=32",
             transport.carriers
         ));
     }
@@ -370,17 +398,36 @@ fn build_registry() -> ModuleRegistry {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(error) = run_main().await {
+        eprintln!("{error:#}");
+        std::process::exit(exit_code(&error));
+    }
+}
+
+async fn run_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
     let registry = build_registry();
 
     match cli.cmd {
         Cmd::Server(a) => {
+            if a.secret.is_some() && a.secret_file.is_some() {
+                return Err(anyhow!("--secret and --secret-file are mutually exclusive"));
+            }
+            let server_secret = if let Some(secret) = a.secret {
+                Some(secret)
+            } else if let Some(path) = a.secret_file {
+                Some(read_secret_file(&path)?)
+            } else {
+                None
+            };
             let cfg = ServerConfig {
                 bind_addr: a.bind_addr,
                 control_port: a.control_port,
-                secret: a.secret,
+                secret: server_secret,
+                tls_cert: a.tls_cert,
+                tls_key: a.tls_key,
                 max_conns: a.max_conns,
                 udp: a.udp,
             };
@@ -400,6 +447,39 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Filesystem(a) => run_target(&registry, "filesystem", &a).await,
         Cmd::S3(a) => run_target(&registry, "s3", &a).await,
     }
+}
+
+/// Stable shell-facing error codes. Keep this independent from stderr wording.
+fn exit_code(error: &anyhow::Error) -> i32 {
+    let text = error.to_string();
+    if text.contains("[Config]")
+        || text.contains("unknown module")
+        || text.contains("--to is required")
+    {
+        2
+    } else if text.contains("[Preflight]") {
+        3
+    } else if text.contains("[PlanRejected]") || text.contains("rejected by operator") {
+        4
+    } else if text.contains("[Verify]") || text.contains("[Apply]") {
+        5
+    } else if text.contains("[SourceMutated]") || text.contains("source fingerprint changed") {
+        6
+    } else if text.contains("[Connect]") || text.contains("transport:") {
+        7
+    } else {
+        1
+    }
+}
+
+fn read_secret_file(path: &str) -> anyhow::Result<String> {
+    let value = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read secret file {path}"))?;
+    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        return Err(anyhow!("secret file {path} is empty"));
+    }
+    Ok(value)
 }
 
 /// Run one target from CLI args.
@@ -435,6 +515,11 @@ async fn run_session(
     requested_fail_fast: bool,
 ) -> anyhow::Result<()> {
     let mut cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+    if cfg.server.is_some() {
+        return Err(anyhow!(
+            "`run --config` does not start `server:`; start `rust-backup server` separately"
+        ));
+    }
     if let Some(parallel) = requested_parallel {
         cfg.parallel_targets = parallel.max(1);
     }
@@ -535,7 +620,6 @@ impl ProgressReporter {
         ProgressReporter(tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
-            tick.tick().await; // the first tick fires immediately
             loop {
                 tick.tick().await;
                 tracing::info!(
@@ -586,13 +670,20 @@ async fn execute(
             let ch = rb_transport::connect_destination(transport)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            let mut accept = move |plan: &BackupPlan| {
+            let mut accept = move |plan: &BackupPlan| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = bool> + Send>,
+            > {
                 if auto_accept {
-                    return true;
+                    return Box::pin(async { true });
                 }
-                prompt_yes(plan)
+                let rendered = plan.render();
+                Box::pin(async move {
+                    tokio::task::spawn_blocking(move || prompt_yes_rendered(&rendered))
+                        .await
+                        .unwrap_or(false)
+                })
             };
-            session::run_destination(&*dst, &ch, &progress, &mut accept)
+            session::run_destination_with_accept(&*dst, &ch, &progress, &mut accept)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
         }
@@ -601,9 +692,9 @@ async fn execute(
 }
 
 /// Interactive async-accept: show the plan and read `yes`/`no` from stdin.
-fn prompt_yes(plan: &BackupPlan) -> bool {
+fn prompt_yes_rendered(rendered: &str) -> bool {
     use std::io::Write;
-    print!("\n{}\nProceed with restore? [yes/no] ", plan.render());
+    print!("\n{rendered}\nProceed with restore? [yes/no] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
@@ -631,6 +722,20 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn exit_code_maps_phase_classes() {
+        for (message, code) in [
+            ("[Config] bad", 2),
+            ("[Preflight] bad", 3),
+            ("[PlanRejected] bad", 4),
+            ("[Verify] bad", 5),
+            ("[SourceMutated] bad", 6),
+            ("[Connect] bad", 7),
+        ] {
+            assert_eq!(exit_code(&anyhow!(message)), code);
+        }
+    }
+
     fn write_yaml(body: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -657,6 +762,40 @@ targets:
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("cli parses")
+    }
+
+    #[test]
+    fn server_udp_accepts_bare_and_explicit_boolean_values() {
+        let Cmd::Server(defaults) = parse(&["rust-backup", "server"]).cmd else {
+            panic!("expected server subcommand")
+        };
+        assert!(defaults.udp);
+
+        let Cmd::Server(enabled) = parse(&["rust-backup", "server", "--udp"]).cmd else {
+            panic!("expected server subcommand")
+        };
+        assert!(enabled.udp);
+
+        let Cmd::Server(disabled) = parse(&["rust-backup", "server", "--udp=false"]).cmd else {
+            panic!("expected server subcommand")
+        };
+        assert!(!disabled.udp);
+    }
+
+    #[tokio::test]
+    async fn run_config_rejects_ignored_server_section() {
+        let yaml =
+            write_yaml("server: { bind_addr: 127.0.0.1, control_port: 7835 }\ntargets: []\n");
+        let error = run_session(
+            &build_registry(),
+            yaml.to_str().expect("utf8 path"),
+            None,
+            false,
+        )
+        .await
+        .expect_err("server section must not be silently ignored");
+        assert!(error.to_string().contains("does not start `server:`"));
+        std::fs::remove_file(yaml).ok();
     }
 
     /// D10: a flag left unset falls through to the YAML target; a flag that IS
@@ -727,10 +866,10 @@ targets:
         assert!(err.to_string().contains("--to is required"), "{err}");
     }
 
-    /// Multi-carrier is not implemented; asking for it fails loudly rather than
-    /// silently degrading to one carrier.
+    /// Multi-carrier is accepted through the negotiated safety cap, and invalid
+    /// counts fail before a session starts.
     #[test]
-    fn multi_carrier_is_rejected() {
+    fn multi_carrier_range_is_enforced() {
         let cli = parse(&[
             "rust-backup",
             "filesystem",
@@ -745,8 +884,25 @@ targets:
         let Cmd::Filesystem(a) = cli.cmd else {
             panic!("expected filesystem subcommand")
         };
+        let (transport, _, _) = resolve_target(&a, "filesystem", Role::Source).expect("4 works");
+        assert_eq!(transport.carriers, 4);
+
+        let cli = parse(&[
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--carriers",
+            "33",
+        ]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
         let err = resolve_target(&a, "filesystem", Role::Source).expect_err("must fail");
-        assert!(err.to_string().contains("single carrier"), "{err}");
+        assert!(err.to_string().contains("1..=32"), "{err}");
     }
 
     /// `-P key=value` beats the typed flag and keeps scalar typing.

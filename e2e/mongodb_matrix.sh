@@ -35,6 +35,10 @@ cargo build --release --all-features
 image_for() { # major -> docker image tag
   case "$1" in
     4) echo "mongo:4.4" ;;
+    # 8.0.x refuses Linux >= 6.19 (SERVER-121912).  `mongo:8` tracks the
+    # maintained MongoDB 8 release line while still exercising the 8.x wire
+    # and dump/restore format.
+    8) echo "mongo:8" ;;
     *) echo "mongo:$1.0" ;;
   esac
 }
@@ -54,7 +58,8 @@ start_mongo() { # name port image -> start container, wait ready
   local name="$1" port="$2" image="$3"
   docker run -d --name "$name" -p "${port}:27017" "$image" >/dev/null
   CONTAINERS+=("$name")
-  for _ in $(seq 1 40); do
+  # First startup of a newly pulled Mongo image can exceed 40 seconds on CI.
+  for _ in $(seq 1 90); do
     if mongo_eval "$name" admin 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
       return 0
     fi
@@ -167,7 +172,7 @@ for MAJOR in "${MAJORS[@]}"; do
   fi
 
   # 4) Destination matches source 1:1 (counts + content + indexes).
-  if diff <(echo "$fp_before") <(cluster_digest "$DST" appdb) >/tmp/rb-mongo.diff; then
+  if diff <(printf '%s\n' "$fp_before" | sed '/^$/d') <(cluster_digest "$DST" appdb | sed '/^$/d') >/tmp/rb-mongo.diff; then
     echo "PASS: destination matches source"; PASS=$((PASS+1))
   else
     echo "FAIL: destination differs (see /tmp/rb-mongo.diff)"; FAIL=$((FAIL+1))
