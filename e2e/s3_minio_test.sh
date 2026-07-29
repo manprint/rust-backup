@@ -9,6 +9,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 src_name=rb-s3-src-$$
 dst_name=rb-s3-dst-$$
+containers=()
 server_pid=
 source_pid=
 dst_pid=
@@ -25,7 +26,15 @@ cleanup() {
   [[ -n "${dst_pid:-}" ]] && kill "$dst_pid" 2>/dev/null || true
   [[ -n "${source_pid:-}" ]] && kill "$source_pid" 2>/dev/null || true
   [[ -n "${server_pid:-}" ]] && kill "$server_pid" 2>/dev/null || true
-  docker rm -f "$src_name" "$dst_name" >/dev/null 2>&1 || true
+  for container in "${containers[@]:-}"; do
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  done
+  for container in "${containers[@]:-}"; do
+    if docker container inspect "$container" >/dev/null 2>&1; then
+      printf 'FAIL: leaked container %s\n' "$container" >&2
+      status=1
+    fi
+  done
   if [[ ${RUST_BACKUP_E2E_KEEP:-0} == 1 ]]; then
     printf 'kept e2e workdir: %s\n' "$work" >&2
   else
@@ -41,8 +50,12 @@ printf 'rust-backup S3 smoke\n' > "$work/seed/nested/hello.txt"
 dd if=/dev/urandom of="$work/seed/large.bin" bs=1M count=12 status=none
 touch "$work/seed/empty"
 
-docker run -d --name "$src_name" -p 19000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null
-docker run -d --name "$dst_name" -p 19001:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null
+start_minio() { # name host-port
+  docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null
+  containers+=("$1")
+}
+start_minio "$src_name" 19000
+start_minio "$dst_name" 19001
 for _ in {1..30}; do
   if curl -fsS http://127.0.0.1:19000/minio/health/live >/dev/null && curl -fsS http://127.0.0.1:19001/minio/health/live >/dev/null; then break; fi
   sleep 1

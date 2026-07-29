@@ -11,6 +11,7 @@ rb_build_release
 tag="rbbw$$"; coord="${tag}c"; src_ns="${tag}s"; dst_ns="${tag}d"
 work=$(mktemp -d)
 PIDS=()
+NAMESPACES=()
 PASS=0; FAIL=0
 PAYLOAD_BYTES=${RUST_BACKUP_BANDWIDTH_BYTES:-$((200 * 1024 * 1024))}
 RATE_TEST_BYTES=${RUST_BACKUP_RATE_TEST_BYTES:-$((16 * 1024 * 1024))}
@@ -19,7 +20,15 @@ carriers=${RUST_BACKUP_E2E_CARRIERS:-1}
 cleanup() {
   local status=$?
   for pid in "${PIDS[@]:-}"; do kill "$pid" >/dev/null 2>&1 || true; done
-  for ns in "$coord" "$src_ns" "$dst_ns"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true; ip netns del "$ns" 2>/dev/null || true; done
+  # Only delete namespaces created by this invocation.  Never clean a name
+  # merely because it happens to collide with a prior or foreign test run.
+  for ns in "${NAMESPACES[@]:-}"; do ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true; ip netns del "$ns" 2>/dev/null || true; done
+  for ns in "${NAMESPACES[@]:-}"; do
+    if ip netns list | awk '{print $1}' | grep -Fxq "$ns"; then
+      echo "FAIL: leaked namespace $ns" >&2
+      status=1
+    fi
+  done
   if (( status != 0 || FAIL != 0 )); then find "$work" -name '*.log' -print -exec sed -n '1,160p' {} \; 2>/dev/null || true; fi
   rm -rf "$work"
   exit "$status"
@@ -28,7 +37,11 @@ trap cleanup EXIT INT TERM
 pass() { printf 'PASS: %s\n' "$1"; PASS=$((PASS + 1)); }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 
-for ns in "$coord" "$src_ns" "$dst_ns"; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
+for ns in "$coord" "$src_ns" "$dst_ns"; do
+  ip netns add "$ns"
+  NAMESPACES+=("$ns")
+  ip -n "$ns" link set lo up
+done
 link() { # coord-if peer-if peer-ns coord-ip peer-ip
   ip link add "$1" type veth peer name "$2"; ip link set "$1" netns "$coord"; ip link set "$2" netns "$3"
   ip -n "$coord" addr add "$4" dev "$1"; ip -n "$3" addr add "$5" dev "$2"; ip -n "$coord" link set "$1" up; ip -n "$3" link set "$2" up

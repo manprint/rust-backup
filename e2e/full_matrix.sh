@@ -6,6 +6,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 passed=0; failed=0
 run() { if "$@"; then printf 'PASS: %s\n' "$*"; passed=$((passed + 1)); else printf 'FAIL: %s\n' "$*" >&2; failed=$((failed + 1)); fi; }
 cd "$root"
+run bash e2e/resource_hygiene_check.sh
 run bash e2e/relay_smoke.sh
 run env RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh
 run bash e2e/session_two_targets.sh

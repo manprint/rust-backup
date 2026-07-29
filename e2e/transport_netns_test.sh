@@ -6,21 +6,36 @@ set -euo pipefail
 
 source "$(dirname "$0")/lib.sh"
 if (( EUID != 0 )); then echo 'ERROR: run with exact-path sudo -n' >&2; exit 2; fi
-for command in ip iptables python3; do command -v "$command" >/dev/null || { echo "ERROR: missing $command" >&2; exit 2; }; done
+for command in ip iptables python3 timeout; do command -v "$command" >/dev/null || { echo "ERROR: missing $command" >&2; exit 2; }; done
 rb_build_release
 
 tag="rbnet$$"
 coord="${tag}c"; nat="${tag}n"; src_ns="${tag}s"; dst_ns="${tag}d"
 work=$(mktemp -d)
 PIDS=()
+NAMESPACES=()
 PASS=0
 FAIL=0
+# Payload is 96 MiB at 4 MiB/s (~24 s); 60 s leaves handshake headroom while
+# keeping a failed direct/fallback path bounded in the privileged matrix.
+TRANSFER_TIMEOUT=${RUST_BACKUP_E2E_TRANSFER_TIMEOUT:-60s}
+# NAT lab validates candidate nomination and failover, not sustained bandwidth;
+# keep it short enough that the deterministic watchdog remains meaningful.
+NAT_PAYLOAD_BYTES=${RUST_BACKUP_NAT_PAYLOAD_BYTES:-$((16 * 1024 * 1024))}
 cleanup() {
   local status=$?
   for pid in "${PIDS[@]:-}"; do kill "$pid" >/dev/null 2>&1 || true; done
-  for ns in "$coord" "$nat" "$src_ns" "$dst_ns"; do
+  # Delete only namespaces this invocation successfully created.  A stale or
+  # foreign name must make setup fail, never be removed by this test.
+  for ns in "${NAMESPACES[@]:-}"; do
     ip netns pids "$ns" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     ip netns del "$ns" 2>/dev/null || true
+  done
+  for ns in "${NAMESPACES[@]:-}"; do
+    if ip netns list | awk '{print $1}' | grep -Fxq "$ns"; then
+      echo "FAIL: leaked namespace $ns" >&2
+      status=1
+    fi
   done
   if (( status != 0 || FAIL != 0 )); then find "$work" -name '*.log' -print -exec sed -n '1,180p' {} \; 2>/dev/null || true; fi
   rm -rf "$work"
@@ -57,7 +72,11 @@ veth() { # host-end ns-end ns host-ip ns-ip
   ip -n "$ns" link set "$ns_if" up
 }
 
-for ns in "$coord" "$nat" "$src_ns" "$dst_ns"; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
+for ns in "$coord" "$nat" "$src_ns" "$dst_ns"; do
+  ip netns add "$ns"
+  NAMESPACES+=("$ns")
+  ip -n "$ns" link set lo up
+done
 # Source -- NAT -- coordinator -- destination. NAT makes the direct-path test
 # exercise observed mapped candidates instead of two loopback peers.
 veth "${tag}cn" cn0 "$nat" 10.70.0.1/24 10.70.0.2/24
@@ -83,12 +102,12 @@ run_transfer() { # label initial-udp-block drop-after-direct
   local label=$1 blocked=$2 drop_after=$3
   local src="$work/$label-source" dst="$work/$label-destination"
   mkdir -p "$src" "$dst"
-  rb_seed_filesystem_fixture "$src" $((96 * 1024 * 1024))
+  rb_seed_filesystem_fixture "$src" "$NAT_PAYLOAD_BYTES"
   if [[ "$blocked" == yes ]]; then ip netns exec "$nat" iptables -I FORWARD -p udp -j DROP; fi
-  ip netns exec "$src_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "10.70.0.1:$port" --channel "$label" --insecure --max-rate 4194304 --root "$src" >"$work/$label-source.log" 2>&1 &
+  timeout --foreground "$TRANSFER_TIMEOUT" ip netns exec "$src_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "10.70.0.1:$port" --channel "$label" --insecure --max-rate 4194304 --root "$src" >"$work/$label-source.log" 2>&1 &
   local spid=$!; PIDS+=("$spid")
   sleep .4
-  ip netns exec "$dst_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "10.72.0.1:$port" --channel "$label" --insecure --yes --root "$dst" >"$work/$label-destination.log" 2>&1 &
+  timeout --foreground "$TRANSFER_TIMEOUT" ip netns exec "$dst_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "10.72.0.1:$port" --channel "$label" --insecure --yes --root "$dst" >"$work/$label-destination.log" 2>&1 &
   local dpid=$!; PIDS+=("$dpid")
   if [[ "$drop_after" == yes ]]; then
     for _ in $(seq 1 100); do

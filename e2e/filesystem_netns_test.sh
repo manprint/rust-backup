@@ -9,6 +9,11 @@ rb_build_release
 
 work=$(mktemp -d)
 chmod 755 "$work" # `runuser` needs to traverse the per-run fixture directory.
+# The checkout may be private to its owner (`/mnt/<user>/...`); a test account
+# must not need traversal permission on it.  Use a per-run, world-executable
+# binary copy and remove it with the rest of the fixture.
+install -m 0755 "$RB_E2E_BIN" "$work/rust-backup"
+RB_E2E_BIN="$work/rust-backup"
 PIDS=()
 PASS=0
 FAIL=0
@@ -68,7 +73,9 @@ mkdir -p "$nr_src" "$nr_dst"
 rb_seed_filesystem_fixture "$nr_src" 0
 chmod -R a+rX "$nr_src"
 chown -R 0:0 "$nr_src"
-chown "$nonroot":"$nonroot" "$nr_dst"
+# Linux images commonly map user `nobody` to group `nogroup`; use the account's
+# numeric primary group instead of assuming a same-named group exists.
+chown "$(id -u "$nonroot"):$(id -g "$nonroot")" "$nr_dst"
 port=$(rb_free_port)
 if start_server "$port" "$work/nonroot-server.log" && transfer "$nr_src" "$nr_dst" "$port" fs-nonroot "$nonroot"; then
   owner=$(stat -c '%u:%g' "$nr_dst/nested/hello.txt")

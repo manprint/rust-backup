@@ -24,8 +24,16 @@ CTRL_PORT=7836   # distinct from the postgres matrix default (7835)
 CONTAINERS=()
 PIDS=()
 cleanup() {
+  local status=$?
   for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
   for c in "${CONTAINERS[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for c in "${CONTAINERS[@]:-}"; do
+    if docker container inspect "$c" >/dev/null 2>&1; then
+      echo "FAIL: leaked container $c" >&2
+      status=1
+    fi
+  done
+  return "$status"
 }
 trap cleanup EXIT INT TERM
 

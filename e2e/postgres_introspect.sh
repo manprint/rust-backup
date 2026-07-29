@@ -11,10 +11,21 @@ cd "$(dirname "$0")/.."
 
 PG_MAJOR="${1:-16}"
 CONTAINER="rb-pg-introspect-$$"
+CONTAINER_CREATED=0
 PORT=55432
 PASSWORD="rbpg"
 
-cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
+cleanup() {
+  local status=$?
+  if (( CONTAINER_CREATED )); then
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+      echo "FAIL: leaked container $CONTAINER" >&2
+      status=1
+    fi
+  fi
+  return "$status"
+}
 trap cleanup EXIT INT TERM
 
 echo "==> starting postgres:${PG_MAJOR}-alpine on :${PORT}"
@@ -22,6 +33,7 @@ docker run -d --name "$CONTAINER" \
   -e POSTGRES_PASSWORD="$PASSWORD" \
   -p "${PORT}:5432" \
   "postgres:${PG_MAJOR}-alpine" >/dev/null
+CONTAINER_CREATED=1
 
 echo "==> waiting for readiness"
 for _ in $(seq 1 30); do
