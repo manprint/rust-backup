@@ -28,13 +28,31 @@ use crate::pool::{self, Carrier, CarrierPool, PendingCarriers, TokenGuard};
 use crate::prefixed::Prefixed;
 use crate::secret::{self, Registry, UdpRegistry};
 use crate::shared::{
-    proxy_buffer_size, tune_tcp, ClientMessage, Delimited, ServerMessage, TunnelOptions,
-    UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
+    proxy_buffer_size, resolve_https_policy, tune_tcp, ClientMessage, Delimited, ServerMessage,
+    TunnelOptions, UdpDirectTuning, CONTROL_PORT, NETWORK_TIMEOUT,
 };
+#[cfg(feature = "ssh-gateway")]
+use crate::sshgw;
 use crate::udp_diagnostic;
 use crate::vhost::{self, VhostRegistry};
 #[cfg(feature = "vpn")]
 use crate::vpn_server;
+
+/// Compute transmitted/received bytes per second from byte counters and time delta.
+/// Returns 0 if dt_ms is 0 or if the current bytes is less than previous (saturation).
+/// Otherwise returns (cur - prev) * 1000 / dt_ms.
+pub(crate) fn compute_rate_bps(prev_bytes: u64, cur_bytes: u64, dt_ms: u64) -> u64 {
+    if dt_ms == 0 {
+        return 0;
+    }
+    match cur_bytes.checked_sub(prev_bytes) {
+        Some(delta) => {
+            // Use u128 to avoid overflow: (delta as u128) * 1000 / (dt_ms as u128)
+            ((delta as u128).saturating_mul(1000) / (dt_ms as u128)) as u64
+        }
+        None => 0, // cur < prev (wrapped or decreased)
+    }
+}
 
 /// Default cap on the number of concurrently proxied connections per tunnel
 /// connection. Bounds memory and file-descriptor use under a connection flood.
@@ -82,6 +100,70 @@ impl Drop for PublicDeregister {
     }
 }
 
+/// Binds a public tunnel listener, either on a caller-requested port (validated
+/// against `port_range`) or on a randomly chosen free port within `port_range`
+/// when `port == 0`. Shared by the native public accept loop
+/// (`Server::create_listener`) and the SSH gateway's `tcpip-forward` handling,
+/// so port allocation semantics never drift between the two ingress paths.
+pub(crate) async fn bind_public_listener(
+    bind_tunnels: IpAddr,
+    port_range: &RangeInclusive<u16>,
+    port: u16,
+) -> Result<TcpListener, &'static str> {
+    let try_bind = |port: u16| async move {
+        TcpListener::bind((bind_tunnels, port))
+            .await
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::AddrInUse => "port already in use",
+                io::ErrorKind::PermissionDenied => "permission denied",
+                _ => "failed to bind to port",
+            })
+    };
+    if port > 0 {
+        // Client requests a specific port number.
+        if !port_range.contains(&port) {
+            return Err("client port number not in allowed range");
+        }
+        try_bind(port).await
+    } else {
+        // Client requests any available port in range.
+        //
+        // In this case, we bind to 150 random port numbers. We choose this value because in
+        // order to find a free port with probability at least 1-δ, when ε proportion of the
+        // ports are currently available, it suffices to check approximately -2 ln(δ) / ε
+        // independently and uniformly chosen ports (up to a second-order term in ε).
+        //
+        // Checking 150 times gives us 99.999% success at utilizing 85% of ports under these
+        // conditions, when ε=0.15 and δ=0.00001.
+        for _ in 0..150 {
+            let port = fastrand::u16(port_range.clone());
+            match try_bind(port).await {
+                Ok(listener) => return Ok(listener),
+                Err(_) => continue,
+            }
+        }
+        Err("failed to find an available port")
+    }
+}
+
+/// Logs an SSH gateway connection's outcome: the zombie-entry reaper's own
+/// keepalive-timeout disconnect (I-3) is escalated to `warn!` — it means a
+/// half-open/unresponsive client was reaped, unlike an ordinary
+/// client-initiated close (`debug!`). Shared by the dedicated `--ssh-port`
+/// listener and the control-port demux (Phase 6).
+#[cfg(feature = "ssh-gateway")]
+fn log_ssh_gateway_outcome(result: Result<(), russh::Error>, addr: SocketAddr) {
+    match result {
+        Ok(()) => {}
+        Err(err @ (russh::Error::KeepaliveTimeout | russh::Error::InactivityTimeout)) => {
+            warn!(%err, %addr, "ssh gateway: reaped unresponsive connection");
+        }
+        Err(err) => {
+            debug!(%err, %addr, "ssh gateway session ended");
+        }
+    }
+}
+
 /// State structure for the server.
 pub struct Server {
     /// Range of TCP ports that can be forwarded.
@@ -101,6 +183,11 @@ pub struct Server {
 
     /// Direct-UDP transport tuning brokered to peers.
     udp_tuning: UdpDirectTuning,
+
+    /// Kill switch for the server-computed adaptive traversal plan (plan
+    /// Fase 3): when `false`, `UdpPunchV2.plan` is never filled and clients
+    /// run their default (Fase 2) check rounds.
+    udp_adaptive_plan: bool,
 
     /// Pending carrier pools, keyed by the per-tunnel token issued in
     /// [`ServerMessage::CarrierToken`]. An extra connection presenting the token
@@ -225,6 +312,12 @@ pub struct Server {
     /// Direct-to-relay fallback count.
     direct_fallbacks: Arc<AtomicU64>,
 
+    /// Server-side rate sampler: transmitted bytes per second (EWMA over 1s ticks).
+    rate_tx_bps: Arc<AtomicU64>,
+
+    /// Server-side rate sampler: received bytes per second (EWMA over 1s ticks).
+    rate_rx_bps: Arc<AtomicU64>,
+
     /// Serializable snapshot of server startup configuration (sanitized, D11).
     config_view: Arc<crate::admin_views::ConfigView>,
 
@@ -238,6 +331,10 @@ pub struct Server {
     /// before reaping the connection (and its admin entry). Defaults to
     /// [`secret::SECRET_CTRL_TIMEOUT`]; lowered by tests to reap fast.
     secret_ctrl_timeout: std::time::Duration,
+
+    /// Embedded SSH ingress gateway (Phase 4), when enabled via `--ssh-gateway`.
+    #[cfg(feature = "ssh-gateway")]
+    ssh_gateway: Option<Arc<crate::sshgw::SshGateway>>,
 }
 
 impl Server {
@@ -250,6 +347,7 @@ impl Server {
             conn_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNS)),
             max_carriers: DEFAULT_MAX_CARRIERS,
             udp_tuning: UdpDirectTuning::default(),
+            udp_adaptive_plan: true,
             pending_carriers: Arc::new(DashMap::new()),
             providers: Registry::default(),
             udp_providers: UdpRegistry::default(),
@@ -295,6 +393,10 @@ impl Server {
             auth_failures: Arc::new(AtomicU64::new(0)),
             conn_rejections: Arc::new(AtomicU64::new(0)),
             direct_fallbacks: Arc::new(AtomicU64::new(0)),
+
+            rate_tx_bps: Arc::new(AtomicU64::new(0)),
+            rate_rx_bps: Arc::new(AtomicU64::new(0)),
+
             config_view: Arc::new(crate::admin_views::ConfigView {
                 port_range: port_range_str,
                 control_port: CONTROL_PORT,
@@ -330,10 +432,20 @@ impl Server {
                 vhost_config: None,
                 vhost_cert_file: None,
                 tls: false,
+                ssh_gateway: false,
+                ssh_port: None,
+                ssh_advertise_address: None,
+                ssh_advertise_port: None,
+                ssh_auth_pubkey: false,
+                ssh_auth_password: false,
+                ssh_banner: false,
+                ssh_host_key_file: None,
             }),
             access_logger: None,
             access_logger_dropped: Arc::new(AtomicU64::new(0)),
             secret_ctrl_timeout: crate::secret::SECRET_CTRL_TIMEOUT,
+            #[cfg(feature = "ssh-gateway")]
+            ssh_gateway: None,
         }
     }
 
@@ -394,6 +506,13 @@ impl Server {
         self.udp_tuning = udp_tuning;
     }
 
+    /// Enable/disable the server-computed adaptive traversal plan (plan
+    /// Fase 3 kill switch, `--no-udp-adaptive-plan`). Off ⇒ `UdpPunchV2.plan`
+    /// stays `None` and clients keep their default check rounds.
+    pub fn set_udp_adaptive_plan(&mut self, enabled: bool) {
+        self.udp_adaptive_plan = enabled;
+    }
+
     /// Set the IP address where the control server will bind to.
     pub fn set_bind_addr(&mut self, bind_addr: IpAddr) {
         self.bind_addr = bind_addr;
@@ -433,6 +552,16 @@ impl Server {
     /// Cumulative bytes received over all relay tunnels.
     pub fn total_rx_bytes(&self) -> u64 {
         self.total_rx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Server-side transmitted bytes per second (1s EWMA sampler).
+    pub fn rate_tx_bps(&self) -> u64 {
+        self.rate_tx_bps.load(Ordering::Relaxed)
+    }
+
+    /// Server-side received bytes per second (1s EWMA sampler).
+    pub fn rate_rx_bps(&self) -> u64 {
+        self.rate_rx_bps.load(Ordering::Relaxed)
     }
 
     /// Shared atomic for accumulating sent bytes (used by relay code).
@@ -540,6 +669,12 @@ impl Server {
     /// Whether TLS is enabled on the control port.
     pub fn is_tls(&self) -> bool {
         self.tls.is_some()
+    }
+
+    /// Get the SSH gateway instance, if enabled.
+    #[cfg(feature = "ssh-gateway")]
+    pub fn ssh_gateway(&self) -> Option<Arc<crate::sshgw::SshGateway>> {
+        self.ssh_gateway.clone()
     }
 
     /// Whether UDP direct-path brokering is enabled.
@@ -682,6 +817,29 @@ impl Server {
         self.vpn_hub_prefix = prefix;
     }
 
+    /// Enable the embedded SSH ingress gateway. Builds it from clones of this
+    /// server's own registries and helpers (never re-derived) so it shares
+    /// the exact same tunnel-serving state as the native accept paths.
+    #[cfg(feature = "ssh-gateway")]
+    pub fn set_ssh_gateway(&mut self, config: crate::sshgw::SshGatewayConfig) -> Result<()> {
+        let gateway = crate::sshgw::SshGateway::new(
+            config,
+            self.providers.clone(),
+            self.vhost_registry.clone(),
+            self.vhost_config.clone(),
+            self.admin.clone(),
+            Arc::clone(&self.conn_permits),
+            self.port_range.clone(),
+            self.bind_tunnels,
+            Arc::clone(&self.total_rx_bytes),
+            Arc::clone(&self.total_tx_bytes),
+            self.tls.clone(),
+            self.bind_domain.clone(),
+        )?;
+        self.ssh_gateway = Some(Arc::new(gateway));
+        Ok(())
+    }
+
     /// Start the server, listening for new connections.
     pub async fn listen(self) -> Result<()> {
         let this = Arc::new(self);
@@ -694,6 +852,43 @@ impl Server {
             udp = this.udp,
             "server listening"
         );
+
+        // Server-side TX/RX rate sampler (admin metrics). Samples the global byte
+        // counters on a fixed 1 s tick and stores an EWMA-smoothed bytes/sec into
+        // `rate_tx_bps`/`rate_rx_bps`, so the admin API reports an instantaneous rate
+        // that does not depend on the client's poll cadence or wall clock (the old
+        // client-side two-poll delta showed 0 on idle 30 s intervals). Only spawned
+        // when the admin status page is enabled; it runs for the server's lifetime
+        // (`this` is owned by the process; unit tests never enter `listen`).
+        if this.admin_token.is_some() {
+            let tx_total = Arc::clone(&this.total_tx_bytes);
+            let rx_total = Arc::clone(&this.total_rx_bytes);
+            let tx_rate = Arc::clone(&this.rate_tx_bps);
+            let rx_rate = Arc::clone(&this.rate_rx_bps);
+            tokio::spawn(async move {
+                const TICK_MS: u64 = 1000;
+                let mut ticker = interval(std::time::Duration::from_millis(TICK_MS));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                let mut prev_tx = tx_total.load(Ordering::Relaxed);
+                let mut prev_rx = rx_total.load(Ordering::Relaxed);
+                // Consume the immediate first tick (no delta yet).
+                ticker.tick().await;
+                // Light EWMA (α = 0.5): smoothed = raw/2 + previous/2 (overflow-safe).
+                let smooth = |raw: u64, slot: &Arc<AtomicU64>| {
+                    let prev = slot.load(Ordering::Relaxed);
+                    slot.store((raw / 2).saturating_add(prev / 2), Ordering::Relaxed);
+                };
+                loop {
+                    ticker.tick().await;
+                    let cur_tx = tx_total.load(Ordering::Relaxed);
+                    let cur_rx = rx_total.load(Ordering::Relaxed);
+                    smooth(compute_rate_bps(prev_tx, cur_tx, TICK_MS), &tx_rate);
+                    smooth(compute_rate_bps(prev_rx, cur_rx, TICK_MS), &rx_rate);
+                    prev_tx = cur_tx;
+                    prev_rx = cur_rx;
+                }
+            });
+        }
 
         // When vhost is configured, spawn the HTTP and/or HTTPS frontend listeners.
         if let Some(cfg_arc) = &this.vhost_config {
@@ -980,6 +1175,47 @@ impl Server {
             }
         }
 
+        // SSH ingress gateway (Phase 4): dedicated TCP listener handing accepted
+        // connections to russh. The control port ALSO demuxes SSH in (Phase 6,
+        // D8, below) — the two listeners are independent and both work when
+        // both are configured (a client can reach either).
+        #[cfg(feature = "ssh-gateway")]
+        if let Some(gateway) = this.ssh_gateway.clone() {
+            if let Some(port) = gateway.port() {
+                let ssh_listener = TcpListener::bind((this.bind_addr, port)).await?;
+                info!(port, "ssh gateway listening");
+                let this2 = Arc::clone(&this);
+                tokio::spawn(async move {
+                    loop {
+                        match ssh_listener.accept().await {
+                            Ok((stream, addr)) => {
+                                tune_tcp(&stream);
+                                let permit = match Arc::clone(&this2.conn_permits)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        this2
+                                            .conn_rejections
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        debug!("ssh gateway connection dropped: max-conns reached");
+                                        continue;
+                                    }
+                                };
+                                let gateway = Arc::clone(&gateway);
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let result = gateway.serve_connection(stream, addr).await;
+                                    log_ssh_gateway_outcome(result, addr);
+                                });
+                            }
+                            Err(err) => warn!(%err, "ssh gateway accept error"),
+                        }
+                    }
+                });
+            }
+        }
+
         loop {
             let (stream, addr) = listener.accept().await?;
             tune_tcp(&stream);
@@ -987,6 +1223,101 @@ impl Server {
             tokio::spawn(
                 async move {
                     info!("incoming connection");
+
+                    // Control-port demux (Phase 6, D8): when the SSH gateway is
+                    // enabled, classify the connection before anything else so
+                    // ONE port serves SSH alongside TLS/HTTP/native bore. I-1:
+                    // with the gateway disabled (or the feature compiled out)
+                    // this whole `if` is skipped — no added read, no timeout, no
+                    // wrapper — and the unchanged legacy code below runs exactly
+                    // as it always has, on the untouched `stream`.
+                    #[cfg(feature = "ssh-gateway")]
+                    if let Some(gateway) = this.ssh_gateway.clone() {
+                        match sshgw::demux_pre_tls(stream).await {
+                            sshgw::PreTlsRoute::Ssh(ssh_stream) => {
+                                let result = gateway.serve_connection(ssh_stream, addr).await;
+                                log_ssh_gateway_outcome(result, addr);
+                                return;
+                            }
+                            sshgw::PreTlsRoute::Tls(prefixed) => {
+                                let result = match &this.tls {
+                                    // ALPN-aware accept: classify the ClientHello
+                                    // BEFORE the post-TLS silence peek. A browser
+                                    // preconnect/pool spare completes TLS and then
+                                    // idles past SSH_PEEK_TIMEOUT before its first
+                                    // request, so "silence means SSH" alone handed
+                                    // real HTTPS connections to russh (its banner
+                                    // surfaced in the page; poisoned sockets hung
+                                    // in the browser pool). Browsers always offer
+                                    // ALPN; a stock `openssl s_client` ProxyCommand
+                                    // (SSH-over-TLS, D4) offers none and keeps the
+                                    // silence-peek path.
+                                    Some(acceptor) => match sshgw::accept_tls_with_alpn(
+                                        Arc::clone(acceptor.config()),
+                                        prefixed,
+                                    )
+                                    .await
+                                    {
+                                        Ok((tls, sshgw::AlpnRoute::Ssh)) => {
+                                            let result = gateway.serve_connection(tls, addr).await;
+                                            log_ssh_gateway_outcome(result, addr);
+                                            return;
+                                        }
+                                        Ok((tls, sshgw::AlpnRoute::NotSsh)) => {
+                                            this.route_connection_known_http(tls, addr).await
+                                        }
+                                        Ok((tls, sshgw::AlpnRoute::Unknown)) => {
+                                            match sshgw::demux_post_tls(tls).await {
+                                                // SSH-over-TLS (D4): a `ProxyCommand`
+                                                // tunneling ssh through this TLS
+                                                // connection.
+                                                sshgw::PostTlsRoute::Ssh(ssh_tls) => {
+                                                    let result = gateway
+                                                        .serve_connection(ssh_tls, addr)
+                                                        .await;
+                                                    log_ssh_gateway_outcome(result, addr);
+                                                    return;
+                                                }
+                                                sshgw::PostTlsRoute::NotSsh(tls2) => {
+                                                    this.route_connection(tls2, addr).await
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!(%err, "TLS handshake failed");
+                                            return;
+                                        }
+                                    },
+                                    // No TLS configured on this port, yet the
+                                    // first byte still looked like a
+                                    // ClientHello: per the plan, do not invent
+                                    // TLS handling here — hand it to the
+                                    // existing routing exactly like any other
+                                    // non-SSH byte, which will reject it
+                                    // exactly as it does today.
+                                    None => this.route_connection(prefixed, addr).await,
+                                };
+                                match result {
+                                    Ok(_) => info!("connection exited"),
+                                    Err(err) => warn!(%err, "connection exited with error"),
+                                }
+                                return;
+                            }
+                            sshgw::PreTlsRoute::Direct(prefixed) => {
+                                // Plain HTTP or plain bore: bypass any
+                                // configured TLS acceptor entirely (T-SSH-DMX1
+                                // — a plain client keeps working on a port
+                                // that also serves TLS).
+                                let result = this.route_connection(prefixed, addr).await;
+                                match result {
+                                    Ok(_) => info!("connection exited"),
+                                    Err(err) => warn!(%err, "connection exited with error"),
+                                }
+                                return;
+                            }
+                        }
+                    }
+
                     // The TLS handshake (if any) runs here, off the accept path.
                     let result = match &this.tls {
                         Some(acceptor) => match acceptor.accept(stream).await {
@@ -1009,40 +1340,7 @@ impl Server {
     }
 
     async fn create_listener(&self, port: u16) -> Result<TcpListener, &'static str> {
-        let try_bind = |port: u16| async move {
-            TcpListener::bind((self.bind_tunnels, port))
-                .await
-                .map_err(|err| match err.kind() {
-                    io::ErrorKind::AddrInUse => "port already in use",
-                    io::ErrorKind::PermissionDenied => "permission denied",
-                    _ => "failed to bind to port",
-                })
-        };
-        if port > 0 {
-            // Client requests a specific port number.
-            if !self.port_range.contains(&port) {
-                return Err("client port number not in allowed range");
-            }
-            try_bind(port).await
-        } else {
-            // Client requests any available port in range.
-            //
-            // In this case, we bind to 150 random port numbers. We choose this value because in
-            // order to find a free port with probability at least 1-δ, when ε proportion of the
-            // ports are currently available, it suffices to check approximately -2 ln(δ) / ε
-            // independently and uniformly chosen ports (up to a second-order term in ε).
-            //
-            // Checking 150 times gives us 99.999% success at utilizing 85% of ports under these
-            // conditions, when ε=0.15 and δ=0.00001.
-            for _ in 0..150 {
-                let port = fastrand::u16(self.port_range.clone());
-                match try_bind(port).await {
-                    Ok(listener) => return Ok(listener),
-                    Err(_) => continue,
-                }
-            }
-            Err("failed to find an available port")
-        }
+        bind_public_listener(self.bind_tunnels, &self.port_range, port).await
     }
 
     /// Route an accepted (and TLS-terminated, if applicable) control connection.
@@ -1081,6 +1379,50 @@ impl Server {
             // Timed out waiting for the first byte: the byte (if any) is still
             // pending, so forward the untouched socket to the protocol path.
             Err(_) => self.handle_connection(socket, peer).await,
+        }
+    }
+
+    /// [`Server::route_connection`] variant for a TLS connection whose
+    /// `ClientHello` ALPN offer already proved it is NOT SSH
+    /// ([`sshgw::AlpnRoute::NotSsh`] — browsers offer `h2`/`http/1.1`, native
+    /// bore clients offer `bore`). Two differences from the generic path:
+    /// the first-byte wait is [`sshgw::HTTP_ALPN_FIRST_REQUEST_TIMEOUT`]
+    /// (a browser preconnect/pool spare legitimately idles far past
+    /// `NETWORK_TIMEOUT` before its first request), and on timeout the
+    /// socket is CLOSED cleanly instead of being handed to the bore
+    /// protocol path — feeding a never-used browser preconnect to yamux
+    /// would just garbage-close it mid-request later; closing it idle is
+    /// exactly what any web server's keep-alive timeout does.
+    #[cfg(feature = "ssh-gateway")]
+    async fn route_connection_known_http<S: mux::Transport>(
+        &self,
+        mut socket: S,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        // No HTTP handler on this port at all: same short-circuit as
+        // `route_connection` (nothing better to offer the client).
+        if self.admin_token.is_none() && self.vhost_config.is_none() {
+            return self.handle_connection(socket, peer).await;
+        }
+
+        let mut first = [0u8; 1];
+        match timeout(
+            sshgw::HTTP_ALPN_FIRST_REQUEST_TIMEOUT,
+            socket.read(&mut first),
+        )
+        .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => Ok(()), // EOF or read error: drop
+            Ok(Ok(_)) => {
+                let stream = Prefixed::new(first.to_vec(), socket);
+                if admin_http::is_http_first_byte(first[0]) {
+                    self.serve_control_http(stream).await
+                } else {
+                    self.handle_connection(stream, peer).await
+                }
+            }
+            // Never spoke: an abandoned speculative connection. Close it.
+            Err(_) => Ok(()),
         }
     }
 
@@ -1291,6 +1633,7 @@ impl Server {
                     peer,
                     notes,
                     self.udp_tuning,
+                    self.udp_adaptive_plan,
                     Arc::clone(&self.total_rx_bytes),
                     Arc::clone(&self.total_tx_bytes),
                     secret::SecretDisplay {
@@ -1324,6 +1667,9 @@ impl Server {
                 auto_reconnect,
                 local_host,
                 local_port,
+                https_policy,
+                backend_tls,
+                backend_tls_sni,
             }) => {
                 let Some(cfg) = self.vhost_config.clone() else {
                     warn!("vhost not configured on this server");
@@ -1356,6 +1702,9 @@ impl Server {
                     self.udp_tuning,
                     local_host,
                     local_port,
+                    https_policy,
+                    backend_tls,
+                    backend_tls_sni,
                 )
                 .await
             }
@@ -1491,6 +1840,7 @@ impl Server {
                         peer,
                         self.udp_providers.clone(),
                         self.udp_tuning,
+                        self.udp_adaptive_plan,
                         self.vpn_punch_timeout,
                         carriers,
                         self.max_carriers,
@@ -1545,11 +1895,25 @@ impl Server {
         mut control: Delimited<mux::Stream>,
         opener: mux::Opener,
         port: u16,
-        opts: TunnelOptions,
+        mut opts: TunnelOptions,
         peer: SocketAddr,
     ) -> Result<()> {
-        // TLS termination on the tunnel port reuses the server's certificate.
-        if opts.https && self.tls.is_none() {
+        // Resolve effective HTTPS flags from the policy (or legacy bools if no policy).
+        let capable = self.tls.is_some();
+        let (eff_https, eff_force_https, downgraded) = match opts.https_policy {
+            Some(policy) => resolve_https_policy(policy, capable),
+            None => (opts.https, opts.force_https, false), // legacy path, byte-identical
+        };
+
+        // Handle HTTPS capability mismatches: warn (policy path) or reject (legacy path).
+        if downgraded {
+            let msg = "server has no TLS certificate (--cert-file/--key-file); \
+                       falling back to plain HTTP for this tunnel";
+            warn!(%port, "{msg}");
+            // Defer the Warning send: see the ordering comment below after CarrierToken.
+        } else if opts.https_policy.is_none() && opts.https && self.tls.is_none() {
+            // LEGACY path: an OLD client asked for https without a cert. Preserve the
+            // exact fatal behavior (old client cannot decode Warning). Byte-identical.
             control
                 .send(ServerMessage::Error(
                     "server has no TLS certificate configured".into(),
@@ -1557,6 +1921,10 @@ impl Server {
                 .await?;
             return Ok(());
         }
+
+        // Apply the resolved effective flags to opts before it's cloned per-connection.
+        opts.https = eff_https;
+        opts.force_https = eff_force_https;
 
         let listener = match self.create_listener(port).await {
             Ok(listener) => listener,
@@ -1576,27 +1944,38 @@ impl Server {
         // handshakes and deliver their substream openers through `carrier_rx`. The
         // data path is unchanged — only *which* connection opens each substream.
         let effective = opts.carriers.clamp(1, self.max_carriers.max(1));
-        let pool = CarrierPool::new(opener);
+        let pool = CarrierPool::new(mux::LinkOpener::Mux(opener));
         let mut carrier_rx = if opts.carriers > 1 {
             let extra = effective - 1;
             let token = Uuid::new_v4().to_string();
             let (tx, rx) = mpsc::unbounded_channel();
             self.pending_carriers.insert(token.clone(), tx);
+            // Build the RAII guard BEFORE the fallible send: if the send fails,
+            // the `?` early-return unwinds through the guard's Drop and removes
+            // the token. Constructing it after the send (the previous order) left
+            // the token orphaned in `pending_carriers` forever on a send failure.
+            let guard = TokenGuard::new(Arc::clone(&self.pending_carriers), token.clone());
             control
-                .send(ServerMessage::CarrierToken {
-                    token: token.clone(),
-                    extra,
-                })
+                .send(ServerMessage::CarrierToken { token, extra })
                 .await?;
             info!(extra, "carrier pool offered");
             // The guard removes the token when this tunnel ends.
-            Some((
-                rx,
-                TokenGuard::new(Arc::clone(&self.pending_carriers), token),
-            ))
+            Some((rx, guard))
         } else {
             None
         };
+
+        // Send deferred Warning after readiness handshake (Hello + CarrierToken).
+        // CRITICAL ORDERING (from Opus review): the client's one-shot registration
+        // reads (client.rs:210 public Hello, :229 carrier token) BAIL on an unexpected
+        // Warning by design; only the main control loop (client.rs:981) handles it
+        // non-fatally (warn+continue). Therefore we send Warning AFTER the readiness
+        // handshake so it is consumed on the main loop, never at a one-shot read.
+        if downgraded && opts.https_policy.is_some() {
+            let msg = "server has no TLS certificate (--cert-file/--key-file); \
+                       falling back to plain HTTP for this tunnel";
+            let _ = control.send(ServerMessage::Warning(msg.into())).await;
+        }
 
         // Register this tunnel in the admin registry for its whole lifetime; the
         // registration is removed when this function returns (client gone).
@@ -1607,8 +1986,8 @@ impl Server {
             public_port: Some(port),
             notes: opts.notes.clone(),
             basic_auth: opts.basic_auth.is_some(),
-            https: opts.https,
-            force_https: opts.force_https,
+            https: eff_https,
+            force_https: eff_force_https,
             carriers: opts.carriers,
             auto_reconnect: opts.auto_reconnect,
             webserver_log: opts.webserver_log,
@@ -1632,6 +2011,8 @@ impl Server {
             upnp: false,
             try_port_prediction: false,
             max_conns: (opts.max_conns != 0).then_some(opts.max_conns),
+            transport: crate::admin::Transport::Bore,
+            identity: None,
         });
         let active = registration.active();
         // Per-tunnel relay byte counters (shown on /admin/status#/tunnels). These
@@ -1845,20 +2226,15 @@ impl Server {
                             }
                         }
 
-                        // Relay fallback.
-                        match opener.open().await {
+                        // Relay fallback. Announce the lazily-opened substream so the
+                        // client dials the local service before any payload flows (Phase 3).
+                        let forward_ip = if client_wants_logging {
+                            Some(addr.ip().to_string())
+                        } else {
+                            None
+                        };
+                        match opener.open_ready(forward_ip.as_deref(), Some(addr)).await {
                             Ok(mut stream) => {
-                                // Announce the lazily-opened substream so the client
-                                // dials the local service before any payload flows (Phase 3).
-                                let forward_ip = if client_wants_logging {
-                                    Some(addr.ip().to_string())
-                                } else {
-                                    None
-                                };
-                                if let Err(err) = mux::write_stream_ready(&mut stream, forward_ip.as_deref()).await {
-                                    trace!(%err, "failed to establish multiplexed stream");
-                                    return;
-                                }
                                 let buf = proxy_buffer_size();
                                 // Count bytes LIVE as they flow (not only on close) so the
                                 // admin TX/RX columns update for long-lived connections.
@@ -1918,7 +2294,7 @@ impl Server {
             warn!("carrier join with unknown token");
             return Ok(());
         };
-        let carrier = Carrier::new(opener);
+        let carrier = Carrier::new(mux::LinkOpener::Mux(opener));
         let alive = Arc::clone(&carrier.alive);
         if tx.send(carrier).is_err() {
             // The tunnel ended between the lookup and the send.
@@ -1930,5 +2306,50 @@ impl Server {
         while let Ok(Some(_)) = control.recv::<ClientMessage>().await {}
         alive.store(false, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn t_compute_rate_bps_zero_dt() {
+        // Zero time delta should always return 0.
+        assert_eq!(compute_rate_bps(0, 100, 0), 0);
+        assert_eq!(compute_rate_bps(100, 200, 0), 0);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_growth() {
+        // 100 bytes in 1000ms = 100 B/s.
+        assert_eq!(compute_rate_bps(0, 100, 1000), 100);
+        // 1000 bytes in 500ms = 2000 B/s.
+        assert_eq!(compute_rate_bps(0, 1000, 500), 2000);
+        // 1024 bytes in 1024ms ≈ 1000 B/s.
+        assert_eq!(compute_rate_bps(0, 1024, 1024), 1000);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_decrease() {
+        // Current bytes < previous bytes (wrapped or decreased) → 0.
+        assert_eq!(compute_rate_bps(200, 100, 1000), 0);
+        assert_eq!(compute_rate_bps(1000, 500, 1000), 0);
+    }
+
+    #[test]
+    fn t_compute_rate_bps_large_values() {
+        // Large byte counts should not overflow (using u128 intermediate).
+        // 1 GB transferred in 1000ms = 1 GB/s ≈ 1_000_000_000 B/s.
+        let gb = 1_000_000_000u64;
+        let rate = compute_rate_bps(0, gb, 1000);
+        assert_eq!(rate, gb); // 1 GB/s
+    }
+
+    #[test]
+    fn t_compute_rate_bps_saturation() {
+        // Saturation: rate when saturating an interval.
+        // 1 MB in 1s = 1,000,000 B/s.
+        assert_eq!(compute_rate_bps(0, 1_000_000, 1000), 1_000_000);
     }
 }

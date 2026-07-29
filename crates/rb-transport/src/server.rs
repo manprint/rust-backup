@@ -184,6 +184,12 @@ where
                 match msg? {
                     Some(ClientMsg::Heartbeat) => {}
                     Some(ClientMsg::UdpCandidateOffer { addrs }) => {
+                        // A peer-controlled list is sanitized BEFORE it is stored or
+                        // forwarded: invalid entries dropped, deduped, capped at
+                        // MAX_UDP_CANDIDATES so the far side never fans out more
+                        // dials/punches than the contract allows.
+                        let mut addrs = addrs;
+                        crate::shared::sanitize_and_log("broker offer", &mut addrs);
                         info!(%id, candidate_count = addrs.len(), "peer offered udp candidates");
                         match side {
                             BrokerSide::Provider => matchmaker.offer_provider(addrs),

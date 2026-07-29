@@ -31,6 +31,14 @@ impl Progress {
         p
     }
 
+    /// Set the expected totals once the plan is known (the plan is only
+    /// available after `analyze` on the source / after `recv_plan` on the
+    /// destination, so totals arrive later than the handle itself).
+    pub fn set_totals(&self, items_total: usize, bytes_total: u64) {
+        self.inner.items_total.store(items_total, Ordering::Relaxed);
+        self.inner.bytes_total.store(bytes_total, Ordering::Relaxed);
+    }
+
     /// Record `n` transferred payload bytes.
     pub fn add_bytes(&self, n: u64) {
         self.inner.bytes_done.fetch_add(n, Ordering::Relaxed);

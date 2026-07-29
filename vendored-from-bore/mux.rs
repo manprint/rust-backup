@@ -11,7 +11,13 @@
 //! services outbound-open requests sent over another channel ([`Opener`]).
 
 use std::future::poll_fn;
+#[cfg(feature = "ssh-gateway")]
+use std::future::Future;
 use std::io;
+#[cfg(feature = "ssh-gateway")]
+use std::pin::Pin;
+#[cfg(feature = "ssh-gateway")]
+use std::sync::Arc;
 use std::task::Poll;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -81,6 +87,111 @@ impl Opener {
         let (tx, rx) = oneshot::channel();
         self.requests.send(tx).await.map_err(|_| disconnected())?;
         rx.await.map_err(|_| disconnected())?
+    }
+}
+
+/// Any stream usable as a forwarded connection's data path once opened and
+/// readiness-marked. Boxed to erase the underlying transport (a yamux
+/// substream today; an SSH channel in a later phase).
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// A boxed, transport-erased forwarded-connection stream.
+pub type LinkStream = Box<dyn Duplex>;
+
+/// Opens a fresh channel toward an SSH gateway's registered peer, erasing the
+/// `russh` `Handle`/channel-open plumbing behind a plain async call.
+///
+/// Native `async fn` in a trait isn't dyn-compatible (needed here for
+/// `Arc<dyn ChannelOpen>` in [`LinkOpener::Ssh`]) without the `async-trait`
+/// crate or nightly; hand-desugaring to a boxed future avoids adding a
+/// dependency for one method.
+#[cfg(feature = "ssh-gateway")]
+pub trait ChannelOpen: Send + Sync {
+    /// Open a channel and return it boxed as a [`LinkStream`]. `forward_ip`,
+    /// when known, is the originating peer's address — implementors thread
+    /// it into the channel-open request itself (SSH has no separate
+    /// [`STREAM_READY`] marker to carry it; SSH-sourced links must NOT write
+    /// that marker at all, see [`LinkOpener::open_ready`]).
+    ///
+    /// `caller`, when known, is the proxied connection's full source address.
+    /// Unlike `forward_ip` (whose presence is a *wire* signal on the mux path
+    /// — Some ⟺ the native client asked for webserver logging — and which
+    /// carries the IP only), `caller` exists solely so SSH links can fill the
+    /// RFC 4254 `forwarded-tcpip` originator address AND port truthfully,
+    /// regardless of any logging option. It never touches the mux wire.
+    fn open(
+        &self,
+        forward_ip: Option<&str>,
+        caller: Option<std::net::SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<LinkStream>> + Send + '_>>;
+}
+
+/// How to open a fresh substream toward a tunnel's registered peer. Wraps the
+/// transport so the public/vhost/secret relay paths don't need to know
+/// whether the peer connected over the classic yamux mux or an SSH gateway
+/// channel. [`CarrierPool`](crate::pool::CarrierPool) stores this instead of
+/// a bare [`Opener`].
+#[derive(Clone)]
+pub enum LinkOpener {
+    /// The classic yamux-multiplexed substream opener.
+    Mux(Opener),
+    /// An SSH gateway forwarded/direct-tcpip channel opener.
+    #[cfg(feature = "ssh-gateway")]
+    Ssh(Arc<dyn ChannelOpen>),
+}
+
+impl LinkOpener {
+    /// Open a link without announcing it. Only meaningful for callers that
+    /// need to interleave more setup before the peer sees any data (e.g.
+    /// picking between a direct and a relayed path and announcing readiness
+    /// once on whichever succeeded). Most callers want
+    /// [`LinkOpener::open_ready`] instead.
+    ///
+    /// Note this is NOT a no-op for SSH links: unlike the mux path, an SSH
+    /// channel open is itself the peer-visible announcement (there is no
+    /// separate marker to skip), so `open` and `open_ready` do the same
+    /// amount of work for `LinkOpener::Ssh` — the distinction only matters
+    /// for `LinkOpener::Mux`.
+    pub async fn open(&self) -> io::Result<LinkStream> {
+        match self {
+            LinkOpener::Mux(opener) => opener.open().await.map(|s| Box::new(s) as LinkStream),
+            #[cfg(feature = "ssh-gateway")]
+            LinkOpener::Ssh(opener) => opener.open(None, None).await,
+        }
+    }
+
+    /// Open a link, announce it (write the STREAM_READY marker with the
+    /// optional caller IP for a mux link; thread the caller address into the
+    /// channel-open request itself for an SSH link), and return the boxed
+    /// stream ready to splice. A failure at any step is reported as one
+    /// error so carrier-failover callers can treat it identically to an
+    /// open failure.
+    ///
+    /// SSH links skip the marker (I-4): a stock `ssh` client on the other
+    /// end doesn't know about it and would see it as leading garbage on the
+    /// forwarded connection.
+    ///
+    /// `caller` is used only by SSH links (the RFC 4254 originator fields);
+    /// the mux wire is governed exclusively by `forward_ip` and stays
+    /// byte-identical whether or not `caller` is passed.
+    pub async fn open_ready(
+        &self,
+        forward_ip: Option<&str>,
+        caller: Option<std::net::SocketAddr>,
+    ) -> io::Result<LinkStream> {
+        #[cfg(not(feature = "ssh-gateway"))]
+        let _ = caller;
+        match self {
+            LinkOpener::Mux(opener) => {
+                let mut stream = opener.open().await?;
+                write_stream_ready(&mut stream, forward_ip).await?;
+                stream.flush().await?;
+                Ok(Box::new(stream))
+            }
+            #[cfg(feature = "ssh-gateway")]
+            LinkOpener::Ssh(opener) => opener.open(forward_ip, caller).await,
+        }
     }
 }
 
@@ -331,5 +442,91 @@ mod tests {
         // Old client reads exactly one byte and should get STREAM_READY.
         let result = read_stream_ready(&mut server, false).await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn link_open_ready_writes_single_zero_byte() {
+        // Real yamux pair: open a substream through LinkOpener and confirm the
+        // peer sees exactly one byte, STREAM_READY, before any payload.
+        let (a, b) = tokio::io::duplex(4096);
+        let (opener, _client_acceptor) = client(a);
+        let (_server_opener, mut server_acceptor) = server(b);
+
+        let link = LinkOpener::Mux(opener);
+        // A caller addr never leaks onto the mux wire (SSH-only field).
+        let caller = "203.0.113.7:54321".parse().ok();
+        let _stream = link.open_ready(None, caller).await.unwrap();
+
+        let mut accepted = server_acceptor.accept().await.expect("substream accepted");
+        let mut marker = [0u8; 1];
+        accepted.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker[0], STREAM_READY);
+
+        // Nothing else was written yet (no IP header, since forward_ip was None).
+        let mut probe = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            accepted.read(&mut probe).await
+        })
+        .await;
+        assert!(n.is_err(), "no further bytes expected without forward_ip");
+    }
+
+    #[cfg(feature = "ssh-gateway")]
+    #[tokio::test]
+    async fn link_open_ready_ssh_writes_no_marker() {
+        // A mock ChannelOpen that hands back one half of an in-memory duplex
+        // and records the forward_ip it was asked to thread through, so the
+        // test can assert on both without a real russh Handle/session.
+        struct MockOpen {
+            seen_forward_ip: Arc<std::sync::Mutex<Option<String>>>,
+            seen_caller: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
+            stream: Arc<std::sync::Mutex<Option<tokio::io::DuplexStream>>>,
+        }
+
+        impl ChannelOpen for MockOpen {
+            fn open(
+                &self,
+                forward_ip: Option<&str>,
+                caller: Option<std::net::SocketAddr>,
+            ) -> Pin<Box<dyn Future<Output = io::Result<LinkStream>> + Send + '_>> {
+                *self.seen_forward_ip.lock().unwrap() = forward_ip.map(str::to_string);
+                *self.seen_caller.lock().unwrap() = caller;
+                let stream = self.stream.lock().unwrap().take().expect("opened once");
+                Box::pin(async move { Ok(Box::new(stream) as LinkStream) })
+            }
+        }
+
+        let (a, b) = tokio::io::duplex(4096);
+        let seen_forward_ip = Arc::new(std::sync::Mutex::new(None));
+        let seen_caller = Arc::new(std::sync::Mutex::new(None));
+        let opener = MockOpen {
+            seen_forward_ip: Arc::clone(&seen_forward_ip),
+            seen_caller: Arc::clone(&seen_caller),
+            stream: Arc::new(std::sync::Mutex::new(Some(a))),
+        };
+
+        let caller: std::net::SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let link = LinkOpener::Ssh(Arc::new(opener));
+        let mut stream = link
+            .open_ready(Some("203.0.113.7"), Some(caller))
+            .await
+            .unwrap();
+
+        // The caller IP was threaded into the channel-open request itself...
+        assert_eq!(
+            seen_forward_ip.lock().unwrap().as_deref(),
+            Some("203.0.113.7")
+        );
+        // ...alongside the full caller address (IP AND port, for the RFC 4254
+        // originator fields)...
+        assert_eq!(*seen_caller.lock().unwrap(), Some(caller));
+        // ...and NOT written as a leading STREAM_READY-style marker byte (I-4):
+        // whatever the SSH peer sent first arrives untouched.
+        let mut b = b;
+        b.write_all(b"hello").await.unwrap();
+        b.flush().await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
     }
 }

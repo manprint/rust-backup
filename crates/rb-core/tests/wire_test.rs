@@ -76,6 +76,132 @@ async fn plan_serde_roundtrip() {
     assert!(back.render().contains("filesystem"));
 }
 
+/// T-CORE5: a peer-declared chunk length above CHUNK_SIZE is refused BEFORE the
+/// receiver allocates it (a hostile/corrupt header must not become a 4 GiB
+/// allocation).
+#[tokio::test]
+async fn oversized_declared_chunk_is_refused() {
+    let (mut a, b) = tokio::io::duplex(1 << 16);
+    let huge = wire::DataFrame::ChunkStart {
+        item_id: 1,
+        offset: 0,
+        len: u32::MAX,
+        blake3: wire::blake3_hex(&[]),
+    };
+    tokio::spawn(async move {
+        // Header only: if the receiver were to allocate/read it would hang here.
+        wire::send_frame(&mut a, &huge).await.unwrap();
+        futures_util_pending().await;
+    });
+    let mut src = StreamChunkSource::new(b);
+    let err = src.next().await.unwrap_err();
+    assert!(
+        format!("{err}").contains("exceeds CHUNK_SIZE"),
+        "got: {err}"
+    );
+}
+
+/// Keeps the writer half alive without sending payload bytes.
+async fn futures_util_pending() {
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+}
+
+/// T-CORE6: chunks that individually verify but do not add up to the declared
+/// whole-item digest are caught at ItemEnd (per-item integrity, D12).
+#[tokio::test]
+async fn item_digest_mismatch_detected() {
+    let (a, b) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let mut sink = StreamChunkSink::new(a);
+        sink.send_chunk(1, 0, b"hello").await.unwrap();
+        // Digest of DIFFERENT content: each chunk hash is right, the fold is not.
+        sink.finish_item(1, 5, &wire::blake3_hex(b"HELLO"))
+            .await
+            .unwrap();
+    });
+    let mut src = StreamChunkSource::new(b);
+    assert!(matches!(
+        src.next().await.unwrap(),
+        ChunkEvent::Chunk { .. }
+    ));
+    let err = src.next().await.unwrap_err();
+    assert!(
+        format!("{err}").contains("whole-item blake3 mismatch"),
+        "got: {err}"
+    );
+}
+
+/// T-CORE7: the whole-item digest is folded across MANY chunks (it is a running
+/// hash, not a per-chunk one), and a correct multi-chunk item verifies.
+#[tokio::test]
+async fn multi_chunk_item_digest_verifies() {
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let part = vec![9u8; 1000];
+    let whole: Vec<u8> = part.iter().chain(part.iter()).copied().collect();
+    let expect = wire::blake3_hex(&whole);
+    let p2 = part.clone();
+    tokio::spawn(async move {
+        let mut sink = StreamChunkSink::new(a);
+        sink.send_chunk(1, 0, &p2).await.unwrap();
+        sink.send_chunk(1, 1000, &p2).await.unwrap();
+        sink.finish_item(1, 2000, &expect).await.unwrap();
+        sink.finish().await.unwrap();
+    });
+    let mut src = StreamChunkSource::new(b);
+    for _ in 0..2 {
+        assert!(matches!(
+            src.next().await.unwrap(),
+            ChunkEvent::Chunk { .. }
+        ));
+    }
+    assert!(matches!(
+        src.next().await.unwrap(),
+        ChunkEvent::ItemEnd { .. }
+    ));
+    assert!(matches!(src.next().await.unwrap(), ChunkEvent::End));
+}
+
+/// T-CORE8: a zero-chunk item still verifies against the digest of no bytes, so
+/// empty items (empty file, empty table) are not a special case.
+#[tokio::test]
+async fn empty_item_verifies() {
+    let (a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let mut sink = StreamChunkSink::new(a);
+        sink.finish_item(7, 0, &wire::blake3_hex(&[]))
+            .await
+            .unwrap();
+        sink.finish().await.unwrap();
+    });
+    let mut src = StreamChunkSource::new(b);
+    assert!(matches!(
+        src.next().await.unwrap(),
+        ChunkEvent::ItemEnd { item_id: 7, .. }
+    ));
+}
+
+/// T-CORE9: a mid-stream producer abort reaches the consumer as an explicit
+/// phase-tagged error carrying the reason (not an opaque EOF).
+#[tokio::test]
+async fn mid_stream_abort_carries_reason() {
+    let (mut a, b) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        wire::send_frame(
+            &mut a,
+            &wire::DataFrame::Abort {
+                reason: "backend read failed".into(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let mut src = StreamChunkSource::new(b);
+    let err = src.next().await.unwrap_err();
+    let text = format!("{err}");
+    assert!(text.contains("source aborted mid-stream"), "got: {text}");
+    assert!(text.contains("backend read failed"), "got: {text}");
+}
+
 /// T-CORE4: human_bytes formats scale correctly.
 #[test]
 fn human_bytes_scales() {

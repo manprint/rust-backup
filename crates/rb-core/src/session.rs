@@ -50,8 +50,48 @@ pub async fn run_source_limited(
     // 1. Immutability baseline (read-only).
     let fp_before = source.fingerprint().await?;
 
+    let outcome = source_run(source, channel, progress, max_rate).await;
+
+    // 6. Immutability audit — the central invariant. It runs on EVERY exit path,
+    // including a run that failed or was aborted mid-stream: an aborted transfer
+    // is exactly the case where a half-applied source write would hide.
+    match source.fingerprint().await {
+        Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
+            "source fingerprint changed during backup ({fp_before} -> {fp_after})"
+        ))),
+        Ok(_) => {
+            if let Ok(o) = &outcome {
+                info!(bytes = o.bytes_sent, "source done; immutability verified");
+            } else {
+                info!("source run failed; source verified unchanged");
+            }
+            outcome
+        }
+        // A failed audit cannot prove immutability. If the run itself already
+        // failed, that error is the more informative one; otherwise surface the
+        // audit failure — a "successful" run we cannot audit is not a success.
+        Err(audit_err) => match outcome {
+            Err(run_err) => Err(run_err),
+            Ok(_) => Err(BackupError::phase_src(
+                Phase::Verify,
+                "post-run source fingerprint audit failed",
+                audit_err,
+            )),
+        },
+    }
+}
+
+/// The source run proper (analyze → plan exchange → stream → Done), without the
+/// immutability audit, which [`run_source_limited`] applies to every exit path.
+async fn source_run(
+    source: &dyn Source,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    max_rate: Option<u64>,
+) -> Result<SourceOutcome> {
     // 2. Analyze and build the self-contained plan (read-only).
     let plan = source.analyze().await?;
+    progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, items = plan.items.len(), "source plan ready");
     info!("\n{}", plan.render());
 
@@ -65,12 +105,28 @@ pub async fn run_source_limited(
 
     // 4. Stream the payload (no temp files; backpressure consumer-paced).
     let mut stream_sink = StreamChunkSink::new_counted(stream, progress.clone());
-    {
+    let streamed = {
         let mut sink = PacedSink::new(&mut stream_sink, max_rate);
-        source.stream_out(&plan, &mut sink).await?;
-        sink.finish().await?;
-    }
+        match source.stream_out(&plan, &mut sink).await {
+            Ok(()) => sink.finish().await,
+            Err(e) => Err(e),
+        }
+    };
     let mut stream = stream_sink.into_inner();
+
+    // A source-side failure is told to the destination explicitly, so it aborts
+    // its restore with a real reason instead of interpreting a mid-stream EOF.
+    // Best-effort: the channel may already be gone, which is not a new fault.
+    if let Err(e) = streamed {
+        let _ = wire::send_frame(
+            &mut stream,
+            &crate::wire::DataFrame::Abort {
+                reason: e.to_string(),
+            },
+        )
+        .await;
+        return Err(e);
+    }
 
     // 5. Completion frame.
     let bytes_sent = progress.bytes();
@@ -83,14 +139,6 @@ pub async fn run_source_limited(
     )
     .await?;
 
-    // 6. Immutability audit — the central invariant.
-    let fp_after = source.fingerprint().await?;
-    if fp_before != fp_after {
-        return Err(BackupError::SourceMutated(format!(
-            "source fingerprint changed during backup ({fp_before} -> {fp_after})"
-        )));
-    }
-    info!(bytes = bytes_sent, "source done; immutability verified");
     Ok(SourceOutcome { plan, bytes_sent })
 }
 
@@ -151,7 +199,16 @@ pub async fn run_destination(
     // 1. Consumer opens the substream and receives the plan.
     let stream = channel.open_stream().await?;
     let mut stream = stream;
-    let plan = channel::recv_plan(&mut stream).await?;
+    // An unreadable/unsupported plan is refused on the wire too, so the source
+    // fails fast with the reason instead of blocking on a PlanAck that never comes.
+    let plan = match channel::recv_plan(&mut stream).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            let _ = channel::send_ack(&mut stream, false, &e.to_string()).await;
+            return Err(e);
+        }
+    };
+    progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, "destination received plan");
     info!("\n{}", plan.render());
 

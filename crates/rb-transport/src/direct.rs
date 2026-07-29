@@ -38,8 +38,10 @@ const ALPN: &[u8] = b"bore-udp";
 /// Keep-alive interval for idle QUIC connections.
 const QUIC_KEEPALIVE: Duration = Duration::from_secs(3);
 
-/// Maximum idle time before a QUIC connection is closed.
-const QUIC_MAX_IDLE: Duration = Duration::from_secs(10);
+/// Maximum idle time before a QUIC connection is closed, in milliseconds.
+/// Expressed in millis so the quinn `IdleTimeout` is built from a `VarInt`
+/// (infallible) rather than a fallible `Duration` conversion.
+const QUIC_MAX_IDLE_MS: u32 = 10_000;
 
 /// Total timeout for all direct connection attempts.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -232,7 +234,11 @@ async fn punch(socket: &UdpSocket, peers: &[SocketAddr]) {
 fn transport_config(tuning: &UdpDirectTuning) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(QUIC_KEEPALIVE));
-    cfg.max_idle_timeout(Some(QUIC_MAX_IDLE.try_into().expect("valid idle timeout")));
+    // Built from a VarInt (millis) instead of `Duration::try_into` so this hot
+    // path carries no `expect` (I-ERRORS): the conversion cannot fail.
+    cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        QUIC_MAX_IDLE_MS,
+    ))));
 
     cfg.stream_receive_window(tuning.stream_receive_window.into());
     cfg.receive_window(tuning.connection_receive_window.into());

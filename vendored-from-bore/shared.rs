@@ -20,10 +20,15 @@ pub const CONTROL_PORT: u16 = 7835;
 
 /// Maximum byte length for a JSON frame in the stream.
 ///
-/// Large enough to hold a small list of UDP hole-punch candidate addresses
-/// (IPv6 + a nonce) used by the `udp` feature's signaling, while still bounding
-/// untrusted input on the control channel.
-pub const MAX_FRAME_LENGTH: usize = 1024;
+/// Sized for the largest legitimate control frame: an `UdpPunch` carrying a
+/// full candidate-model-v2 rider — up to [`crate::holepunch::MAX_UDP_CANDIDATES`]
+/// (16) addresses BOTH as the legacy plain list and as typed candidates, plus
+/// capabilities, the structured NAT profile, and the server-computed adaptive
+/// plan (plan Fase 3; ~2.5 KiB worst case at 16 candidates). The old 1024-byte
+/// cap silently broke UDP negotiation once port prediction pushed a v2 offer
+/// past it ("frame error, invalid byte length" → relay fallback). Still a
+/// tight bound on untrusted control-channel input.
+pub const MAX_FRAME_LENGTH: usize = 8192;
 
 /// Number of random bytes in a UDP hole-punch session nonce. The shared QUIC
 /// authentication token is derived from this nonce and the tunnel secret.
@@ -212,11 +217,30 @@ pub const NAT_UDP_RELEASE_TIMEOUT: u64 = 600;
 pub const DIRECT_QUIC_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// Default total QUIC receive window for one direct UDP connection.
-pub const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+///
+/// CRITICAL for the multiplexed `local`/`vhost --udp` paths: a single direct
+/// connection (the `--carriers 1` default) carries EVERY proxied connection as
+/// its own QUIC bidi stream. The receiver only returns connection-level
+/// flow-control credit as it DRAINS each stream into its public socket, so a
+/// slow/paused public reader (a browser pausing some assets while it parses
+/// blocking CSS/JS) lets quinn buffer up to one full `STREAM_RECEIVE_WINDOW`
+/// (16 MiB) of unread data per stalled stream AGAINST this shared window. Once
+/// `CONNECTION_RECEIVE_WINDOW / STREAM_RECEIVE_WINDOW` streams stall, the whole
+/// connection runs out of credit and EVERY other stream on it starves —
+/// requests hang "pending" until a stalled reader drains. At 64 MiB only ~4
+/// stalled streams triggered this (the carriers=1 stall reproduced by
+/// `scripts/vhost_udp_concurrency_repro.sh`). 256 MiB tolerates ~16 — the same
+/// headroom four 64 MiB carriers gave, now in the single-connection default.
+/// It is a CEILING (quinn only buffers what actually arrives unread), not a
+/// reservation, so a healthy tunnel that keeps draining costs ~0. Tunable via
+/// the direct-path tuning flags for hosts that need a tighter memory bound.
+pub const DIRECT_QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 256 * 1024 * 1024;
 
 /// Default upper bound on bytes sent but not yet acknowledged on the direct
-/// UDP path.
-pub const DIRECT_QUIC_SEND_WINDOW: u64 = 64 * 1024 * 1024;
+/// UDP path. Kept at parity with the connection receive window so the sender's
+/// own connection-level send budget never becomes the bottleneck before the
+/// peer's advertised receive window does.
+pub const DIRECT_QUIC_SEND_WINDOW: u64 = 256 * 1024 * 1024;
 
 /// Default UDP socket receive buffer requested for each direct-path socket.
 pub const DIRECT_UDP_SOCKET_RECV_BUFFER: usize = 16 * 1024 * 1024;
@@ -253,6 +277,38 @@ pub fn tune_tcp(stream: &TcpStream) {
 /// within [`MAX_FRAME_LENGTH`] so the control-channel frame carrying it (alongside
 /// the tunnel id / options) never exceeds the codec's limit.
 pub const MAX_NOTES_LEN: usize = 256;
+
+/// Per-tunnel HTTPS behavior requested by the client. `None` (an `Option<HttpsPolicy>`)
+/// means "inherit the server default".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+pub enum HttpsPolicy {
+    /// No TLS termination, no redirect; plain HTTP/raw only.
+    Off,
+    /// Terminate TLS; serve both HTTP and HTTPS; no redirect.
+    On,
+    /// Terminate TLS and 308-redirect plain HTTP to HTTPS.
+    Redirect,
+}
+
+/// Resolve a requested per-tunnel HTTPS policy against server capability into
+/// the effective `(https, force_https)` edge flags.
+///
+/// `capable` = the server can terminate TLS for this tunnel family
+/// (public: `self.tls.is_some()`; vhost: cert present and mode serves https).
+/// Returns `(https, force_https, downgraded)` where `downgraded` is true when
+/// the client asked for TLS (`On`/`Redirect`) but the server is not capable,
+/// so the caller must warn and fall back to plain HTTP.
+pub fn resolve_https_policy(policy: HttpsPolicy, capable: bool) -> (bool, bool, bool) {
+    match policy {
+        HttpsPolicy::Off => (false, false, false),
+        HttpsPolicy::On if capable => (true, false, false),
+        HttpsPolicy::On => (false, false, true),
+        HttpsPolicy::Redirect if capable => (true, true, false),
+        HttpsPolicy::Redirect => (false, false, true),
+    }
+}
 
 /// Per-tunnel options requested by the client for a public-port tunnel.
 ///
@@ -303,6 +359,10 @@ pub struct TunnelOptions {
     /// The client's local service port. `0` = unknown. Display-only.
     #[serde(default)]
     pub local_port: u16,
+    /// Per-tunnel HTTPS policy. `None` = inherit the server default (byte-identical
+    /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
+    #[serde(default)]
+    pub https_policy: Option<HttpsPolicy>,
 }
 
 /// Options negotiated by two `bore test-udp` peers once the server pairs them.
@@ -472,11 +532,188 @@ impl UdpAdaptivePlan {
     }
 }
 
+/// Capability label a peer advertises in [`UdpCandidateOffer::capabilities`]
+/// when it understands the typed candidate model v2 (plan Fase 1). V2
+/// semantics only ever activate when BOTH peers advertise it; absent ⇒ the
+/// legacy `candidates: Vec<SocketAddr>` path is authoritative.
+pub const UDP_CAP_CANDIDATE_V2: &str = "cand-v2";
+
+/// Capability label for authenticated connectivity checks (plan Fase 2):
+/// HMAC request/response probes that validate a candidate pair and learn
+/// peer-reflexive sources BEFORE QUIC. Only active when BOTH peers advertise
+/// it; a legacy peer keeps the blind punch + dial-all path byte-identical.
+pub const UDP_CAP_CHECK_V1: &str = "check-v1";
+
+/// Observed NAT *mapping* behaviour in RFC 4787 terms, self-reported in a
+/// structured enum so the server-side policy never parses text labels (plan
+/// Fase 3). Derived live from two independent STUN observations on the same
+/// socket: identical mapped addresses ⇒ endpoint-independent, different ⇒
+/// symmetric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UdpNatMapping {
+    /// Fewer than two observations — never treated as hostile by the policy.
+    #[default]
+    Unknown,
+    /// Endpoint-independent mapping: same external `ip:port` toward any peer.
+    Eim,
+    /// Address/port-dependent mapping (symmetric NAT): fresh mapping per
+    /// destination, so the STUN-observed port is not the port the peer sees.
+    Symmetric,
+}
+
+impl UdpNatMapping {
+    /// Stable lowercase label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpNatMapping::Unknown => "unknown",
+            UdpNatMapping::Eim => "eim",
+            UdpNatMapping::Symmetric => "symmetric",
+        }
+    }
+}
+
+/// Observed NAT *filtering* behaviour (RFC 4787). A live gather cannot observe
+/// filtering without a two-IP STUN server (plan Fase 6), so this is always
+/// `Unknown` today — carried on the wire so the policy and frames need no
+/// change when Fase 6 lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum UdpNatFiltering {
+    /// Not observed (the only value produced today).
+    #[default]
+    Unknown,
+    /// Endpoint-independent filtering (full cone).
+    Eif,
+    /// Address- or port-dependent filtering.
+    AddressDependent,
+}
+
+impl UdpNatFiltering {
+    /// Stable lowercase label used in logs and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UdpNatFiltering::Unknown => "unknown",
+            UdpNatFiltering::Eif => "eif",
+            UdpNatFiltering::AddressDependent => "address-dependent",
+        }
+    }
+}
+
+/// Structured NAT self-profile attached to a candidate offer (plan Fase 3).
+///
+/// The server computes an adaptive plan ONLY when BOTH peers attach one;
+/// absence keeps the legacy behaviour (a missing profile must NEVER be read
+/// as "relay only"). All fields are additive serde defaults so legacy frames
+/// stay byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UdpNatProfile {
+    /// Observed mapping behaviour.
+    #[serde(default)]
+    pub mapping: UdpNatMapping,
+    /// Observed filtering behaviour (always `Unknown` until Fase 6).
+    #[serde(default)]
+    pub filtering: UdpNatFiltering,
+    /// Whether the NAT preserved the local UDP port in the mapping.
+    #[serde(default)]
+    pub port_preserved: Option<bool>,
+    /// Independent STUN observations backing `mapping` — the policy's
+    /// confidence signal (`< 2` ⇒ mapping is at best a guess).
+    #[serde(default)]
+    pub observations: u8,
+}
+
+impl UdpNatProfile {
+    /// Compact log label: `mapping/filtering/port_preserved (N obs)`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}/{} port_preserved={} ({} obs)",
+            self.mapping.as_str(),
+            self.filtering.as_str(),
+            match self.port_preserved {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            },
+            self.observations
+        )
+    }
+}
+
+/// One typed hole-punch candidate (candidate model v2, plan Fase 1).
+///
+/// Carried ALONGSIDE the legacy plain-address list — same addresses, extra
+/// metadata — so an old peer keeps working off `candidates` unchanged.
+/// Observe-only in Fase 1 (logged, not yet steering connects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpTypedCandidate {
+    /// The candidate address (also present in the legacy list).
+    pub addr: SocketAddr,
+    /// How this candidate was obtained.
+    pub kind: UdpCandidateKind,
+    /// Relative preference, higher = try earlier (advisory until Fase 3).
+    #[serde(default)]
+    pub priority: u32,
+}
+
+/// V2 traversal metadata rider on [`ServerMessage::UdpPunch`] (plan Fase 1).
+///
+/// `None` for old peers and for paths that have not adopted v2 yet (VPN
+/// adopts in Fase 3); everything here is observe-only in Fase 1. A missing
+/// or partial rider must NEVER be interpreted as `RelayOnly` — absence of
+/// metadata means "use the legacy behaviour".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UdpPunchV2 {
+    /// Traversal round generation the peer candidates belong to.
+    #[serde(default)]
+    pub generation: u32,
+    /// The peer's typed candidates (same addresses as the legacy `peer` list).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_typed: Vec<UdpTypedCandidate>,
+    /// The peer's advertised traversal capabilities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_capabilities: Vec<String>,
+    /// Server-computed traversal plan (Fase 3; always `None` before that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<UdpAdaptivePlan>,
+}
+
+impl UdpPunchV2 {
+    /// `Some(generation)` when the peer advertised authenticated connectivity
+    /// checks ([`UDP_CAP_CHECK_V1`]) — the gate for the Fase 2 check round.
+    pub fn check_generation(&self) -> Option<u32> {
+        self.peer_capabilities
+            .iter()
+            .any(|c| c == UDP_CAP_CHECK_V1)
+            .then_some(self.generation)
+    }
+
+    /// Build the punch rider from a peer's offer. `None` when the offer
+    /// carried no v2 metadata (legacy peer) so the relayed wire frame stays
+    /// byte-identical for legacy pairs. The adaptive `plan` starts `None`;
+    /// the broker attaches one when both peers reported a structured profile
+    /// (plan Fase 3). Shared by the secret broker and the VPN server so the
+    /// two rider builders can never drift.
+    pub fn from_offer(offer: &UdpCandidateOffer) -> Option<Self> {
+        if offer.typed_candidates.is_empty()
+            && offer.capabilities.is_empty()
+            && offer.generation == 0
+            && offer.profile.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            generation: offer.generation,
+            peer_typed: offer.typed_candidates.clone(),
+            peer_capabilities: offer.capabilities.clone(),
+            plan: None,
+        })
+    }
+}
+
 /// UDP candidate offer with optional metadata about the STUN server that
 /// produced the primary reflexive candidate. The metadata is advisory: the wire
 /// path still brokers plain candidate addresses, and peers fall back to the
 /// normal STUN chain if the hinted server is unreachable from their network.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UdpCandidateOffer {
     /// Candidate addresses this peer can be punched at.
     pub candidates: Vec<SocketAddr>,
@@ -486,6 +723,27 @@ pub struct UdpCandidateOffer {
     /// Hub mode: which peer this offer is for; 0 in 1:1.
     #[serde(default)]
     pub peer_id: u32,
+    /// Candidate model v2 (plan Fase 1): typed candidates, same addresses as
+    /// `candidates`. Old peers ignore it; new peers still read the legacy
+    /// list as the source of truth until both sides advertise
+    /// [`UDP_CAP_CANDIDATE_V2`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub typed_candidates: Vec<UdpTypedCandidate>,
+    /// Traversal round generation these candidates belong to (0 = first).
+    #[serde(default)]
+    pub generation: u32,
+    /// Traversal capabilities this peer understands (e.g. `cand-v2`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// Compact self-reported NAT profile hint (observe-only; a server MUST
+    /// NOT derive `RelayOnly` from a missing hint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_hint: Option<String>,
+    /// Structured NAT self-profile (plan Fase 3). The server computes an
+    /// adaptive plan only when BOTH peers attach one; `None` keeps the
+    /// legacy/Fase-2 behaviour and the legacy wire frame byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UdpNatProfile>,
 }
 
 /// Bandwidth-oriented tuning for the direct UDP path.
@@ -944,6 +1202,23 @@ pub enum ClientMessage {
         /// The provider's local target port. `0` = unknown. Display-only.
         #[serde(default)]
         local_port: u16,
+        /// Per-tunnel HTTPS policy. `None` = inherit the server default (byte-identical
+        /// to the pre-policy behavior). `#[serde(default)]` keeps the wire backward-compatible.
+        #[serde(default)]
+        https_policy: Option<HttpsPolicy>,
+        /// Whether the server should connect to the provider's local backend over
+        /// TLS (the backend is itself an HTTPS server, e.g. a self-signed dev app).
+        /// The server originates a TLS client session on the provider-facing
+        /// `LinkStream`; certificate verification is skipped (accept-any).
+        /// `#[serde(default)]` keeps the wire backward-compatible (an old client
+        /// omits it ⇒ reads as `false` ⇒ the pre-feature plaintext path).
+        #[serde(default)]
+        backend_tls: bool,
+        /// SNI/server name sent in the backend TLS ClientHello. `None` ⇒ the server
+        /// defaults to `localhost`. Ignored when `backend_tls` is `false`.
+        /// `#[serde(default)]` keeps the wire backward-compatible.
+        #[serde(default)]
+        backend_tls_sni: Option<String>,
     },
 
     /// Ask the server to issue a fresh vhost-UDP nonce so the provider can
@@ -1106,6 +1381,11 @@ pub enum ServerMessage {
         /// Hub mode: which peer this punch belongs to; 0 in 1:1.
         #[serde(default)]
         peer_id: u32,
+        /// Candidate model v2 rider (typed candidates, generation,
+        /// capabilities, future plan). `None` from old servers / non-v2 paths;
+        /// observe-only in Fase 1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        v2: Option<UdpPunchV2>,
     },
 
     /// Provider-selected STUN server hint returned to a consumer before it
@@ -1176,6 +1456,18 @@ pub enum ServerMessage {
         /// Adaptive NAT plan chosen by the server for this paired diagnostic.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adaptive_plan: Option<UdpAdaptivePlan>,
+        /// Whether this server supports retry re-candidating: a peer may send a
+        /// fresh [`ClientMessage::TestUdpJoin`] after a failed direct attempt
+        /// and the server re-brokers a new round (fresh nonce + candidates +
+        /// plan). Old servers omit it (`false`) → the client skips retries
+        /// instead of re-punching stale candidates from a dead socket.
+        #[serde(default)]
+        recandidate: bool,
+        /// Traversal round number: 0 for the initial pairing, incremented for
+        /// every re-brokered retry round. Retries MUST carry a new generation
+        /// so stale-round candidates are never mixed into a fresh attempt.
+        #[serde(default)]
+        generation: u32,
     },
 
     /// VPN link paired; contains overlay addressing and the direct-path nonce.
@@ -1227,6 +1519,10 @@ pub enum ServerMessage {
         /// The peer's identifier (from the matching VpnPeerJoin).
         peer_id: u32,
     },
+
+    /// Non-fatal advisory from the server. The client prints it and CONTINUES.
+    /// Sent only to policy-aware clients (they sent https_policy = Some). Old clients never receive it.
+    Warning(String),
 }
 
 #[doc(hidden)]
@@ -1381,14 +1677,28 @@ impl ControlFrameSummary for ServerMessage {
                 peer_selected_stun,
                 tuning,
                 peer_id,
+                v2,
             } => {
                 format!(
-                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }}, peer_id={} }}",
+                    "UdpPunch {{ nonce={}, peer={:?}, peer_selected_stun={}, tuning={{ {} }}, peer_id={}, v2={} }}",
                     hex::encode(nonce),
                     peer,
                     peer_selected_stun.as_deref().unwrap_or("<none>"),
                     tuning.control_frame_summary(),
                     peer_id,
+                    match v2 {
+                        Some(v2) => format!(
+                            "{{ generation={}, typed={}, capabilities={:?}, plan={} }}",
+                            v2.generation,
+                            v2.peer_typed.len(),
+                            v2.peer_capabilities,
+                            v2.plan
+                                .as_ref()
+                                .map(|p| p.summary())
+                                .unwrap_or_else(|| "<none>".to_string()),
+                        ),
+                        None => "<none>".to_string(),
+                    },
                 )
             }
             ServerMessage::UdpStunHint { stun_server } => {
@@ -1439,9 +1749,11 @@ impl ControlFrameSummary for ServerMessage {
                 options,
                 tuning,
                 adaptive_plan,
+                recandidate,
+                generation,
             } => {
                 format!(
-                    "TestUdpStart {{ role={:?}, nonce={}, peer_candidates={:?}, peer_summary={{ {} }}, options={{ {} }}, tuning={{ {} }}, adaptive_plan={} }}",
+                    "TestUdpStart {{ role={:?}, nonce={}, peer_candidates={:?}, peer_summary={{ {} }}, options={{ {} }}, tuning={{ {} }}, adaptive_plan={}, recandidate={}, generation={} }}",
                     role,
                     hex::encode(nonce),
                     peer_candidates,
@@ -1449,6 +1761,8 @@ impl ControlFrameSummary for ServerMessage {
                     options.control_frame_summary(),
                     tuning.control_frame_summary(),
                     adaptive_plan.as_ref().map(|plan| plan.summary()).unwrap_or_else(|| "<none>".to_string()),
+                    recandidate,
+                    generation,
                 )
             }
             ServerMessage::VpnReady {
@@ -1494,6 +1808,9 @@ impl ControlFrameSummary for ServerMessage {
             }
             ServerMessage::VpnPeerLeave { peer_id } => {
                 format!("VpnPeerLeave {{ peer_id={} }}", peer_id)
+            }
+            ServerMessage::Warning(msg) => {
+                format!("Warning {{ message={} }}", msg)
             }
         }
     }
@@ -1692,6 +2009,63 @@ mod tests {
     }
 
     #[test]
+    fn hello_vhost_old_wire_defaults_backend_tls_off() {
+        // I-2: a legacy HelloVhost that predates the backend-TLS fields must still
+        // deserialize, with `backend_tls`/`backend_tls_sni` reading as their
+        // defaults (off / none) rather than failing.
+        let msg: ClientMessage = serde_json::from_str(
+            r#"{"HelloVhost":{"subdomain":"app","client_id":"c","notes":null,"basic_auth":false}}"#,
+        )
+        .expect("legacy HelloVhost must still deserialize");
+        match msg {
+            ClientMessage::HelloVhost {
+                subdomain,
+                backend_tls,
+                backend_tls_sni,
+                ..
+            } => {
+                assert_eq!(subdomain, "app");
+                assert!(!backend_tls, "missing backend_tls defaults to false");
+                assert_eq!(backend_tls_sni, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_vhost_backend_tls_serde_roundtrip() {
+        // The new fields survive a full serialize/deserialize round-trip.
+        let full = ClientMessage::HelloVhost {
+            subdomain: "app".into(),
+            client_id: "c".into(),
+            notes: None,
+            basic_auth: false,
+            carriers: 0,
+            udp: false,
+            webserver_log: false,
+            auto_reconnect: false,
+            local_host: Some("localhost".into()),
+            local_port: 3005,
+            https_policy: None,
+            backend_tls: true,
+            backend_tls_sni: Some("app.internal".into()),
+        };
+        let back: ClientMessage =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        match back {
+            ClientMessage::HelloVhost {
+                backend_tls,
+                backend_tls_sni,
+                ..
+            } => {
+                assert!(backend_tls, "backend_tls must round-trip on the wire");
+                assert_eq!(backend_tls_sni.as_deref(), Some("app.internal"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn tunnelopts_compat_missing_new_fields_default() {
         // I-COMPAT (D4): an old client omits `carriers`/`udp`/`auto_reconnect`;
         // a new server must read them as their defaults rather than failing.
@@ -1720,6 +2094,7 @@ mod tests {
             max_conns: 0,
             local_host: None,
             local_port: 0,
+            https_policy: None,
         };
         let json = serde_json::to_string(&full).unwrap();
         let back: TunnelOptions = serde_json::from_str(&json).unwrap();
@@ -1740,14 +2115,217 @@ mod tests {
                 peer_selected_stun,
                 tuning,
                 peer_id: _,
+                v2,
             } => {
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
                 assert_eq!(peer, vec!["127.0.0.1:3478".parse().unwrap()]);
                 assert_eq!(peer_selected_stun, None);
                 assert_eq!(tuning, UdpDirectTuning::default());
+                assert!(v2.is_none(), "old frame must decode with v2 = None");
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    /// Wire matrix old/new (Fase 1): an old-format offer (plain address list
+    /// only) decodes with empty v2 fields; a v2 offer round-trips; and a v2
+    /// offer serialized then read by an "old" decoder still exposes the legacy
+    /// list (serde_json ignores unknown struct fields).
+    #[test]
+    fn udp_offer_v2_wire_matrix() {
+        // old client → new server
+        let old: UdpCandidateOffer = serde_json::from_str(
+            r#"{"candidates":["198.51.100.1:4000"],"selected_stun":"s:3478","peer_id":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.candidates.len(), 1);
+        assert!(old.typed_candidates.is_empty());
+        assert_eq!(old.generation, 0);
+        assert!(old.capabilities.is_empty());
+        assert!(old.profile_hint.is_none());
+        assert!(old.profile.is_none());
+
+        // new → new roundtrip
+        let full = UdpCandidateOffer {
+            candidates: vec!["198.51.100.1:4000".parse().unwrap()],
+            selected_stun: Some("s:3478".into()),
+            peer_id: 3,
+            typed_candidates: vec![UdpTypedCandidate {
+                addr: "198.51.100.1:4000".parse().unwrap(),
+                kind: UdpCandidateKind::Reflexive,
+                priority: 800,
+            }],
+            generation: 2,
+            capabilities: vec![UDP_CAP_CANDIDATE_V2.to_string()],
+            profile_hint: Some("cone".into()),
+            profile: Some(UdpNatProfile {
+                mapping: UdpNatMapping::Eim,
+                filtering: UdpNatFiltering::Unknown,
+                port_preserved: Some(true),
+                observations: 2,
+            }),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        let back: UdpCandidateOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.typed_candidates, full.typed_candidates);
+        assert_eq!(back.generation, 2);
+        assert_eq!(back.capabilities, full.capabilities);
+        assert_eq!(back.profile_hint.as_deref(), Some("cone"));
+        assert_eq!(back.profile, full.profile);
+        // The legacy list is intact inside the v2 frame (old server reads it).
+        assert_eq!(back.candidates, full.candidates);
+
+        // A profile-less offer must not even carry the `profile` key, so a
+        // legacy pair's frame stays byte-identical (Fase 3 zero-regression).
+        let no_profile = UdpCandidateOffer {
+            profile: None,
+            ..full.clone()
+        };
+        let json = serde_json::to_string(&no_profile).unwrap();
+        assert!(
+            !json.contains("\"profile\""),
+            "profile key must be absent when None: {json}"
+        );
+    }
+
+    /// The WORST-CASE control frame — an `UdpPunch` whose v2 rider carries the
+    /// full 16-candidate list (legacy + typed), capabilities, and an adaptive
+    /// plan — must fit `MAX_FRAME_LENGTH` with headroom. Fase-3 regression
+    /// pin: the old 1024-byte cap silently broke UDP negotiation ("frame
+    /// error, invalid byte length") once port prediction pushed the rider
+    /// past it.
+    #[test]
+    fn udp_punch_worst_case_fits_frame_limit() {
+        let addr =
+            |i: u16| -> SocketAddr { format!("203.111.222.133:{}", 40_000 + i).parse().unwrap() };
+        let peers: Vec<SocketAddr> = (0..16).map(addr).collect();
+        let msg = ServerMessage::UdpPunch {
+            nonce: [255; UDP_NONCE_LEN],
+            peer: peers.clone(),
+            peer_selected_stun: Some("stun.some-long-hostname.example.com:3478".into()),
+            tuning: UdpDirectTuning::default(),
+            peer_id: u32::MAX,
+            v2: Some(UdpPunchV2 {
+                generation: u32::MAX,
+                peer_typed: peers
+                    .iter()
+                    .map(|&addr| UdpTypedCandidate {
+                        addr,
+                        kind: UdpCandidateKind::RouterMapped,
+                        priority: u32::MAX,
+                    })
+                    .collect(),
+                peer_capabilities: vec![
+                    UDP_CAP_CANDIDATE_V2.to_string(),
+                    UDP_CAP_CHECK_V1.to_string(),
+                ],
+                plan: Some(UdpAdaptivePlan {
+                    mode: UdpAdaptiveMode::DirectWithRetry,
+                    candidate_order: vec![
+                        UdpAdaptiveCandidateKind::Local,
+                        UdpAdaptiveCandidateKind::Reflexive,
+                        UdpAdaptiveCandidateKind::RouterMapped,
+                        UdpAdaptiveCandidateKind::Predicted,
+                        UdpAdaptiveCandidateKind::RelayFallback,
+                    ],
+                    retry_budget: u8::MAX,
+                    read_timeout_ms: u64::MAX,
+                    send_delay_ms: u64::MAX,
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.len() < MAX_FRAME_LENGTH - 1024,
+            "worst-case UdpPunch is {} bytes; needs >1 KiB headroom under \
+             MAX_FRAME_LENGTH ({MAX_FRAME_LENGTH})",
+            json.len()
+        );
+    }
+
+    /// Wire matrix old/new (Fase 1): `UdpPunch` with a v2 rider round-trips,
+    /// and a v2-less legacy frame stays legacy. A legacy pair's frame must not
+    /// even carry the `v2` key (skip_serializing_if).
+    #[test]
+    fn udp_punch_v2_wire_matrix() {
+        let with_v2 = ServerMessage::UdpPunch {
+            nonce: [1; UDP_NONCE_LEN],
+            peer: vec!["198.51.100.1:4000".parse().unwrap()],
+            peer_selected_stun: None,
+            tuning: UdpDirectTuning::default(),
+            peer_id: 0,
+            v2: Some(UdpPunchV2 {
+                generation: 5,
+                peer_typed: vec![UdpTypedCandidate {
+                    addr: "198.51.100.1:4000".parse().unwrap(),
+                    kind: UdpCandidateKind::Reflexive,
+                    priority: 800,
+                }],
+                peer_capabilities: vec![UDP_CAP_CANDIDATE_V2.to_string()],
+                plan: None,
+            }),
+        };
+        let json = serde_json::to_string(&with_v2).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMessage::UdpPunch { v2: Some(v2), .. } => {
+                assert_eq!(v2.generation, 5);
+                assert_eq!(v2.peer_typed.len(), 1);
+                assert!(v2.plan.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Rider WITH an adaptive plan (Fase 3) round-trips, and an old
+        // (Fase 1/2) client deserializes it fine — plan is serde(default).
+        let with_plan = ServerMessage::UdpPunch {
+            nonce: [1; UDP_NONCE_LEN],
+            peer: vec!["198.51.100.1:4000".parse().unwrap()],
+            peer_selected_stun: None,
+            tuning: UdpDirectTuning::default(),
+            peer_id: 0,
+            v2: Some(UdpPunchV2 {
+                generation: 6,
+                peer_typed: vec![],
+                peer_capabilities: vec![UDP_CAP_CHECK_V1.to_string()],
+                plan: Some(UdpAdaptivePlan {
+                    mode: UdpAdaptiveMode::DirectWithRetry,
+                    candidate_order: vec![
+                        UdpAdaptiveCandidateKind::Local,
+                        UdpAdaptiveCandidateKind::Reflexive,
+                        UdpAdaptiveCandidateKind::RelayFallback,
+                    ],
+                    retry_budget: 2,
+                    read_timeout_ms: 500,
+                    send_delay_ms: 25,
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&with_plan).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ServerMessage::UdpPunch { v2: Some(v2), .. } => {
+                assert_eq!(v2.check_generation(), Some(6));
+                let plan = v2.plan.expect("plan must round-trip");
+                assert_eq!(plan.mode, UdpAdaptiveMode::DirectWithRetry);
+                assert_eq!(plan.retry_budget, 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let legacy = ServerMessage::UdpPunch {
+            nonce: [1; UDP_NONCE_LEN],
+            peer: vec![],
+            peer_selected_stun: None,
+            tuning: UdpDirectTuning::default(),
+            peer_id: 0,
+            v2: None,
+        };
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("\"v2\""),
+            "legacy pair frames must stay byte-identical (no v2 key): {json}"
+        );
     }
 
     #[test]
@@ -1765,6 +2343,8 @@ mod tests {
                 options,
                 tuning,
                 adaptive_plan,
+                recandidate,
+                generation,
             } => {
                 assert_eq!(role, UdpTestRole::Listener);
                 assert_eq!(nonce, [0; UDP_NONCE_LEN]);
@@ -1772,6 +2352,9 @@ mod tests {
                 assert_eq!(peer_summary.nat_class, "Open");
                 assert!(peer_summary.candidate_kinds.is_empty());
                 assert_eq!(peer_summary.selected_stun, None);
+                // Old-server frame: the retry-round capability fields default off.
+                assert!(!recandidate);
+                assert_eq!(generation, 0);
                 assert!(!options.bandwidth);
                 assert_eq!(options.transfer_quota, 1024);
                 assert!(!options.udp_only);
@@ -1891,6 +2474,8 @@ fn control_frame_summary_includes_test_udp_plan() {
             read_timeout_ms: 750,
             send_delay_ms: 0,
         }),
+        recandidate: true,
+        generation: 0,
     };
 
     let summary = msg.control_frame_summary();
@@ -1912,6 +2497,9 @@ fn hello_vhost_round_trips_and_fits_frame() {
         auto_reconnect: true,
         local_host: None,
         local_port: 0,
+        https_policy: None,
+        backend_tls: false,
+        backend_tls_sni: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -2284,4 +2872,138 @@ fn tunnel_options_serde_default_webserver_log() {
     let json = r#"{"https":false,"force_https":false,"basic_auth":null,"notes":null,"carriers":0,"udp":false,"auto_reconnect":false}"#;
     let opts: TunnelOptions = serde_json::from_str(json).unwrap();
     assert!(!opts.webserver_log);
+}
+
+#[test]
+fn https_policy_serde_roundtrip() {
+    assert_eq!(
+        serde_json::to_string(&HttpsPolicy::Redirect).unwrap(),
+        "\"redirect\""
+    );
+    assert_eq!(serde_json::to_string(&HttpsPolicy::On).unwrap(), "\"on\"");
+    assert_eq!(serde_json::to_string(&HttpsPolicy::Off).unwrap(), "\"off\"");
+    let redirect: HttpsPolicy = serde_json::from_str("\"redirect\"").unwrap();
+    assert_eq!(redirect, HttpsPolicy::Redirect);
+    let on: HttpsPolicy = serde_json::from_str("\"on\"").unwrap();
+    assert_eq!(on, HttpsPolicy::On);
+    let off: HttpsPolicy = serde_json::from_str("\"off\"").unwrap();
+    assert_eq!(off, HttpsPolicy::Off);
+}
+
+#[test]
+fn https_policy_valueenum_parse() {
+    use clap::ValueEnum;
+    let on = HttpsPolicy::from_str("on", false).unwrap();
+    assert_eq!(on, HttpsPolicy::On);
+    let off = HttpsPolicy::from_str("off", false).unwrap();
+    assert_eq!(off, HttpsPolicy::Off);
+    let redirect = HttpsPolicy::from_str("redirect", false).unwrap();
+    assert_eq!(redirect, HttpsPolicy::Redirect);
+    let invalid = HttpsPolicy::from_str("bogus", false);
+    assert!(invalid.is_err());
+}
+
+#[test]
+fn resolve_policy_off() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Off, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(!downgraded);
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Off, true);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_on_capable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::On, true);
+    assert!(https);
+    assert!(!force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_on_incapable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::On, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(downgraded);
+}
+
+#[test]
+fn resolve_policy_redirect_capable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Redirect, true);
+    assert!(https);
+    assert!(force_https);
+    assert!(!downgraded);
+}
+
+#[test]
+fn resolve_policy_redirect_incapable() {
+    let (https, force_https, downgraded) = resolve_https_policy(HttpsPolicy::Redirect, false);
+    assert!(!https);
+    assert!(!force_https);
+    assert!(downgraded);
+}
+
+#[test]
+fn server_message_warning_roundtrip() {
+    let msg = ServerMessage::Warning("test warning".to_string());
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ServerMessage = serde_json::from_str(&json).unwrap();
+    match back {
+        ServerMessage::Warning(text) => assert_eq!(text, "test warning"),
+        _ => panic!("unexpected variant"),
+    }
+}
+
+#[test]
+fn server_message_warning_is_last_variant() {
+    let ok_msg = serde_json::from_str::<ServerMessage>(r#"{"Ok":null}"#).unwrap();
+    match ok_msg {
+        ServerMessage::Ok => {}
+        _ => panic!("unexpected variant"),
+    }
+}
+
+#[test]
+fn tunnel_options_default_policy_none() {
+    let opts = TunnelOptions::default();
+    assert!(opts.https_policy.is_none());
+}
+
+#[test]
+fn hello_vhost_serde_omits_default_policy() {
+    let msg = ClientMessage::HelloVhost {
+        subdomain: "test".to_string(),
+        client_id: "id".to_string(),
+        notes: None,
+        basic_auth: false,
+        carriers: 0,
+        udp: false,
+        webserver_log: false,
+        auto_reconnect: false,
+        local_host: None,
+        local_port: 0,
+        https_policy: None,
+        backend_tls: false,
+        backend_tls_sni: None,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    let round: ClientMessage = serde_json::from_str(&json).unwrap();
+    match round {
+        ClientMessage::HelloVhost { https_policy, .. } => {
+            assert!(https_policy.is_none());
+        }
+        _ => panic!("unexpected variant"),
+    }
+    let legacy_json = r#"{"HelloVhost":{"subdomain":"test","client_id":"id","notes":null,"basic_auth":false,"carriers":0,"udp":false,"webserver_log":false,"auto_reconnect":false,"local_host":null,"local_port":0}}"#;
+    let legacy: ClientMessage = serde_json::from_str(legacy_json).unwrap();
+    match legacy {
+        ClientMessage::HelloVhost { https_policy, .. } => {
+            assert!(https_policy.is_none());
+        }
+        _ => panic!("unexpected variant"),
+    }
 }

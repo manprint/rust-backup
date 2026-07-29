@@ -221,13 +221,20 @@ async fn setup_direct_inner(
     // One socket is used for both candidate gathering and QUIC, so any STUN
     // reflexive mapping stays valid for the hole-punched connection.
     let socket = bind_socket(0).await?;
-    let candidates = gather_candidates(&socket).await?;
+    let mut candidates = gather_candidates(&socket).await?;
+    crate::shared::sanitize_and_log("local offer", &mut candidates);
+    if candidates.is_empty() {
+        anyhow::bail!("no usable local candidates");
+    }
     control
         .send_client(ClientMsg::UdpCandidateOffer { addrs: candidates })
         .await
         .map_err(|e| anyhow::anyhow!("send candidate offer: {e}"))?;
 
-    let peer_addrs = recv_punch(control).await?;
+    let mut peer_addrs = recv_punch(control).await?;
+    // Defense in depth: the broker already sanitizes, but the punch/dial entry
+    // point never trusts a peer-controlled list either.
+    crate::shared::sanitize_and_log("peer punch", &mut peer_addrs);
     if peer_addrs.is_empty() {
         anyhow::bail!("no peer candidates");
     }

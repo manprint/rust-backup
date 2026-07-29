@@ -61,6 +61,11 @@ pub enum DataFrame {
     },
     /// No more items on this substream.
     StreamEnd,
+    /// The producer failed mid-stream and will send nothing further. Carried in
+    /// the DATA family (not [`ControlFrame::Abort`]) because in the single-substream
+    /// session the peer is parsing `DataFrame`s at this point — a control-family
+    /// frame would surface as an opaque deserialize error instead of a reason.
+    Abort { reason: String },
 }
 
 /// Write a length-prefixed JSON frame.

@@ -24,7 +24,7 @@ use crate::mux;
 /// when that connection drops so the pool can prune it.
 pub struct Carrier {
     /// Opener for the connection this carrier represents.
-    pub opener: mux::Opener,
+    pub opener: mux::LinkOpener,
     /// Set while the connection is alive; cleared by the task holding the
     /// connection when it drops.
     pub alive: Arc<AtomicBool>,
@@ -32,7 +32,7 @@ pub struct Carrier {
 
 impl Carrier {
     /// A carrier marked alive.
-    pub fn new(opener: mux::Opener) -> Self {
+    pub fn new(opener: mux::LinkOpener) -> Self {
         Self {
             opener,
             alive: Arc::new(AtomicBool::new(true)),
@@ -76,7 +76,7 @@ pub struct CarrierPool {
 impl CarrierPool {
     /// A pool seeded with the first connection's opener (always considered live by
     /// its owner — when the first connection dies, the whole tunnel is torn down).
-    pub fn new(first: mux::Opener) -> Self {
+    pub fn new(first: mux::LinkOpener) -> Self {
         Self {
             carriers: Mutex::new(vec![Carrier::new(first)]),
             next: AtomicUsize::new(0),
@@ -106,7 +106,7 @@ impl CarrierPool {
 
     /// Pick the next live opener round-robin, pruning any that have died. Returns
     /// `None` only if every carrier has dropped.
-    pub fn pick(&self) -> Option<mux::Opener> {
+    pub fn pick(&self) -> Option<mux::LinkOpener> {
         let mut carriers = self.carriers.lock().expect("carrier pool mutex");
         carriers.retain(|c| c.alive.load(Ordering::Relaxed));
         if carriers.is_empty() {
@@ -125,5 +125,29 @@ pub async fn recv_carrier(
     match rx {
         Some((rx, _guard)) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pins the RAII contract the server relies on for BUG (CarrierToken leak):
+    // the token must be created into `pending_carriers` and a `TokenGuard` built
+    // BEFORE the fallible `CarrierToken` send, so that a send failure (`?`
+    // early-return) unwinds through this Drop and removes the orphaned token.
+    #[test]
+    fn token_guard_drop_removes_token() {
+        let registry: PendingCarriers = Arc::new(DashMap::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        registry.insert("tok-1".to_string(), tx);
+        {
+            let _guard = TokenGuard::new(Arc::clone(&registry), "tok-1".to_string());
+            assert!(registry.contains_key("tok-1"));
+        }
+        // Guard dropped (as it would on a `?` early-return before the send
+        // succeeds): the token is gone, no leak.
+        assert!(!registry.contains_key("tok-1"));
+        assert!(registry.is_empty());
     }
 }

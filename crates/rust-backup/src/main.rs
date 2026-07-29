@@ -5,12 +5,17 @@
 //! connection params are assembled from typed common flags plus `-P key=value`
 //! escapes into a JSON object that each module deserializes — so a new module
 //! needs no new common flags (I-MODULAR at the CLI too).
+//!
+//! CONFIG PRECEDENCE (D10): CLI > env > YAML. clap resolves CLI vs env; the YAML
+//! target (matched by module+role in `--config`) is the underlay merged field by
+//! field in [`resolve_target`], so a flag left unset falls through to YAML and
+//! then to the built-in default.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rb_core::config::{Role, ServerConfig, SessionConfig, TransportConfig};
+use rb_core::config::{Role, ServerConfig, SessionConfig, TargetSpec, TransportConfig};
 use rb_core::module::{ModuleRegistry, TargetParams};
 use rb_core::plan::BackupPlan;
 use rb_core::progress::Progress;
@@ -43,6 +48,8 @@ enum Cmd {
         #[arg(long, env = "RUST_BACKUP_FAIL_FAST")]
         fail_fast: bool,
     },
+    /// Dry-run: analyze a source and print its plan; no transport, no transfer.
+    Plan(PlanArgs),
     /// PostgreSQL backup/restore (10..=latest).
     Postgres(TargetArgs),
     /// MongoDB backup/restore (4..=8).
@@ -74,33 +81,38 @@ enum CliRole {
     Destination,
 }
 
-#[derive(Args)]
-struct TargetArgs {
-    /// Which side to run.
-    role: CliRole,
+impl From<CliRole> for Role {
+    fn from(r: CliRole) -> Role {
+        match r {
+            CliRole::Source => Role::Source,
+            CliRole::Destination => Role::Destination,
+        }
+    }
+}
 
-    // --- transport ---
-    #[arg(long, env = "RUST_BACKUP_TO")]
-    to: String,
-    #[arg(long, env = "RUST_BACKUP_CHANNEL")]
-    channel: String,
-    #[arg(long, env = "RUST_BACKUP_SECRET")]
-    secret: Option<String>,
-    #[arg(long, env = "RUST_BACKUP_CARRIERS", default_value_t = 1)]
-    carriers: u32,
-    /// Disable the direct UDP/QUIC path (relay only).
-    #[arg(long = "no-udp")]
-    no_udp: bool,
-    #[arg(long)]
-    insecure: bool,
-    /// Aggregate payload limit in bytes/second (0/unset means unlimited).
-    #[arg(long, env = "RUST_BACKUP_MAX_RATE")]
-    max_rate: Option<u64>,
-    /// Auto-accept the plan (destination only).
-    #[arg(long = "yes")]
-    yes: bool,
+/// Module name accepted by the `plan` dry-run subcommand.
+#[derive(Clone, Copy, ValueEnum)]
+enum CliModule {
+    Postgres,
+    Mongodb,
+    Filesystem,
+    S3,
+}
 
-    // --- common module params (folded into the params JSON when set) ---
+impl CliModule {
+    fn name(self) -> &'static str {
+        match self {
+            CliModule::Postgres => "postgres",
+            CliModule::Mongodb => "mongodb",
+            CliModule::Filesystem => "filesystem",
+            CliModule::S3 => "s3",
+        }
+    }
+}
+
+/// Module connection params, shared by the transfer subcommands and `plan`.
+#[derive(Args, Default)]
+struct ModuleParamArgs {
     #[arg(long)]
     host: Option<String>,
     #[arg(long)]
@@ -153,26 +165,52 @@ struct TargetArgs {
     #[arg(short = 'P', long = "param")]
     param: Vec<String>,
 
-    /// YAML config underlay.
+    /// YAML config underlay (values not set on the CLI/env come from here).
     #[arg(long, env = "RUST_BACKUP_CONFIG")]
     config: Option<String>,
 }
 
-impl TargetArgs {
-    fn transport(&self) -> TransportConfig {
-        TransportConfig {
-            to: self.to.clone(),
-            channel: self.channel.clone(),
-            secret: self.secret.clone(),
-            carriers: self.carriers,
-            udp: !self.no_udp,
-            insecure: self.insecure,
-            max_rate: self.max_rate.filter(|rate| *rate > 0),
-        }
-    }
+#[derive(Args)]
+struct TargetArgs {
+    /// Which side to run.
+    role: CliRole,
 
-    /// Assemble the module params JSON from the set typed flags + `-P` escapes.
-    fn params(&self) -> anyhow::Result<TargetParams> {
+    // --- transport (each optional so a YAML underlay can supply it) ---
+    #[arg(long, env = "RUST_BACKUP_TO")]
+    to: Option<String>,
+    #[arg(long, env = "RUST_BACKUP_CHANNEL")]
+    channel: Option<String>,
+    #[arg(long, env = "RUST_BACKUP_SECRET")]
+    secret: Option<String>,
+    #[arg(long, env = "RUST_BACKUP_CARRIERS")]
+    carriers: Option<u32>,
+    /// Disable the direct UDP/QUIC path (relay only).
+    #[arg(long = "no-udp")]
+    no_udp: bool,
+    #[arg(long)]
+    insecure: bool,
+    /// Aggregate payload limit in bytes/second (0/unset means unlimited).
+    #[arg(long, env = "RUST_BACKUP_MAX_RATE")]
+    max_rate: Option<u64>,
+    /// Auto-accept the plan (destination only).
+    #[arg(long = "yes")]
+    yes: bool,
+
+    #[command(flatten)]
+    module: ModuleParamArgs,
+}
+
+#[derive(Args)]
+struct PlanArgs {
+    /// Module to analyze.
+    module: CliModule,
+    #[command(flatten)]
+    params: ModuleParamArgs,
+}
+
+impl ModuleParamArgs {
+    /// The typed flags + `-P` escapes as a JSON object (CLI/env layer only).
+    fn overlay(&self) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
         use serde_json::{Map, Value};
         let mut m = Map::new();
         let mut put_str = |k: &str, v: &Option<String>| {
@@ -220,8 +258,91 @@ impl TargetArgs {
                 .ok_or_else(|| anyhow!("-P expects key=value, got '{kv}'"))?;
             m.insert(k.to_string(), parse_scalar(v));
         }
-        Ok(TargetParams(Value::Object(m)))
+        Ok(m)
     }
+
+    /// The YAML target this invocation sits on top of, if any.
+    fn underlay(&self, module: &str, role: Role) -> anyhow::Result<Option<TargetSpec>> {
+        let Some(path) = &self.config else {
+            return Ok(None);
+        };
+        let cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+        Ok(cfg
+            .targets
+            .into_iter()
+            .find(|t| t.module == module && t.role == role))
+    }
+}
+
+/// Merge the YAML underlay params with the CLI/env overlay (overlay wins per key).
+fn merge_params(
+    underlay: Option<&serde_json::Value>,
+    overlay: serde_json::Map<String, serde_json::Value>,
+) -> TargetParams {
+    use serde_json::Value;
+    let mut base = match underlay {
+        Some(Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (k, v) in overlay {
+        base.insert(k, v);
+    }
+    TargetParams(Value::Object(base))
+}
+
+/// Resolve transport + params + accept policy for one CLI target.
+fn resolve_target(
+    a: &TargetArgs,
+    module: &str,
+    role: Role,
+) -> anyhow::Result<(TransportConfig, TargetParams, bool)> {
+    let underlay = a.module.underlay(module, role)?;
+    let mut transport = underlay
+        .as_ref()
+        .map(|t| t.transport.clone())
+        .unwrap_or_default();
+
+    if let Some(to) = &a.to {
+        transport.to = to.clone();
+    }
+    if let Some(channel) = &a.channel {
+        transport.channel = channel.clone();
+    }
+    if a.secret.is_some() {
+        transport.secret = a.secret.clone();
+    }
+    if let Some(carriers) = a.carriers {
+        transport.carriers = carriers;
+    }
+    if a.no_udp {
+        transport.udp = false;
+    }
+    if a.insecure {
+        transport.insecure = true;
+    }
+    if a.max_rate.is_some() {
+        transport.max_rate = a.max_rate.filter(|rate| *rate > 0);
+    }
+
+    if transport.to.is_empty() {
+        return Err(anyhow!("--to is required (or set it in --config)"));
+    }
+    if transport.channel.is_empty() {
+        return Err(anyhow!("--channel is required (or set it in --config)"));
+    }
+    // Multi-carrier item distribution is not implemented yet; accepting the flag
+    // silently would promise parallelism the session does not deliver.
+    if transport.carriers > 1 {
+        return Err(anyhow!(
+            "carriers={} requested but this build streams on a single carrier; \
+             use carriers=1",
+            transport.carriers
+        ));
+    }
+
+    let params = merge_params(underlay.as_ref().map(|t| &t.params), a.module.overlay()?);
+    let auto_accept = a.yes || underlay.as_ref().is_some_and(|t| t.auto_accept);
+    Ok((transport, params, auto_accept))
 }
 
 fn parse_scalar(v: &str) -> serde_json::Value {
@@ -273,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
             parallel_targets,
             fail_fast,
         } => run_session(&registry, &config, parallel_targets, fail_fast).await,
+        Cmd::Plan(a) => print_plan(&registry, &a).await,
         Cmd::Postgres(a) => run_target(&registry, "postgres", &a).await,
         Cmd::Mongodb(a) => run_target(&registry, "mongodb", &a).await,
         Cmd::Filesystem(a) => run_target(&registry, "filesystem", &a).await,
@@ -285,13 +407,24 @@ async fn run_target(reg: &ModuleRegistry, module: &str, a: &TargetArgs) -> anyho
     let m = reg
         .get(module)
         .ok_or_else(|| anyhow!("unknown module '{module}'"))?;
-    let params = a.params()?;
-    let transport = a.transport();
-    let role = match a.role {
-        CliRole::Source => Role::Source,
-        CliRole::Destination => Role::Destination,
-    };
-    execute(&m, role, &transport, &params, a.yes).await
+    let role: Role = a.role.into();
+    let (transport, params, auto_accept) = resolve_target(a, module, role)?;
+    execute(&m, role, &transport, &params, auto_accept).await
+}
+
+/// `plan` dry-run: open the source read-only, analyze, print the plan. No
+/// transport is established and nothing is transferred; the source is only read.
+async fn print_plan(reg: &ModuleRegistry, a: &PlanArgs) -> anyhow::Result<()> {
+    let module = a.module.name();
+    let m = reg
+        .get(module)
+        .ok_or_else(|| anyhow!("unknown module '{module}'"))?;
+    let underlay = a.params.underlay(module, Role::Source)?;
+    let params = merge_params(underlay.as_ref().map(|t| &t.params), a.params.overlay()?);
+    let src = m.open_source(&params).await.map_err(|e| anyhow!("{e}"))?;
+    let plan = src.analyze().await.map_err(|e| anyhow!("{e}"))?;
+    println!("{}", plan.render());
+    Ok(())
 }
 
 /// Run a multi-target session from YAML.
@@ -389,6 +522,38 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
     }
 }
 
+/// How often a running transfer logs its progress line (I-OBSERV).
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Periodic progress reporter (phase-agnostic: it renders whatever counters the
+/// session has published). Aborted with its guard when the run ends, so a
+/// finished run never keeps logging.
+struct ProgressReporter(tokio::task::JoinHandle<()>);
+
+impl ProgressReporter {
+    fn spawn(progress: Progress, label: String) -> Self {
+        ProgressReporter(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
+            tick.tick().await; // the first tick fires immediately
+            loop {
+                tick.tick().await;
+                tracing::info!(
+                    target_label = %label,
+                    "{}",
+                    progress.line(started.elapsed().as_secs_f64())
+                );
+            }
+        }))
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Connect the transport for `role` and drive the session.
 async fn execute(
     module: &Arc<dyn rb_core::BackupModule>,
@@ -398,6 +563,8 @@ async fn execute(
     auto_accept: bool,
 ) -> anyhow::Result<()> {
     let progress = Progress::default();
+    let _reporter =
+        ProgressReporter::spawn(progress.clone(), format!("{}/{:?}", module.name(), role));
     match role {
         Role::Source => {
             let src = module
@@ -457,4 +624,180 @@ fn init_tracing(verbose: u8) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn write_yaml(body: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rust-backup-cli-test-{}-{:?}.yml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, body).expect("write test yaml");
+        path
+    }
+
+    const YAML: &str = r#"
+targets:
+  - module: postgres
+    role: source
+    transport: { to: yaml-coord:7835, channel: yaml-ch, secret: yaml-secret, carriers: 1, udp: true }
+    params: { host: yaml-db, user: yaml-ro, port: 5433 }
+  - module: postgres
+    role: destination
+    transport: { to: yaml-coord:7835, channel: yaml-ch }
+    params: { host: yaml-db-b, admin: true }
+    auto_accept: true
+"#;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("cli parses")
+    }
+
+    /// D10: a flag left unset falls through to the YAML target; a flag that IS
+    /// set overrides it, per field.
+    #[test]
+    fn cli_overrides_yaml_per_field() {
+        let yaml = write_yaml(YAML);
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "source",
+            "--channel",
+            "cli-ch",
+            "--host",
+            "cli-db",
+            "--config",
+            yaml.to_str().expect("utf8 path"),
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (transport, params, auto_accept) =
+            resolve_target(&a, "postgres", Role::Source).expect("resolve");
+        // From YAML (not set on the CLI):
+        assert_eq!(transport.to, "yaml-coord:7835");
+        assert_eq!(transport.secret.as_deref(), Some("yaml-secret"));
+        assert_eq!(params.0["user"], "yaml-ro");
+        assert_eq!(params.0["port"], 5433);
+        // Overridden on the CLI:
+        assert_eq!(transport.channel, "cli-ch");
+        assert_eq!(params.0["host"], "cli-db");
+        assert!(!auto_accept);
+        std::fs::remove_file(yaml).ok();
+    }
+
+    /// The underlay is selected by module AND role: the destination row supplies
+    /// its own params and `auto_accept`.
+    #[test]
+    fn underlay_is_matched_by_role() {
+        let yaml = write_yaml(YAML);
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--config",
+            yaml.to_str().expect("utf8 path"),
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (transport, params, auto_accept) =
+            resolve_target(&a, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(transport.channel, "yaml-ch");
+        assert_eq!(params.0["host"], "yaml-db-b");
+        assert_eq!(params.0["admin"], true);
+        assert!(auto_accept, "auto_accept comes from the YAML target");
+        std::fs::remove_file(yaml).ok();
+    }
+
+    /// Without a YAML underlay the transport essentials are mandatory.
+    #[test]
+    fn missing_transport_essentials_are_rejected() {
+        let cli = parse(&["rust-backup", "filesystem", "source", "--root", "/data"]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
+        let err = resolve_target(&a, "filesystem", Role::Source).expect_err("must fail");
+        assert!(err.to_string().contains("--to is required"), "{err}");
+    }
+
+    /// Multi-carrier is not implemented; asking for it fails loudly rather than
+    /// silently degrading to one carrier.
+    #[test]
+    fn multi_carrier_is_rejected() {
+        let cli = parse(&[
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--carriers",
+            "4",
+        ]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
+        let err = resolve_target(&a, "filesystem", Role::Source).expect_err("must fail");
+        assert!(err.to_string().contains("single carrier"), "{err}");
+    }
+
+    /// `-P key=value` beats the typed flag and keeps scalar typing.
+    #[test]
+    fn param_escape_overrides_typed_flag() {
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--host",
+            "flag-host",
+            "-P",
+            "host=escape-host",
+            "-P",
+            "port=6000",
+            "-P",
+            "overwrite=true",
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "postgres", Role::Source).expect("resolve");
+        assert_eq!(params.0["host"], "escape-host");
+        assert_eq!(params.0["port"], 6000);
+        assert_eq!(params.0["overwrite"], true);
+    }
+
+    /// The `plan` dry-run subcommand parses and carries module params only.
+    #[test]
+    fn plan_subcommand_parses() {
+        let cli = parse(&["rust-backup", "plan", "filesystem", "--root", "/srv/data"]);
+        let Cmd::Plan(a) = cli.cmd else {
+            panic!("expected plan subcommand")
+        };
+        assert_eq!(a.module.name(), "filesystem");
+        let overlay = a.params.overlay().expect("overlay");
+        assert_eq!(overlay["root"], "/srv/data");
+    }
+
+    /// Every registered module is reachable by name (I-MODULAR at the CLI).
+    #[test]
+    fn registry_exposes_all_modules() {
+        let reg = build_registry();
+        assert_eq!(
+            reg.names(),
+            vec!["filesystem", "mongodb", "postgres", "s3"],
+            "module registry names"
+        );
+    }
 }

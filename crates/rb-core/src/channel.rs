@@ -142,9 +142,18 @@ impl<S: DuplexStream> ChunkSink for StreamChunkSink<S> {
 }
 
 /// A [`ChunkSource`] backed by a single transport substream.
+///
+/// Verifies integrity at two levels without ever buffering an item: every chunk
+/// is checked against its own `ChunkStart.blake3`, and a running per-item hasher
+/// is folded chunk by chunk and compared against `ItemEnd.blake3`. A module
+/// therefore never applies bytes that failed either check.
 pub struct StreamChunkSource<S: DuplexStream> {
     stream: S,
     progress: Option<Progress>,
+    /// Running whole-item hashers, keyed by item id. An entry lives only while
+    /// the item is in flight (removed at `ItemEnd`), so memory is O(items in
+    /// flight), never O(bytes).
+    item_hashers: std::collections::HashMap<u32, blake3::Hasher>,
 }
 
 impl<S: DuplexStream> StreamChunkSource<S> {
@@ -152,6 +161,7 @@ impl<S: DuplexStream> StreamChunkSource<S> {
         Self {
             stream,
             progress: None,
+            item_hashers: std::collections::HashMap::new(),
         }
     }
     /// As [`Self::new`] but increments `progress` as chunks/items arrive.
@@ -159,6 +169,7 @@ impl<S: DuplexStream> StreamChunkSource<S> {
         Self {
             stream,
             progress: Some(progress),
+            item_hashers: std::collections::HashMap::new(),
         }
     }
     /// Recover the underlying stream (e.g. to read a trailing control frame).
@@ -173,12 +184,25 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
         let frame: Option<DataFrame> = wire::recv_frame(&mut self.stream).await?;
         match frame {
             None | Some(DataFrame::StreamEnd) => Ok(ChunkEvent::End),
+            Some(DataFrame::Abort { reason }) => Err(BackupError::phase(
+                Phase::Transfer,
+                format!("source aborted mid-stream: {reason}"),
+            )),
             Some(DataFrame::ChunkStart {
                 item_id,
                 offset,
                 len,
                 blake3,
             }) => {
+                // A peer-declared length is never trusted for allocation: the
+                // sender is bound by CHUNK_SIZE, so anything larger is a protocol
+                // violation, not a 4 GiB buffer to allocate.
+                if len as usize > wire::CHUNK_SIZE {
+                    return Err(BackupError::phase(
+                        Phase::Transfer,
+                        format!("incoming chunk len {len} exceeds CHUNK_SIZE"),
+                    ));
+                }
                 let mut data = vec![0u8; len as usize];
                 wire::read_exact_idle(&mut self.stream, &mut data).await?;
                 let got = wire::blake3_hex(&data);
@@ -187,6 +211,7 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                         "chunk item={item_id} offset={offset}: blake3 mismatch"
                     )));
                 }
+                self.item_hashers.entry(item_id).or_default().update(&data);
                 if let Some(p) = &self.progress {
                     p.add_bytes(data.len() as u64);
                 }
@@ -201,6 +226,16 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                 total,
                 blake3,
             }) => {
+                // Whole-item integrity: fold of every chunk received for this id.
+                // An item with no chunks hashes the empty input, which is exactly
+                // what the sender's whole-item digest is for a zero-byte item.
+                let hasher = self.item_hashers.remove(&item_id).unwrap_or_default();
+                let got = hasher.finalize().to_hex().to_string();
+                if got != blake3 {
+                    return Err(BackupError::Integrity(format!(
+                        "item={item_id}: whole-item blake3 mismatch (declared {blake3}, computed {got})"
+                    )));
+                }
                 if let Some(p) = &self.progress {
                     p.item_done();
                 }
@@ -225,9 +260,22 @@ pub async fn send_plan<S: DuplexStream>(
 }
 
 /// Destination: receive the plan.
+///
+/// A plan whose `format_version` this build does not understand is rejected here
+/// (the plan is self-contained, so a version we cannot interpret must never be
+/// half-applied).
 pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<crate::plan::BackupPlan> {
     match wire::recv_frame::<_, ControlFrame>(ctrl).await? {
-        Some(ControlFrame::Plan(p)) => Ok(*p),
+        Some(ControlFrame::Plan(p)) => {
+            if p.format_version != crate::plan::PLAN_FORMAT_VERSION {
+                return Err(BackupError::PlanRejected(format!(
+                    "unsupported plan format_version {} (this build understands {})",
+                    p.format_version,
+                    crate::plan::PLAN_FORMAT_VERSION
+                )));
+            }
+            Ok(*p)
+        }
         Some(ControlFrame::Abort { reason }) => Err(BackupError::PlanRejected(reason)),
         other => Err(BackupError::phase(
             Phase::Connect,
