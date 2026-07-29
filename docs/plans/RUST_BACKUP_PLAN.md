@@ -89,13 +89,15 @@ password credentials — faithful user restore is impossible from a logical dump
 mirrors postgres passwords-not-captured). Views and time-series collections are
 skipped (only `CollectionType::Collection` is backed up).
 
-**▶ NEXT: Phase 4 — Filesystem module** (`crates/rb-filesystem`, currently a
-stub). `std` + `nix`: recursive read-only walk → `FsPlanPayload` (kind/size/mode/
-uid/gid/mtime/symlink target/xattr), per-file byte streaming into `ChunkSink`
-(64 KiB reads, no whole-file buffer), restore recreating tree + mode/mtime always
-and uid/gid when privileged (`CAP_CHOWN`; preflight warns otherwise, D13),
-immutability tree hash with `O_NOATIME` reads. Module crates depend only on
-`rb-core`; never edit core to add a backend (I-MODULAR).
+**Phase 4 (Filesystem) — implementation in progress.** 4.1–4.4 now have an
+implemented, unit-tested core path: deterministic read-only walk, regular-file
+streaming in 64 KiB blocks, empty-destination restore with modes/mtimes plus
+symlink/hardlink recreation, ownership preflight (root/CAP_CHOWN detection), and
+tree fingerprinting with `O_NOATIME` attempted first. `cargo test -p
+rb-filesystem` passes (3 tests, 0 ignored). `--follow-symlinks` and
+`--preserve-xattr` fail explicitly rather than weakening containment or adding
+unsafe code. **Still required before marking the phase done:** privileged and
+non-privileged Linux e2e, including a mid-transfer I-IMMUT abort case.
 
 **Build/test:** `cargo build --all-features` · `cargo build --no-default-features`
 (relay-only, no quinn) · `cargo test --all-features` · `bash scripts/gates.sh` (full).
@@ -524,20 +526,24 @@ subcommand; relay channel moves bytes in an in-process e2e.
 
 - **4.1** *(Sonnet)* — `walk.rs`: recursive walk; per entry capture kind (file/dir/
   symlink/hardlink), size, mode, uid, gid, mtime, symlink target, xattr (optional) →
-  `FsPlanPayload`. Read-only. **Unit:** walk a tempdir fixture. **Done:** plan complete.
+  `FsPlanPayload`. Read-only. **Unit:** walk a tempdir fixture. **Status:** implemented;
+  xattrs deliberately rejected until a safe `std`+`nix` implementation is available.
 - **4.2** *(Sonnet)* — `source stream_out`: per file stream bytes into `ChunkSink`
-  (64 KiB reads, no whole-file buffer); dirs/symlinks are metadata-only items. **Done:** streamed.
+  (64 KiB reads, no whole-file buffer); dirs/symlinks are metadata-only items. **Status:**
+  implemented and unit-tested (including an over-64-KiB file).
 - **4.3 ⟦OPUS GATE⟧** *(Sonnet)* — `dest stream_in`: recreate tree; write file bytes;
   restore mode/mtime always; uid/gid when privileged (`chown`); **preflight warns +
   records when not root/`CAP_CHOWN`** (D13). Symlinks/hardlinks recreated. **Unit:**
   metadata roundtrip (non-root: mode preserved, ownership best-effort). **e2e:** root
-  netns case restores uid/gid exactly; non-root case preserves mode + warns. **Done:**
-  1:1 with documented sudo behavior.
+  netns case restores uid/gid exactly; non-root case preserves mode + warns. **Status:**
+  core + unit round-trip implemented; privileged/non-privileged live e2e pending.
 - **4.4 ⟦OPUS GATE⟧** *(Sonnet)* — immutability: source tree hash (path+meta+content)
   before/after; assert no atime/mtime write to source (open read-only, `O_NOATIME`
-  where available). **e2e:** T-FS-IMMUT mid-abort. **Done:** I-IMMUT for fs.
+  where available). **e2e:** T-FS-IMMUT mid-abort. **Status:** deterministic tree hash
+  and unit mutation detection implemented; live mid-abort/atime e2e pending.
 - **4.5** *(Haiku)* — `docs/modules/FILESYSTEM.md`: sudo/`CAP_CHOWN` matrix, xattr,
-  symlink/hardlink semantics. **Done:** documented.
+  symlink/hardlink semantics. **Status:** updated with current ownership, containment,
+  xattr and empty-destination semantics.
 
 ---
 
@@ -545,18 +551,24 @@ subcommand; relay channel moves bytes in an in-process e2e.
 
 > `aws-sdk-s3` + `aws-config`. Streaming GET→PUT (multipart), no temp.
 
+> **Status** *(2026-07-29)* — core implementation and `e2e/s3_minio_test.sh`
+> verified locally. The backend supports AWS credentials/MinIO endpoint overrides,
+> object metadata, bounded 5 MiB multipart restore, bucket creation/collision
+> preflight, best-effort bucket policy and source ETag fingerprints. ACLs, tags
+> and storage-class restoration are explicit prototype limits.
+
 - **5.1** *(Sonnet)* — connect/config (endpoint override for MinIO, path-style, creds);
-  list buckets/objects + metadata + (optional) policy/ACL → `S3PlanPayload`. **Done:** plan.
+  list buckets/objects + metadata + (optional) policy/ACL → `S3PlanPayload`. **Done** (policy best-effort; ACL unsupported).
 - **5.2** *(Sonnet)* — `source stream_out`: per object `GetObject` body byte-stream →
-  `ChunkSink`. **Done:** streamed.
+  `ChunkSink`. **Done.**
 - **5.3** *(Sonnet)* — `dest validate`: bucket exists/creatable, region, creds, target
-  empty/allowed. **Done:** checks.
+  empty/allowed. **Done.**
 - **5.4 ⟦OPUS GATE⟧** *(Sonnet)* — `dest stream_in`: create bucket; `PutObject` /
   multipart upload streamed from `ChunkSource`; preserve content-type/metadata/storage
-  class; ACL/policy. **e2e:** MinIO container 1:1. **Done:** 1:1.
+  class; ACL/policy. **Done with documented ACL/storage-class limit; MinIO e2e green.**
 - **5.5** *(Sonnet)* — immutability: source object listing + per-object ETag before/after
-  + mid-abort. **Done:** I-IMMUT for s3.
-- **5.6** *(Sonnet)* — `e2e/s3_minio_test.sh`. **Done:** green.
+  + mid-abort. **ETag fingerprint done; abort injection remains Phase 8 work.**
+- **5.6** *(Sonnet)* — `e2e/s3_minio_test.sh`. **Done, locally green.**
 
 ---
 
@@ -565,9 +577,11 @@ subcommand; relay channel moves bytes in an in-process e2e.
 - **6.1** *(Sonnet)* — `session.rs`: negotiate N data substreams (`carriers`); distribute
   items across carriers (one item = one carrier, never intra-item striping — reorder
   trap, mirror bore's flow-pinning note). Control stays on stream 0. **Unit:** N-carrier
-  distribution; carriers==1 byte-identical to Phase 0. **Done:** parallel + safe.
+  distribution; carriers==1 byte-identical to Phase 0. **Status: pending.** The current
+  module interface has one ordered sink, so item-pinned parallel carriers need a protocol change.
 - **6.2** *(Sonnet)* — explicit pacing option `--max-rate` (token bucket) on top of
-  natural backpressure, for shared links. **Unit:** rate limiter. **Done:** capped.
+  natural backpressure, for shared links. **Unit:** rate limiter. **Done:** `--max-rate` /
+  `TransportConfig.max_rate` paces sink writes without read-ahead.
 - **6.3** *(Sonnet)* — `e2e/bandwidth_netem.sh` (T-BW): netns + `tc netem` asymmetric
   bandwidth/RTT; assert source never buffers > window, transfer completes, no loss-induced
   corruption (BLAKE3). **Done:** I-BANDWIDTH proven under a real gap.
@@ -583,7 +597,8 @@ subcommand; relay channel moves bytes in an in-process e2e.
 - **7.3** *(Sonnet)* — `session_runner.rs`: run a `targets[]` list — sequential by default,
   bounded-concurrent with `--parallel-targets`; per-target tracing span + progress; one
   failed target doesn't abort siblings unless `--fail-fast`. **e2e:** 2-target YAML session.
-  **Done:** multi-target session runs.
+  **Core implemented:** bounded `parallel_targets` / `--parallel-targets` and `fail_fast` /
+  `--fail-fast`; the live two-target e2e remains pending.
 
 ---
 

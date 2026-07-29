@@ -42,6 +42,7 @@ async fn direct_path_activates_over_loopback() {
         carriers: 1,
         udp: true,
         insecure: true,
+        max_rate: None,
     };
     let src_cfg = mk();
     let dst_cfg = mk();

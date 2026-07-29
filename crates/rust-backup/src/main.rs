@@ -38,6 +38,10 @@ enum Cmd {
     Run {
         #[arg(long, env = "RUST_BACKUP_CONFIG")]
         config: String,
+        #[arg(long, env = "RUST_BACKUP_PARALLEL_TARGETS")]
+        parallel_targets: Option<usize>,
+        #[arg(long, env = "RUST_BACKUP_FAIL_FAST")]
+        fail_fast: bool,
     },
     /// PostgreSQL backup/restore (10..=latest).
     Postgres(TargetArgs),
@@ -89,6 +93,9 @@ struct TargetArgs {
     no_udp: bool,
     #[arg(long)]
     insecure: bool,
+    /// Aggregate payload limit in bytes/second (0/unset means unlimited).
+    #[arg(long, env = "RUST_BACKUP_MAX_RATE")]
+    max_rate: Option<u64>,
     /// Auto-accept the plan (destination only).
     #[arg(long = "yes")]
     yes: bool,
@@ -160,6 +167,7 @@ impl TargetArgs {
             carriers: self.carriers,
             udp: !self.no_udp,
             insecure: self.insecure,
+            max_rate: self.max_rate.filter(|rate| *rate > 0),
         }
     }
 
@@ -260,7 +268,11 @@ async fn main() -> anyhow::Result<()> {
                 .context("coordination server")?;
             Ok(())
         }
-        Cmd::Run { config } => run_session(&registry, &config).await,
+        Cmd::Run {
+            config,
+            parallel_targets,
+            fail_fast,
+        } => run_session(&registry, &config, parallel_targets, fail_fast).await,
         Cmd::Postgres(a) => run_target(&registry, "postgres", &a).await,
         Cmd::Mongodb(a) => run_target(&registry, "mongodb", &a).await,
         Cmd::Filesystem(a) => run_target(&registry, "filesystem", &a).await,
@@ -283,8 +295,26 @@ async fn run_target(reg: &ModuleRegistry, module: &str, a: &TargetArgs) -> anyho
 }
 
 /// Run a multi-target session from YAML.
-async fn run_session(reg: &ModuleRegistry, path: &str) -> anyhow::Result<()> {
-    let cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+async fn run_session(
+    reg: &ModuleRegistry,
+    path: &str,
+    requested_parallel: Option<usize>,
+    requested_fail_fast: bool,
+) -> anyhow::Result<()> {
+    let mut cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+    if let Some(parallel) = requested_parallel {
+        cfg.parallel_targets = parallel.max(1);
+    }
+    if requested_fail_fast {
+        cfg.fail_fast = true;
+    }
+    if cfg.parallel_targets <= 1 {
+        return run_session_sequential(reg, &cfg).await;
+    }
+    run_session_parallel(reg, &cfg).await
+}
+
+async fn run_session_sequential(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyhow::Result<()> {
     for (i, t) in cfg.targets.iter().enumerate() {
         tracing::info!(target = i, module = %t.module, role = ?t.role, "session target");
         let m = reg
@@ -296,6 +326,67 @@ async fn run_session(reg: &ModuleRegistry, path: &str) -> anyhow::Result<()> {
             .with_context(|| format!("target {i} ({}/{:?})", t.module, t.role))?;
     }
     Ok(())
+}
+
+async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyhow::Result<()> {
+    use tokio::task::JoinSet;
+    let mut pending = cfg.targets.iter().cloned().enumerate();
+    let mut running = JoinSet::new();
+    let mut errors = Vec::new();
+    loop {
+        while running.len() < cfg.parallel_targets {
+            let Some((i, target)) = pending.next() else {
+                break;
+            };
+            let module = reg
+                .get(&target.module)
+                .ok_or_else(|| anyhow!("unknown module '{}'", target.module))?;
+            running.spawn(async move {
+                let params = TargetParams(target.params.clone());
+                tracing::info!(target = i, module = %target.module, role = ?target.role, "session target");
+                execute(&module, target.role, &target.transport, &params, target.auto_accept).await
+                    .with_context(|| format!("target {i} ({}/{:?})", target.module, target.role))
+            });
+        }
+        let Some(result) = running.join_next().await else {
+            break;
+        };
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                errors.push(error);
+                if cfg.fail_fast {
+                    running.abort_all();
+                    break;
+                }
+            }
+            Err(error) => {
+                errors.push(anyhow!("target task failed: {error}"));
+                if cfg.fail_fast {
+                    running.abort_all();
+                    break;
+                }
+            }
+        }
+    }
+    while let Some(result) = running.join_next().await {
+        if let Ok(Err(error)) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} target(s) failed: {}",
+            errors.len(),
+            errors
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    }
 }
 
 /// Connect the transport for `role` and drive the session.
@@ -316,7 +407,7 @@ async fn execute(
             let ch = rb_transport::connect_source(transport)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            session::run_source(&*src, &ch, &progress)
+            session::run_source_limited(&*src, &ch, &progress, transport.max_rate)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
         }

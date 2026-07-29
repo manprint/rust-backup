@@ -38,6 +38,9 @@ pub struct TransportConfig {
     /// Skip TLS cert verification (testing only).
     #[serde(default)]
     pub insecure: bool,
+    /// Optional aggregate payload cap in bytes/second. Zero means unlimited.
+    #[serde(default)]
+    pub max_rate: Option<u64>,
 }
 
 fn default_carriers() -> u32 {
@@ -56,6 +59,7 @@ impl Default for TransportConfig {
             carriers: default_carriers(),
             udp: default_udp(),
             insecure: false,
+            max_rate: None,
         }
     }
 }
@@ -130,6 +134,16 @@ pub struct SessionConfig {
     /// Targets to run.
     #[serde(default)]
     pub targets: Vec<TargetSpec>,
+    /// Maximum simultaneously running targets; one preserves deterministic order.
+    #[serde(default = "default_parallel_targets")]
+    pub parallel_targets: usize,
+    /// Stop scheduling new targets as soon as one target fails.
+    #[serde(default)]
+    pub fail_fast: bool,
+}
+
+fn default_parallel_targets() -> usize {
+    1
 }
 
 impl SessionConfig {

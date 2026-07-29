@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "rust-backup filesystem module (stub)"
+description = "rust-backup filesystem module"
 
 [dependencies]
 rb-core = { path = "../rb-core" }
 anyhow.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
+nix = { workspace = true, features = ["fs", "user"] }
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }

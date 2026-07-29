@@ -9,7 +9,7 @@ of `BackupPlan.payload`), a `Source` (read-only analyze + stream out), and a
 |--------|-------|----------|-------------------|--------|
 | postgres | `rb-postgres` | 10..=latest | `tokio-postgres` (pure Rust) | stub |
 | mongodb | `rb-mongodb` | 4..=8 | `mongodb` (pure Rust) | stub |
-| filesystem | `rb-filesystem` | POSIX | `std` + `nix` | stub — see [FILESYSTEM.md](FILESYSTEM.md) |
+| filesystem | `rb-filesystem` | POSIX | `std` + `nix` | core path implemented; privileged/live e2e pending — see [FILESYSTEM.md](FILESYSTEM.md) |
 | s3 | `rb-s3` | AWS S3 / MinIO | `aws-sdk-s3` | stub |
 
 ## Adding a new module (I-MODULAR)

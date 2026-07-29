@@ -1,6 +1,8 @@
 # filesystem module
 
-1:1 copy of a directory tree from source to destination over the streaming channel.
+1:1 copy of a directory tree from source to an empty destination root over the
+streaming channel. The destination must be absent or empty: rust-backup never
+deletes pre-existing entries as part of a restore.
 
 ## What is preserved
 
@@ -11,7 +13,7 @@
 | mtime | always | always | none |
 | symlinks / hardlinks | always | recreated | none |
 | **uid / gid (ownership)** | always (recorded in plan) | **only when privileged** | **root or `CAP_CHOWN`** |
-| xattrs | with `--preserve-xattr` | with `--preserve-xattr` | varies |
+| xattrs | not yet supported | not yet supported | — |
 
 ## The sudo / ownership case (important)
 
@@ -35,10 +37,23 @@ touched, upholding I-IMMUT).
 ownership entirely and silence the warnings when you intentionally want
 running-user ownership.
 
+## Current limits
+
+- `--follow-symlinks` is rejected. Following a link could escape the declared
+  source root and would no longer preserve that link faithfully.
+- `--preserve-xattr` is rejected for now. The module uses only safe `std` +
+  `nix` APIs under the workspace `forbid(unsafe_code)` rule; xattr support will
+  be added when a safe implementation fits that constraint.
+- Regular file reads try Linux `O_NOATIME` first. If the caller does not own the
+  file and has no capability to use it, the kernel rejects that flag and the
+  read falls back to ordinary read-only open.
+
 ## Invariant notes
 
 - **I-IMMUT**: the source tree is opened read-only; the module computes a tree
   fingerprint (path + metadata + content hash) before and after and asserts equality.
 - **I-NOTEMP**: files stream in 64 KiB reads straight into the channel; nothing is
   copied to a staging directory.
-- Implementation status: **stub** (see `docs/plans/RUST_BACKUP_PLAN.md` Phase 4).
+- Implementation status: Phase 4 core path is implemented and unit-tested;
+  privileged root/CAP_CHOWN and interrupted-transfer cases still need the
+  documented live Linux e2e coverage.

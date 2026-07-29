@@ -1,35 +1,40 @@
 #![forbid(unsafe_code)]
 
-//! rust-backup filesystem module (stub).
+//! POSIX filesystem backup module.
 //!
-//! Provides typed parameter handling and plan shape for filesystem backups.
-//! Real backup/restore logic lands in Phase 2.
+//! The source side only reads directory metadata and regular-file bytes.  The
+//! plan is self-contained: it contains every path and its restore metadata;
+//! only regular-file contents travel on the chunk channel.
 
+mod dest;
+mod immutability;
+mod source;
+mod walk;
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use rb_core::channel::{ChunkSink, ChunkSource};
-use rb_core::error::{BackupError, Phase, Result};
+use rb_core::error::Result;
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
 
 /// Filesystem backup parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesystemParams {
-    /// Root directory to back up (required).
+    /// Root directory to back up or restore into.
     pub root: String,
-
-    /// Whether to follow symlinks (default false).
+    /// Following links is deliberately rejected: it can escape the declared root
+    /// and cannot preserve a link as a link.
     #[serde(default)]
     pub follow_symlinks: bool,
-
-    /// Whether to preserve ownership (uid/gid) — requires elevated privileges on restore.
+    /// Attempt to restore uid/gid.  Requires root or CAP_CHOWN at destination.
     #[serde(default = "default_preserve_ownership")]
     pub preserve_ownership: bool,
-
-    /// Whether to preserve extended attributes (default false).
+    /// Reserved for a later safe, cross-platform xattr implementation.
     #[serde(default)]
     pub preserve_xattr: bool,
 }
@@ -38,61 +43,46 @@ fn default_preserve_ownership() -> bool {
     true
 }
 
-/// Filesystem backup plan payload.
-///
-/// Describes the complete directory tree, file metadata, symlinks, and
-/// extended attributes needed to restore the filesystem exactly as it was.
+/// Complete filesystem descriptor carried in [`BackupPlan::payload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesystemPlan {
-    /// Root directory path.
+    /// Source root, for display only; restore always uses destination `root`.
     pub root: String,
-
-    /// All filesystem entries (files, directories, symlinks).
+    /// Entries sorted in deterministic relative-path order.
     pub entries: Vec<FilesystemEntry>,
-
-    /// Total size in bytes across all entries.
     pub total_bytes: u64,
-
-    /// Note: restoring with ownership preservation may require root or CAP_CHOWN.
-    #[serde(default)]
     pub ownership_note: String,
 }
 
-/// A single filesystem entry (file, directory, or symlink).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry in a filesystem plan.  `path` is always a validated relative path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilesystemEntry {
-    /// Relative path from root.
     pub path: String,
-
-    /// Entry kind: "file", "dir", or "symlink".
+    /// `file`, `dir`, `symlink`, or `hardlink`.
     pub kind: String,
-
-    /// File size in bytes (0 for directories).
     #[serde(default)]
     pub size: u64,
-
-    /// Unix file mode (permissions, file type bits).
     #[serde(default)]
     pub mode: u32,
-
-    /// User ID (only preserved if params.preserve_ownership).
     #[serde(default)]
     pub uid: u32,
-
-    /// Group ID (only preserved if params.preserve_ownership).
     #[serde(default)]
     pub gid: u32,
-
-    /// Modification time (Unix timestamp in seconds).
     #[serde(default)]
     pub mtime: u64,
-
-    /// Symlink target (only set if kind == "symlink").
+    #[serde(default)]
+    pub mtime_nsec: u32,
     #[serde(default)]
     pub target: Option<String>,
+    #[serde(default)]
+    pub hardlink_to: Option<String>,
+    /// Kept in the plan format for forward compatibility.  Xattrs are not
+    /// collected until a safe std+nix-only API is available.
+    #[serde(default)]
+    pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-/// The filesystem backup module.
+/// The filesystem module registration object.
 pub struct Module;
 
 #[async_trait]
@@ -106,110 +96,260 @@ impl BackupModule for Module {
     }
 
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {
-        let fs_params: FilesystemParams = params.deserialize()?;
-        Ok(Box::new(FilesystemSource { params: fs_params }))
+        let params: FilesystemParams = params.deserialize()?;
+        source::validate_source_params(&params)?;
+        Ok(Box::new(FilesystemSource { params }))
     }
 
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>> {
-        let fs_params: FilesystemParams = params.deserialize()?;
-        Ok(Box::new(FilesystemDestination { params: fs_params }))
+        let params: FilesystemParams = params.deserialize()?;
+        dest::validate_destination_params(&params)?;
+        Ok(Box::new(FilesystemDestination { params }))
     }
 }
 
-/// Filesystem source (read-only).
 struct FilesystemSource {
-    #[allow(dead_code)]
     params: FilesystemParams,
 }
 
 #[async_trait]
 impl Source for FilesystemSource {
     async fn analyze(&self) -> Result<BackupPlan> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-filesystem: analyze not yet implemented (plan Phase 2)",
-        ))
+        source::analyze(&self.params).await
     }
 
-    async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Transfer,
-            "rb-filesystem: stream_out not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        source::stream_out(&self.params, plan, sink).await
     }
 
     async fn fingerprint(&self) -> Result<String> {
-        Err(BackupError::phase(
-            Phase::Analyze,
-            "rb-filesystem: fingerprint not yet implemented (plan Phase 2)",
-        ))
+        immutability::fingerprint(&self.params).await
     }
 }
 
-/// Filesystem destination (restore).
 struct FilesystemDestination {
-    #[allow(dead_code)]
     params: FilesystemParams,
 }
 
 #[async_trait]
 impl Destination for FilesystemDestination {
-    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
-        Ok(Preflight::pass().check(
-            "not-implemented",
-            false,
-            "rb-filesystem restore stub — destination validation and restore not yet implemented (plan Phase 2)",
-        ))
+    async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
+        dest::validate(&self.params, plan).await
     }
 
-    async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {
-        Err(BackupError::phase(
-            Phase::Apply,
-            "rb-filesystem: stream_in not yet implemented (plan Phase 2)",
-        ))
+    async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        dest::stream_in(&self.params, plan, src).await
     }
 }
 
 /// Register the filesystem module.
-pub fn module() -> Arc<dyn rb_core::module::BackupModule> {
+pub fn module() -> Arc<dyn BackupModule> {
     Arc::new(Module)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use async_trait::async_trait;
+    use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
+
     use super::*;
 
-    #[test]
-    fn test_module_name() {
-        let m = Module;
-        assert_eq!(m.name(), "filesystem");
+    #[derive(Default)]
+    struct RecordingSink {
+        chunks: Vec<(u32, u64, Vec<u8>)>,
+        completed: Vec<(u32, u64, String)>,
+    }
+
+    #[async_trait]
+    impl ChunkSink for RecordingSink {
+        async fn send_chunk(&mut self, id: u32, offset: u64, data: &[u8]) -> Result<()> {
+            self.chunks.push((id, offset, data.to_vec()));
+            Ok(())
+        }
+        async fn finish_item(&mut self, id: u32, total: u64, digest: &str) -> Result<()> {
+            self.completed.push((id, total, digest.into()));
+            Ok(())
+        }
+        async fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct EventSource(VecDeque<ChunkEvent>);
+
+    #[async_trait]
+    impl ChunkSource for EventSource {
+        async fn next(&mut self) -> Result<ChunkEvent> {
+            Ok(self.0.pop_front().unwrap_or(ChunkEvent::End))
+        }
+    }
+
+    fn tempdir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rb-filesystem-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn params(root: &Path) -> FilesystemParams {
+        FilesystemParams {
+            root: root.display().to_string(),
+            follow_symlinks: false,
+            preserve_ownership: false,
+            preserve_xattr: false,
+        }
+    }
+
+    fn fixture(root: &Path) {
+        fs::create_dir(root.join("nested")).unwrap();
+        let data: Vec<u8> = (0..(64 * 1024 + 19)).map(|n| (n % 251) as u8).collect();
+        fs::write(root.join("nested/data.bin"), data).unwrap();
+        fs::set_permissions(
+            root.join("nested/data.bin"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("nested/data.bin", root.join("data-link")).unwrap();
+        fs::hard_link(root.join("nested/data.bin"), root.join("data-hardlink")).unwrap();
+        fs::write(root.join("empty"), []).unwrap();
     }
 
     #[tokio::test]
-    async fn test_open_source_valid_params() {
-        let m = Module;
-        let params = TargetParams::from_value(serde_json::json!({
-            "root": "/home/user"
-        }));
-
-        let source = m.open_source(&params).await;
-        assert!(source.is_ok());
+    async fn analyze_and_stream_are_complete_and_chunked() {
+        let root = tempdir("source");
+        fixture(&root);
+        let source = FilesystemSource {
+            params: params(&root),
+        };
+        let plan = source.analyze().await.unwrap();
+        let payload: FilesystemPlan = serde_json::from_value(plan.payload.clone()).unwrap();
+        assert!(payload
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "dir" && entry.path == "nested"));
+        assert!(payload
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "symlink" && entry.path == "data-link"));
+        assert!(payload.entries.iter().any(|entry| entry.kind == "hardlink"));
+        assert_eq!(plan.items.len(), 2, "only unique regular files carry bytes");
+        let mut sink = RecordingSink::default();
+        source.stream_out(&plan, &mut sink).await.unwrap();
+        assert!(sink
+            .chunks
+            .iter()
+            .all(|(_, _, bytes)| bytes.len() <= 64 * 1024));
+        assert_eq!(sink.completed.len(), 2);
+        assert_eq!(
+            sink.completed
+                .iter()
+                .map(|(_, total, _)| total)
+                .sum::<u64>(),
+            64 * 1024 + 19
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn test_analyze_not_implemented() {
-        let m = Module;
-        let params = TargetParams::from_value(serde_json::json!({
-            "root": "/home/user"
-        }));
+    async fn roundtrip_restores_contents_links_and_mode() {
+        let source_root = tempdir("roundtrip-source");
+        let destination_root = tempdir("roundtrip-destination");
+        fixture(&source_root);
+        let source = FilesystemSource {
+            params: params(&source_root),
+        };
+        let plan = source.analyze().await.unwrap();
+        let mut sink = RecordingSink::default();
+        source.stream_out(&plan, &mut sink).await.unwrap();
+        let mut events = VecDeque::new();
+        for (id, offset, data) in sink.chunks {
+            events.push_back(ChunkEvent::Chunk {
+                item_id: id,
+                offset,
+                data,
+            });
+            if let Some((_, total, digest)) = sink.completed.iter().find(|(done, _, _)| *done == id)
+            {
+                let last = events.back().is_some_and(|event| matches!(event, ChunkEvent::Chunk { data, .. } if offset + data.len() as u64 == *total));
+                if last {
+                    events.push_back(ChunkEvent::ItemEnd {
+                        item_id: id,
+                        total: *total,
+                        blake3: digest.clone(),
+                    });
+                }
+            }
+        }
+        for (id, total, digest) in &sink.completed {
+            if !events
+                .iter()
+                .any(|event| matches!(event, ChunkEvent::ItemEnd { item_id, .. } if item_id == id))
+            {
+                events.push_back(ChunkEvent::ItemEnd {
+                    item_id: *id,
+                    total: *total,
+                    blake3: digest.clone(),
+                });
+            }
+        }
+        events.push_back(ChunkEvent::End);
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        destination
+            .stream_in(&plan, &mut EventSource(events))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(destination_root.join("nested/data.bin")).unwrap(),
+            fs::read(source_root.join("nested/data.bin")).unwrap()
+        );
+        assert_eq!(
+            fs::read_link(destination_root.join("data-link")).unwrap(),
+            PathBuf::from("nested/data.bin")
+        );
+        assert_eq!(
+            fs::metadata(destination_root.join("nested/data.bin"))
+                .unwrap()
+                .ino(),
+            fs::metadata(destination_root.join("data-hardlink"))
+                .unwrap()
+                .ino()
+        );
+        assert_eq!(
+            fs::metadata(destination_root.join("nested/data.bin"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
 
-        let source = m.open_source(&params).await.unwrap();
-        let result = source.analyze().await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
+    #[tokio::test]
+    async fn fingerprint_is_stable_then_detects_content_change() {
+        let root = tempdir("fingerprint");
+        fixture(&root);
+        let source = FilesystemSource {
+            params: params(&root),
+        };
+        let before = source.fingerprint().await.unwrap();
+        assert_eq!(before, source.fingerprint().await.unwrap());
+        fs::write(root.join("nested/data.bin"), b"changed").unwrap();
+        assert_ne!(before, source.fingerprint().await.unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 }

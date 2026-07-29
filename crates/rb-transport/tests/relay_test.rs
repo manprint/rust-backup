@@ -30,6 +30,7 @@ async fn relay_roundtrip() {
         carriers: 1,
         udp: false,
         insecure: true,
+        max_rate: None,
     };
 
     let source_channel = rb_transport::connect_source(&transport)
