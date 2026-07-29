@@ -29,6 +29,13 @@ use crate::wire::{self, ControlFrame};
 /// half-open peer must not wedge a session forever.
 const DEFAULT_PLAN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// A data stream can observe the peer closing just before the independent
+/// control stream delivers its structured Abort. Give that control frame a
+/// small window to win so callers retain the remote failure reason rather than
+/// a transport-level EOF.
+const DESTINATION_ABORT_GRACE: Duration = Duration::from_secs(1);
+const ABORT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn plan_exchange_timeout() -> Duration {
     std::env::var("RUST_BACKUP_PLAN_TIMEOUT")
         .ok()
@@ -342,16 +349,24 @@ async fn source_stream_multi(
         (result, channel::completion_digest(&sink.completed_items))
     };
     if let Err(error) = streamed {
-        data_sink.abort(&error.to_string()).await;
-        let _ = wire::send_frame(
-            &mut control_write,
-            &ControlFrame::Abort {
-                reason: error.to_string(),
-            },
-        )
-        .await;
-        abort_task.abort();
-        let _ = abort_task.await;
+        let destination_aborted = abort_rx.borrow().is_some();
+        if destination_aborted {
+            // Acknowledge on the independent control plane before touching
+            // data streams that the failed destination may no longer drain.
+            let _ = wire::send_frame(&mut control_write, &ControlFrame::AbortAck).await;
+            let _ = abort_task.await;
+        } else {
+            data_sink.abort(&error.to_string()).await;
+            let _ = wire::send_frame(
+                &mut control_write,
+                &ControlFrame::Abort {
+                    reason: error.to_string(),
+                },
+            )
+            .await;
+            abort_task.abort();
+            let _ = abort_task.await;
+        }
         return Err(error);
     }
     let bytes_sent = progress.bytes();
@@ -423,6 +438,23 @@ impl<'a> PacedSink<'a> {
                 .unwrap_or_else(|| "destination control stream closed".to_string()),
         )
     }
+    async fn prefer_destination_abort(
+        local_error: BackupError,
+        abort_watch: &mut watch::Receiver<Option<String>>,
+    ) -> BackupError {
+        if abort_watch.borrow().is_some() {
+            return Self::abort_error(abort_watch);
+        }
+        if matches!(
+            tokio::time::timeout(DESTINATION_ABORT_GRACE, abort_watch.changed()).await,
+            Ok(Ok(()))
+        ) && abort_watch.borrow().is_some()
+        {
+            Self::abort_error(abort_watch)
+        } else {
+            local_error
+        }
+    }
     async fn pace(&mut self, bytes: usize) -> Result<()> {
         let Some(rate) = self.rate else { return Ok(()) };
         self.sent = self.sent.saturating_add(bytes as u64);
@@ -455,10 +487,14 @@ impl ChunkSink for PacedSink<'_> {
         if abort_watch.borrow().is_some() {
             return Err(Self::abort_error(abort_watch));
         }
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = abort_watch.changed() => Err(Self::abort_error(abort_watch)),
             result = inner.send_chunk(item_id, offset, data) => result,
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Self::prefer_destination_abort(error, abort_watch).await),
         }
     }
     async fn finish_item(&mut self, item_id: u32, total: u64, blake3: &str) -> Result<()> {
@@ -473,10 +509,13 @@ impl ChunkSink for PacedSink<'_> {
             if abort_watch.borrow().is_some() {
                 return Err(Self::abort_error(abort_watch));
             }
-            tokio::select! {
+            let result = tokio::select! {
                 biased;
-                _ = abort_watch.changed() => return Err(Self::abort_error(abort_watch)),
-                result = inner.finish_item(item_id, total, blake3) => result?,
+                _ = abort_watch.changed() => Err(Self::abort_error(abort_watch)),
+                result = inner.finish_item(item_id, total, blake3) => result,
+            };
+            if let Err(error) = result {
+                return Err(Self::prefer_destination_abort(error, abort_watch).await);
             }
         } else {
             inner.finish_item(item_id, total, blake3).await?;
@@ -492,10 +531,14 @@ impl ChunkSink for PacedSink<'_> {
         if abort_watch.borrow().is_some() {
             return Err(Self::abort_error(abort_watch));
         }
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = abort_watch.changed() => Err(Self::abort_error(abort_watch)),
             result = inner.finish() => result,
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Self::prefer_destination_abort(error, abort_watch).await),
         }
     }
 }
@@ -739,13 +782,23 @@ async fn destination_stream_multi(
     let received_items = src.completed_item_ids();
     let received_digest = src.completion_digest();
     if let Err(error) = apply_result {
-        let _ = wire::send_frame(
+        let sent = wire::send_frame(
             &mut control,
             &ControlFrame::Abort {
                 reason: error.to_string(),
             },
         )
-        .await;
+        .await
+        .is_ok();
+        if sent {
+            // Keep the multiplexed connection alive until the source confirms
+            // receipt. Older peers simply hit this short best-effort timeout.
+            let _ = tokio::time::timeout(
+                ABORT_ACK_TIMEOUT,
+                wire::recv_frame::<_, ControlFrame>(&mut control),
+            )
+            .await;
+        }
         let _ = control.shutdown().await;
         return Err(error);
     }
@@ -818,12 +871,14 @@ async fn destination_stream_multi(
 mod pacing_tests {
     use super::{exchange_timeout_with, PacedSink};
     use crate::channel::ChunkSink;
-    use crate::error::Result;
+    use crate::error::{BackupError, Phase, Result};
     use async_trait::async_trait;
     use std::time::Duration;
     use tokio::sync::watch;
 
     struct BlockingSink;
+
+    struct FailingSink;
 
     #[async_trait]
     impl ChunkSink for BlockingSink {
@@ -837,6 +892,21 @@ mod pacing_tests {
 
         async fn finish(&mut self) -> Result<()> {
             std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl ChunkSink for FailingSink {
+        async fn send_chunk(&mut self, _: u32, _: u64, _: &[u8]) -> Result<()> {
+            Err(BackupError::phase(Phase::Transfer, "injected data EOF"))
+        }
+
+        async fn finish_item(&mut self, _: u32, _: u64, _: &str) -> Result<()> {
+            Err(BackupError::phase(Phase::Transfer, "injected data EOF"))
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            Err(BackupError::phase(Phase::Transfer, "injected data EOF"))
         }
     }
 
@@ -879,5 +949,28 @@ mod pacing_tests {
             assert!(error.to_string().contains("injected apply failure"));
             notify.await.expect("abort notifier");
         }
+    }
+
+    #[tokio::test]
+    async fn destination_abort_reason_wins_data_close_race() {
+        let mut inner = FailingSink;
+        let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
+        let mut sink = PacedSink::new(&mut inner, None).with_abort_watch(&mut abort_rx);
+        let notify = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            abort_tx
+                .send(Some("destination aborted: injected ENOSPC".into()))
+                .ok();
+        });
+
+        let error = sink
+            .send_chunk(7, 0, &[0; 1024])
+            .await
+            .expect_err("data close must retain the pending destination reason");
+        assert!(error
+            .to_string()
+            .contains("destination aborted: injected ENOSPC"));
+        assert!(!error.to_string().contains("injected data EOF"));
+        notify.await.expect("abort notifier");
     }
 }

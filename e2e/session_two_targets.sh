@@ -34,9 +34,18 @@ if ! timeout --foreground "${RUST_BACKUP_SESSION_TIMEOUT:-45s}" env RUST_LOG=inf
   sed -n '1,160p' "$work/server.log" >&2
   exit 1
 fi
-[[ "$(rb_tree_digest "$work/one-src")" == "$(rb_tree_digest "$work/one-dst")" ]]
-[[ "$(rb_tree_digest "$work/two-src")" == "$(rb_tree_digest "$work/two-dst")" ]]
-[[ $(grep -c 'target_label=' "$work/run.log") -ge 4 ]]
+for pair in one two; do
+  if [[ "$(rb_tree_digest "$work/$pair-src")" != "$(rb_tree_digest "$work/$pair-dst")" ]]; then
+    echo "FAIL: $pair destination differs from source" >&2
+    exit 1
+  fi
+done
+progress_lines=$(grep -c 'target_label=' "$work/run.log" || true)
+if (( progress_lines < 4 )); then
+  echo "FAIL: expected progress for four targets, got $progress_lines line(s)" >&2
+  sed -n '1,240p' "$work/run.log" >&2
+  exit 1
+fi
 
 cat >"$work/fail-fast.yml" <<EOF
 targets:

@@ -19,6 +19,10 @@
   destination does not close before the acknowledgement is known to be received.
   Destination aborts now interrupt source pacing and blocked chunk writes, and
   truncated carriers/offset gaps are rejected.
+- Destination failures now use an `Abort`/`AbortAck` control-plane handshake, so
+  relay teardown cannot replace an apply error such as ENOSPC with a generic EOF.
+  Progress also emits an initial per-target snapshot synchronously, including for
+  transfers that finish before the periodic reporter is first scheduled.
 - Interrupted filesystem items remove their partial final-path file. S3 fidelity
   preflight now rejects non-default ACLs and has a credential-gated real-AWS smoke.
 - Direct QUIC streams now use an explicit readiness byte, privileged restores

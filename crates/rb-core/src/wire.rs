@@ -67,6 +67,9 @@ pub enum ControlFrame {
     CompleteAckAck,
     /// Either side: abort with reason (clean teardown, no partial apply).
     Abort { reason: String },
+    /// Receiver → aborting peer: confirms the structured abort reason was
+    /// received, allowing a multiplexed transport to close without dropping it.
+    AbortAck,
 }
 
 const fn default_carriers() -> u32 {

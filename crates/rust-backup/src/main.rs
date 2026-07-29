@@ -642,9 +642,20 @@ struct ProgressReporter(tokio::task::JoinHandle<()>);
 
 impl ProgressReporter {
     fn spawn(progress: Progress, label: String) -> Self {
+        let started = std::time::Instant::now();
+        // Emit the initial snapshot synchronously. A very small transfer can
+        // otherwise finish and drop the reporter before its spawned task is
+        // first scheduled, leaving that target with no progress record.
+        tracing::info!(
+            target_label = %label,
+            "{}",
+            progress.line(started.elapsed().as_secs_f64())
+        );
         ProgressReporter(tokio::spawn(async move {
-            let started = std::time::Instant::now();
-            let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
+            let mut tick = tokio::time::interval_at(
+                tokio::time::Instant::now() + PROGRESS_INTERVAL,
+                PROGRESS_INTERVAL,
+            );
             loop {
                 tick.tick().await;
                 tracing::info!(
