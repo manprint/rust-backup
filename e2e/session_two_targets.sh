@@ -40,7 +40,7 @@ for pair in one two; do
     exit 1
   fi
 done
-progress_lines=$(grep -c 'target_label=' "$work/run.log" || true)
+progress_lines=$(grep -c 'target_label' "$work/run.log" || true)
 if (( progress_lines < 4 )); then
   echo "FAIL: expected progress for four targets, got $progress_lines line(s)" >&2
   sed -n '1,240p' "$work/run.log" >&2
