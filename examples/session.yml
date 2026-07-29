@@ -1,21 +1,43 @@
-# Example multi-target session: `rust-backup run --config examples/session.yml`
-# CLI flags and RUST_BACKUP_* env vars override matching fields here.
+# Mixed multi-target session. Replace every CHANGE_ME and hostname before use.
+# All four peers run concurrently; each channel has one source and destination.
+parallel_targets: 4
+fail_fast: true
 targets:
-  # Back up a PostgreSQL cluster A -> B (source uses a read-only user).
   - module: postgres
     role: source
-    transport: { to: coord.example:7835, channel: pg-prod, secret: s3cr3t, udp: true }
+    transport: { to: coordinator.example:7835, channel: pg-prod, secret: CHANGE_ME, udp: true }
     params:
-      host: db-a.internal
+      host: postgres-source.internal
       port: 5432
-      user: backup_ro
-      password: ${PGPASS}   # expand via env in your shell before running
+      user: backup_readonly
+      password: CHANGE_ME
       database: app
+      sslmode: require
 
-  # Restore a directory tree (destination under sudo to preserve ownership).
+  - module: postgres
+    role: destination
+    transport: { to: coordinator.example:7835, channel: pg-prod, secret: CHANGE_ME, udp: true }
+    params:
+      host: postgres-destination.internal
+      port: 5432
+      user: postgres
+      password: CHANGE_ME
+      database: postgres
+      sslmode: require
+      admin: true
+      overwrite: false
+    auto_accept: true
+
+  - module: filesystem
+    role: source
+    transport: { to: coordinator.example:7835, channel: fs-home, secret: CHANGE_ME, carriers: 4, udp: true }
+    params:
+      root: /srv/home
+      preserve_ownership: true
+
   - module: filesystem
     role: destination
-    transport: { to: coord.example:7835, channel: fs-home, secret: s3cr3t }
+    transport: { to: coordinator.example:7835, channel: fs-home, secret: CHANGE_ME, carriers: 4, udp: true }
     params:
       root: /restore/home
       preserve_ownership: true

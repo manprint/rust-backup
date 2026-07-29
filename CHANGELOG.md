@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added pinned GitHub Actions for Rust CI, the complete end-to-end matrix,
+  dependency/security analysis, multi-architecture container publication, and
+  reproducible Linux release artifacts with checksums and provenance.
+- Added a hardened non-root coordination-server image, Compose/TLS deployment
+  examples, per-backend session configurations, and complete binary/container
+  deployment and end-to-end guidance in the README.
+- Removed unused direct dependencies and updated the MongoDB driver to 3.8.
 - Added relay end-to-end coverage, TLS control-listener support, secret-file
   input, bounded session accounting, and S3 fidelity preflight checks.
 - Multi-carrier transfers now negotiate the safe count on the wire and bind

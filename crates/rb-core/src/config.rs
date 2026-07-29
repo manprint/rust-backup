@@ -209,3 +209,41 @@ impl SessionConfig {
         Self::from_yaml(&text)
     }
 }
+
+#[cfg(test)]
+mod example_tests {
+    use super::SessionConfig;
+
+    #[test]
+    fn shipped_session_examples_parse_and_can_rendezvous() {
+        let examples = [
+            ("session.yml", include_str!("../../../examples/session.yml")),
+            (
+                "filesystem-session.yml",
+                include_str!("../../../examples/filesystem-session.yml"),
+            ),
+            (
+                "postgres-session.yml",
+                include_str!("../../../examples/postgres-session.yml"),
+            ),
+            (
+                "mongodb-session.yml",
+                include_str!("../../../examples/mongodb-session.yml"),
+            ),
+            (
+                "s3-session.yml",
+                include_str!("../../../examples/s3-session.yml"),
+            ),
+        ];
+
+        for (name, yaml) in examples {
+            let config = SessionConfig::from_yaml(yaml)
+                .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            assert!(!config.targets.is_empty(), "{name} must contain targets");
+            assert!(
+                config.parallel_targets >= 2,
+                "{name} must run rendezvous peers concurrently"
+            );
+        }
+    }
+}

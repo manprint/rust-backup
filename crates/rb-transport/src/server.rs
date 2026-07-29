@@ -61,7 +61,7 @@ pub type UdpRegistry = Arc<DashMap<String, Arc<UdpMatchmaker>>>;
 /// Cross-task rendezvous that exchanges the two peers' UDP hole-punch candidates.
 ///
 /// Each side registers a one-shot sink for the *peer's* addresses and later offers
-/// its own. [`Self::try_match`] fires both sinks exactly once, the moment BOTH
+/// its own. The internal `try_match` operation fires both sinks exactly once when
 /// peers have offered — so the exchange is fully order-independent (provider-first
 /// or consumer-first). A side that never offers, or whose peer never offers,
 /// leaves its receiver pending; the owning task's broker deadline then sends

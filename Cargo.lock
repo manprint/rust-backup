@@ -66,7 +66,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -77,7 +77,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -427,7 +427,7 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.1.0",
  "http-body-util",
- "md-5 0.11.0",
+ "md-5",
  "pin-project-lite",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -1255,7 +1255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2063,16 +2063,6 @@ dependencies = [
 
 [[package]]
 name = "md-5"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
@@ -2132,9 +2122,9 @@ dependencies = [
 
 [[package]]
 name = "mongocrypt"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da0cd419a51a5fb44819e290fbdb0665a54f21dead8923446a799c7f4d26ad9"
+checksum = "8426a875ded61430d4a811dbfda7633b6b8af0225c547fc6c28b8b0aa7d79a13"
 dependencies = [
  "bson",
  "mongocrypt-sys",
@@ -2144,15 +2134,15 @@ dependencies = [
 
 [[package]]
 name = "mongocrypt-sys"
-version = "0.1.5+1.15.1"
+version = "0.1.6+1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224484c5d09285a7b8cb0a0c117e847ebd14cb6e4470ecf68cdb89c503b0edb9"
+checksum = "851fac73f7fe22f6a3ab87f720ce509cae7c9fd08e7dd27866cc232dee07ccf4"
 
 [[package]]
 name = "mongodb"
-version = "3.7.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "276ba0cd571553d1f6936c6f180964776ece6ab7507dc8765f8a9c9c49d8cd00"
+checksum = "b814038f367d212f55de0a630cb35102a9b8ca23785a86955d62c0087c93846d"
 dependencies = [
  "base64",
  "bitflags",
@@ -2166,9 +2156,9 @@ dependencies = [
  "hickory-net",
  "hickory-proto",
  "hickory-resolver",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "macro_magic",
- "md-5 0.10.6",
+ "md-5",
  "mongocrypt",
  "mongodb-internal-macros",
  "pbkdf2",
@@ -2179,8 +2169,8 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_with",
- "sha1 0.10.6",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "socket2",
  "stringprep",
  "strsim",
@@ -2196,9 +2186,9 @@ dependencies = [
 
 [[package]]
 name = "mongodb-internal-macros"
-version = "3.7.0"
+version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99ceb1a9a1018e470077ec94cf3a8c2d0e6da542b2c05ea95a59a0a627147375"
+checksum = "f736d2fbc56e0011a341fbb9172bd822fda75c5f93b82fae1c7aab1e2613c810"
 dependencies = [
  "macro_magic",
  "proc-macro2",
@@ -2247,7 +2237,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2364,11 +2354,11 @@ dependencies = [
 
 [[package]]
 name = "pbkdf2"
-version = "0.12.2"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
- "digest 0.10.7",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -2461,7 +2451,7 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "hmac 0.13.0",
- "md-5 0.11.0",
+ "md-5",
  "memchr",
  "rand 0.10.1",
  "sha2 0.11.0",
@@ -2658,14 +2648,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bytes",
- "hex",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -2673,7 +2660,6 @@ dependencies = [
 name = "rb-filesystem"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "blake3",
  "nix",
@@ -2681,31 +2667,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "rb-mongodb"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "blake3",
- "bytes",
  "futures-util",
  "mongodb",
  "rb-core",
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "rb-postgres"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "blake3",
  "bytes",
@@ -2725,7 +2706,6 @@ dependencies = [
 name = "rb-s3"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-config",
  "aws-credential-types",
@@ -2736,7 +2716,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2755,7 +2734,6 @@ dependencies = [
  "quinn",
  "rb-core",
  "rcgen",
- "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2847,9 +2825,7 @@ dependencies = [
  "rb-postgres",
  "rb-s3",
  "rb-transport",
- "serde",
  "serde_json",
- "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3203,7 +3179,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3922,7 +3898,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

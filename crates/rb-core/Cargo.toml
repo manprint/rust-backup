@@ -10,14 +10,11 @@ description = "rust-backup core: backup-module traits, plan model, wire framing,
 anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
-bytes.workspace = true
-hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
-tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

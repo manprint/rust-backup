@@ -16,7 +16,7 @@ done
 
 rb_build_release
 work=$(mktemp -d)
-server_pid= source_pid= destination_pid=
+server_pid='' source_pid='' destination_pid=''
 token="rust-backup-e2e-$(date +%s)-$$"
 source_key="$token/source.txt"
 destination_prefix="$token/destination/"

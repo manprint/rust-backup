@@ -15,7 +15,7 @@ image="$work/destination.ext4"
 mount_dir="$work/mount"
 source_root="$work/source"
 destination_root="$mount_dir/restore"
-server_pid= source_pid= destination_pid=
+server_pid='' source_pid='' destination_pid=''
 PASS=0 FAIL=0
 
 cleanup() {

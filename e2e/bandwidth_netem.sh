@@ -81,17 +81,16 @@ run_case() { # label bytes max-rate-or-empty
   if (( max_rss <= RSS_LIMIT_KIB )); then pass "$label: source RSS ${max_rss} KiB <= ${RSS_LIMIT_KIB} KiB"; else fail "$label: source RSS ${max_rss} KiB exceeds cap"; fi
   CASE_ELAPSED=$elapsed
   CASE_BYTES=$bytes
-  CASE_MAX_RSS=$max_rss
 }
 
 run_case T-BW-NETEM "$PAYLOAD_BYTES" ''
-elapsed=$CASE_ELAPSED; bytes=$CASE_BYTES; max_rss=$CASE_MAX_RSS
+elapsed=$CASE_ELAPSED; bytes=$CASE_BYTES
 # 5 Mbit/s allows at most ~0.625 MB/s. Leave 30% slack for scheduler/qdisc burst.
 minimum=$(( bytes * 8 * 70 / 5000000 / 100 ))
 if (( elapsed >= minimum )); then pass "T-BW-NETEM: ${elapsed}s proves constrained receiver pacing"; else fail "T-BW-NETEM: ${elapsed}s is too fast for 5 Mbit/s"; fi
 
 run_case T-BW-MAX-RATE "$RATE_TEST_BYTES" 262144
-capped_elapsed=$CASE_ELAPSED; capped_bytes=$CASE_BYTES; capped_rss=$CASE_MAX_RSS
+capped_elapsed=$CASE_ELAPSED; capped_bytes=$CASE_BYTES
 rate_minimum=$(( capped_bytes * 70 / 262144 / 100 ))
 if (( capped_elapsed >= rate_minimum )); then pass "T-BW-MAX-RATE: ${capped_elapsed}s visibly honors 256 KiB/s cap"; else fail "T-BW-MAX-RATE: ${capped_elapsed}s bypassed cap"; fi
 

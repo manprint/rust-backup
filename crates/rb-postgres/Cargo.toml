@@ -8,7 +8,6 @@ description = "rust-backup postgres module (PostgreSQL 10..=latest, logical, pur
 
 [dependencies]
 rb-core = { path = "../rb-core" }
-anyhow.workspace = true
 async-trait.workspace = true
 blake3 = { workspace = true }
 bytes = { workspace = true }

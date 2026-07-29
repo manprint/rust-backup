@@ -1,0 +1,102 @@
+name: Binary artifacts and release
+
+on:
+  push:
+    branches: [dev, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build locked release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --all-features --bin rust-backup --target "$TARGET"
+      - name: Package binary and checksum
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          base_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="${base_version}-${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"
+          fi
+          package="rust-backup-${version}-${TARGET}"
+          mkdir -p "dist/$package"
+          install -m 0755 "target/${TARGET}/release/rust-backup" "dist/$package/rust-backup"
+          cp README.md CHANGELOG.md LICENSE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+          (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
+          rm -rf "dist/$package"
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rust-backup-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  github-release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Create the tag's GitHub Release and upload assets.
+      id-token: write # Request the OIDC identity used for provenance.
+      attestations: write # Publish provenance for the release archives.
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Build aggregate checksums
+        run: |
+          cd release-assets
+          sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e # v4
+        with:
+          subject-path: release-assets/*
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          fi

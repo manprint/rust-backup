@@ -1,0 +1,33 @@
+# Source should be read-only; destination needs cluster administration rights.
+# Keep this template outside version control after inserting credentials.
+parallel_targets: 2
+fail_fast: true
+targets:
+  - module: postgres
+    role: source
+    transport: &transport
+      to: coordinator.example:7835
+      channel: postgres-production
+      secret: CHANGE_ME
+      udp: true
+    params:
+      host: postgres-source.internal
+      port: 5432
+      user: backup_readonly
+      password: CHANGE_ME
+      database: app
+      sslmode: require
+
+  - module: postgres
+    role: destination
+    transport: *transport
+    params:
+      host: postgres-destination.internal
+      port: 5432
+      user: postgres
+      password: CHANGE_ME
+      database: postgres
+      sslmode: require
+      admin: true
+      overwrite: false
+    auto_accept: true

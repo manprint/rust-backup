@@ -1,0 +1,25 @@
+# Omit `database` to copy every non-system database.
+parallel_targets: 2
+fail_fast: true
+targets:
+  - module: mongodb
+    role: source
+    transport: &transport
+      to: coordinator.example:7835
+      channel: mongodb-production
+      secret: CHANGE_ME
+      udp: true
+    params:
+      uri: mongodb://backup_readonly:CHANGE_ME@mongo-source.internal:27017/?authSource=admin
+      database: app
+      auth_db: admin
+
+  - module: mongodb
+    role: destination
+    transport: *transport
+    params:
+      uri: mongodb://root:CHANGE_ME@mongo-destination.internal:27017/?authSource=admin
+      database: app
+      auth_db: admin
+      overwrite: false
+    auto_accept: true

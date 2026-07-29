@@ -1,0 +1,147 @@
+name: Security and dependency health
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustsec-policy:
+    name: Advisories, licenses, bans and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-security-tools-audit-0.22.1
+      - name: Install pinned audit tool
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.1 --locked
+      - name: RustSec vulnerability audit
+        run: cargo audit --deny warnings
+      - name: Dependency policy
+        uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
+        with:
+          arguments: --all-features
+          command: check
+          command-arguments: advisories bans licenses sources
+
+  dependency-hygiene:
+    name: Unused, duplicate and outdated dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-machete
+            ~/.cargo/bin/cargo-outdated
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ runner.arch }}-dependency-tools-machete-0.9.2-outdated-0.19.0
+      - name: Install pinned dependency tools
+        run: |
+          command -v cargo-machete >/dev/null || cargo install cargo-machete --version 0.9.2 --locked
+          command -v cargo-outdated >/dev/null || cargo install cargo-outdated --version 0.19.0 --locked
+      - name: Reject unused direct dependencies
+        run: cargo machete
+      - name: Report duplicate versions
+        run: cargo tree --workspace --locked --duplicates | tee duplicate-dependencies.txt
+      - name: Report outdated direct dependencies
+        run: |
+          set +e
+          cargo outdated --workspace --depth 1 --exit-code 1 | tee outdated-dependencies.txt
+          status=${PIPESTATUS[0]}
+          {
+            echo '## Direct dependency update report'
+            echo
+            echo '```text'
+            cat outdated-dependencies.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  dependency-review:
+    name: Pull request dependency review
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          deny-licenses: GPL-2.0-only, GPL-3.0-only
+
+  workflow-security:
+    name: Workflow syntax and supply-chain audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo" -w /repo \
+            rhysd/actionlint:1.7.12
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        with:
+          inputs: .github/workflows
+          persona: pedantic
+          version: 1.28.0
+          advanced-security: false
+          annotations: true
+
+  codeql:
+    name: CodeQL (Rust)
+    permissions:
+      actions: read # Read workflow metadata required by CodeQL.
+      contents: read # Analyze the checked-out Rust source.
+      security-events: write # Upload CodeQL results to code scanning.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@adfda868f108ac4222129de456ea554034a27db7 # v4
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+      - name: Analyze
+        uses: github/codeql-action/analyze@adfda868f108ac4222129de456ea554034a27db7 # v4
+        with:
+          category: /language:rust

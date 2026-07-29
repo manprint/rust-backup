@@ -10,3 +10,7 @@ notes.ai
 /.serena/
 .agents
 skills-lock.json
+
+# Local coordination-server credentials and certificates.
+/deploy/coordination/coordination.secret
+/deploy/coordination/tls/

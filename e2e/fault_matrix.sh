@@ -7,7 +7,7 @@ source "$(dirname "$0")/lib.sh"
 rb_build_release
 
 work=$(mktemp -d)
-server_pid= source_pid= destination_pid=
+server_pid='' source_pid='' destination_pid=''
 PASS=0; FAIL=0
 cleanup() {
   local status=$?

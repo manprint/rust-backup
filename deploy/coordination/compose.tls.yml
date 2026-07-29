@@ -1,0 +1,20 @@
+services:
+  coordinator:
+    command:
+      - server
+      - --bind-addr
+      - 0.0.0.0
+      - --control-port
+      - "7835"
+      - --secret-file
+      - /run/secrets/coordination_secret
+      - --tls-cert
+      - /run/tls/tls.crt
+      - --tls-key
+      - /run/tls/tls.key
+      - --max-conns
+      - ${RUST_BACKUP_MAX_CONNS:-256}
+      - --udp
+      - ${RUST_BACKUP_UDP:-true}
+    volumes:
+      - ${RUST_BACKUP_TLS_DIR:-./deploy/coordination/tls}:/run/tls:ro

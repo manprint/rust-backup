@@ -1,0 +1,11 @@
+.git
+.github
+.agents
+.serena
+target
+e2e
+docs
+deploy
+examples
+*.log
+notes.ai

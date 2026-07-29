@@ -1,0 +1,146 @@
+name: End-to-end
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  core:
+    name: Relay, TLS, sessions, faults and MinIO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-core-${{ hashFiles('Cargo.lock') }}
+      - run: bash e2e/full_matrix.sh
+
+  postgres-introspection:
+    name: PostgreSQL introspection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: bash e2e/postgres_introspect.sh 16
+
+  postgres:
+    name: PostgreSQL ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [10, 12, 14, 16, 18]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-pg-${{ matrix.version }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_VERSION: ${{ matrix.version }}
+        run: bash e2e/postgres_matrix.sh "$DATABASE_VERSION"
+
+  mongodb:
+    name: MongoDB ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-mongo-${{ matrix.version }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_VERSION: ${{ matrix.version }}
+        run: bash e2e/mongodb_matrix.sh "$DATABASE_VERSION"
+
+  filesystem-privileged:
+    name: Filesystem metadata and ENOSPC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: sudo -n "$GITHUB_WORKSPACE/e2e/filesystem_netns_test.sh"
+      - run: sudo -n "$GITHUB_WORKSPACE/e2e/filesystem_disk_full.sh"
+
+  transport-privileged:
+    name: Direct, relay fallback and active loss
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: sudo -n "$GITHUB_WORKSPACE/e2e/transport_netns_test.sh"
+
+  bandwidth-privileged:
+    name: Backpressure, netem and rate limiting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: sudo -n "$GITHUB_WORKSPACE/e2e/bandwidth_netem.sh"
+
+  aws-s3:
+    name: Real AWS S3 (credential gated)
+    if: github.event_name != 'pull_request' && vars.RUN_AWS_E2E == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: aws-e2e
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      RUST_BACKUP_AWS_SOURCE_BUCKET: ${{ vars.RUST_BACKUP_AWS_SOURCE_BUCKET }}
+      RUST_BACKUP_AWS_DEST_BUCKET: ${{ vars.RUST_BACKUP_AWS_DEST_BUCKET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: bash e2e/s3_aws_test.sh

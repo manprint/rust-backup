@@ -93,7 +93,7 @@ mc diff --quiet src/source/in/ dst/destination/out/
 
 # Inject after the first completed multipart part. The destination returns a
 # phase-tagged Apply error only after `abort_upload` has removed the upload.
-source_pid= dst_pid=
+source_pid='' dst_pid=''
 RUST_BACKUP_S3_TEST_FAIL_AFTER_PART=1 "$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-abort --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/abort-source.log" 2>&1 &
 source_pid=$!
 sleep 1

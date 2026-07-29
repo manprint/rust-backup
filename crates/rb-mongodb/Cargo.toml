@@ -8,15 +8,12 @@ description = "rust-backup mongodb module (MongoDB 4..=8, pure Rust)"
 
 [dependencies]
 rb-core = { path = "../rb-core" }
-anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
-bytes.workspace = true
 futures-util.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
-tracing.workspace = true
 
 # MongoDB 4..=8, pure-Rust driver (rustls TLS by default). Re-exports `bson`.
-mongodb = "3"
+mongodb = "3.8"

@@ -1,0 +1,40 @@
+name: rust-backup
+
+services:
+  coordinator:
+    image: ${RUST_BACKUP_IMAGE:-ghcr.io/manprint/rust-backup:latest}
+    build:
+      context: .
+      args:
+        VERSION: ${RUST_BACKUP_VERSION:-dev}
+        VCS_REF: ${RUST_BACKUP_VCS_REF:-local}
+    restart: unless-stopped
+    command:
+      - server
+      - --bind-addr
+      - 0.0.0.0
+      - --control-port
+      - "7835"
+      - --secret-file
+      - /run/secrets/coordination_secret
+      - --max-conns
+      - ${RUST_BACKUP_MAX_CONNS:-256}
+      - --udp
+      - ${RUST_BACKUP_UDP:-true}
+    ports:
+      - "${RUST_BACKUP_CONTROL_PORT:-7835}:7835/tcp"
+      - "${RUST_BACKUP_UDP_PORT:-7835}:7835/udp"
+    secrets:
+      - coordination_secret
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+secrets:
+  coordination_secret:
+    file: ${RUST_BACKUP_SECRET_FILE:-./deploy/coordination/coordination.secret}

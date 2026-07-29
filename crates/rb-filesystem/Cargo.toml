@@ -8,13 +8,11 @@ description = "rust-backup filesystem module"
 
 [dependencies]
 rb-core = { path = "../rb-core" }
-anyhow.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 nix = { workspace = true, features = ["fs", "user"] }
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
-tracing.workspace = true
 
 # Phase 2: nix = "0.29" (Unix syscalls for stat, xattr, chown); walkdir = "2.4" (recursive traversal)

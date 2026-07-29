@@ -1,0 +1,30 @@
+# Run source and destination together:
+#   rust-backup run --config examples/filesystem-session.yml
+# Replace coordinator.example and CHANGE_ME before use.
+parallel_targets: 2
+fail_fast: true
+targets:
+  - module: filesystem
+    role: source
+    transport:
+      to: coordinator.example:7835
+      channel: filesystem-production
+      secret: CHANGE_ME
+      carriers: 4
+      udp: true
+    params:
+      root: /srv/source-data
+      preserve_ownership: true
+
+  - module: filesystem
+    role: destination
+    transport:
+      to: coordinator.example:7835
+      channel: filesystem-production
+      secret: CHANGE_ME
+      carriers: 4
+      udp: true
+    params:
+      root: /srv/restored-data
+      preserve_ownership: true
+    auto_accept: true

@@ -1,0 +1,34 @@
+# Works with AWS S3 and S3-compatible endpoints such as MinIO.
+parallel_targets: 2
+fail_fast: true
+targets:
+  - module: s3
+    role: source
+    transport: &transport
+      to: coordinator.example:7835
+      channel: s3-production
+      secret: CHANGE_ME
+      udp: true
+    params:
+      endpoint: https://s3.example.com
+      region: eu-south-1
+      bucket: source-bucket
+      prefix: production/
+      access_key: CHANGE_ME
+      secret_key: CHANGE_ME
+      path_style: false
+
+  - module: s3
+    role: destination
+    transport: *transport
+    params:
+      endpoint: https://s3.example.com
+      region: eu-south-1
+      bucket: restored-bucket
+      prefix: recovered/
+      access_key: CHANGE_ME
+      secret_key: CHANGE_ME
+      path_style: false
+      create_bucket: true
+      overwrite: false
+    auto_accept: true
