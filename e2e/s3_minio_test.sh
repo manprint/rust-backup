@@ -106,7 +106,7 @@ set -e
 [[ $abort_source_rc -ne 0 && $abort_destination_rc -ne 0 ]]
 after_abort=$(mc ls --recursive --json src/source | sort)
 [[ "$before" == "$after_abort" ]]
-if mc ls --incomplete --recursive --json dst/destination 2>/dev/null | rg -q .; then
+if mc ls --incomplete --recursive --json dst/destination 2>/dev/null | grep -q .; then
   echo 'orphan multipart upload after injected abort' >&2
   exit 1
 fi

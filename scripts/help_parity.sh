@@ -10,7 +10,7 @@ usage=USAGE.md
 missing=0
 while IFS= read -r flag; do
   [[ -z $flag ]] && continue
-  if ! rg -Fq -- "$flag" "$usage"; then
+  if ! grep -Fq -- "$flag" "$usage"; then
     printf 'USAGE.md missing documented flag: %s\n' "$flag" >&2
     missing=1
   fi
@@ -24,7 +24,7 @@ done < <(
       "$bin" "$module" source --help
       "$bin" "$module" destination --help
     done
-  } | rg -o -- '--[a-z0-9-]+' | sort -u
+  } | grep -Eo -- '--[a-z0-9-]+' | sort -u
 )
 (( missing == 0 ))
 printf 'help/USAGE parity: PASS\n'

@@ -36,7 +36,7 @@ if ! timeout --foreground "${RUST_BACKUP_SESSION_TIMEOUT:-45s}" env RUST_LOG=inf
 fi
 [[ "$(rb_tree_digest "$work/one-src")" == "$(rb_tree_digest "$work/one-dst")" ]]
 [[ "$(rb_tree_digest "$work/two-src")" == "$(rb_tree_digest "$work/two-dst")" ]]
-[[ $(rg -c 'target_label=' "$work/run.log") -ge 4 ]]
+[[ $(grep -c 'target_label=' "$work/run.log") -ge 4 ]]
 
 cat >"$work/fail-fast.yml" <<EOF
 targets:
