@@ -36,11 +36,22 @@ docker run -d --name "$CONTAINER" \
 CONTAINER_CREATED=1
 
 echo "==> waiting for readiness"
-for _ in $(seq 1 30); do
-  if docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then break; fi
+ready=0
+for _ in $(seq 1 60); do
+  # The official entrypoint starts a temporary socket-only server while it
+  # initializes the cluster. Checking TCP avoids mistaking that bootstrap
+  # server for the final listener and racing its restart.
+  if docker exec "$CONTAINER" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 1
 done
-docker exec "$CONTAINER" pg_isready -U postgres
+if (( ! ready )); then
+  echo "FAIL: postgres ${PG_MAJOR} did not become ready" >&2
+  docker logs "$CONTAINER" >&2
+  exit 1
+fi
 
 echo "==> seeding fixture schema"
 docker exec -i "$CONTAINER" psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
