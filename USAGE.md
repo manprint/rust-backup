@@ -30,6 +30,7 @@ module-specific setting that has no dedicated flag. `run` accepts
 | `--insecure` | `RUST_BACKUP_INSECURE` | off | skip TLS verification (testing only) |
 | `--max-rate <bytes/s>` | `RUST_BACKUP_MAX_RATE` | unlimited | aggregate source payload rate cap |
 | `--yes` *(dest)* | `RUST_BACKUP_YES` | off | auto-accept the plan (skip interactive prompt) |
+| `--overwrite` *(dest)* | `RUST_BACKUP_OVERWRITE` | off | replace existing destination databases, collections, or objects |
 | `--config <file>` | `RUST_BACKUP_CONFIG` | — | YAML config underlay |
 | `-v` | — | — | increase log verbosity (repeatable) |
 
