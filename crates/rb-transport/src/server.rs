@@ -289,16 +289,22 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                 let auth_opt = auth.clone();
                 let tls = tls.clone();
                 tokio::spawn(
-                    handle_accepted_conn(
-                        socket,
-                        tls,
-                        peer,
-                        registry,
-                        max_conns,
-                        pending_carriers,
-                        udp_registry,
-                        auth_opt,
-                    )
+                    async move {
+                        if let Err(error) = handle_accepted_conn(
+                            socket,
+                            tls,
+                            peer,
+                            registry,
+                            max_conns,
+                            pending_carriers,
+                            udp_registry,
+                            auth_opt,
+                        )
+                        .await
+                        {
+                            warn!(%error, "client handler failed");
+                        }
+                    }
                     .instrument(info_span!("client", %peer)),
                 );
             }
@@ -424,7 +430,9 @@ async fn serve_provider(
     if registry.contains_key(&id) {
         warn!(%id, "channel id already in use");
         control
-            .send_server(ServerMsg::Error("channel already in use".into()))
+            .send_server(ServerMsg::Error {
+                reason: "channel already in use".into(),
+            })
             .await?;
         return Ok(());
     }

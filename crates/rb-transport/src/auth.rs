@@ -1,7 +1,7 @@
 //! Authentication for rb-transport.
 //! Vendored from bore, adapted for minimal proto messages.
 
-use anyhow::{ensure, Result};
+use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -41,11 +41,21 @@ impl Authenticator {
         stream: &mut Delimited<T>,
     ) -> Result<()> {
         let challenge = Uuid::new_v4();
-        stream.send_server(ServerMsg::Challenge(challenge)).await?;
+        stream
+            .send_server(ServerMsg::Challenge { challenge })
+            .await?;
         match stream.recv_client().await? {
-            Some(ClientMsg::Authenticate(tag)) => {
-                ensure!(self.validate(&challenge, &tag), "invalid secret");
-                Ok(())
+            Some(ClientMsg::Authenticate { tag }) => {
+                if self.validate(&challenge, &tag) {
+                    Ok(())
+                } else {
+                    stream
+                        .send_server(ServerMsg::Error {
+                            reason: "authentication failed".into(),
+                        })
+                        .await?;
+                    anyhow::bail!("invalid secret")
+                }
             }
             _ => anyhow::bail!("server requires secret, but no secret was provided"),
         }
@@ -56,14 +66,14 @@ impl Authenticator {
         stream: &mut Delimited<T>,
     ) -> Result<()> {
         let challenge = match stream.recv_server().await? {
-            Some(ServerMsg::Challenge(challenge)) => challenge,
+            Some(ServerMsg::Challenge { challenge }) => challenge,
             Some(_) => {
                 anyhow::bail!("expected authentication challenge, but no secret was required")
             }
             None => anyhow::bail!("connection closed before authentication"),
         };
         let tag = self.answer(&challenge);
-        stream.send_client(ClientMsg::Authenticate(tag)).await?;
+        stream.send_client(ClientMsg::Authenticate { tag }).await?;
         Ok(())
     }
 }

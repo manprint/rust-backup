@@ -79,6 +79,81 @@ async fn relay_roundtrip() {
 }
 
 #[tokio::test]
+async fn authenticated_relay_accepts_matching_and_rejects_invalid_secrets() {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let cfg = rb_core::config::ServerConfig {
+        bind_addr: "127.0.0.1".to_string(),
+        control_port: port,
+        secret: Some("shared-secret".into()),
+        tls_cert: None,
+        tls_key: None,
+        max_conns: 256,
+        udp: false,
+    };
+    let server = tokio::spawn(async move { rb_transport::run_server(&cfg).await });
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let transport = TransportConfig {
+        to: addr.clone(),
+        channel: "authenticated-relay".into(),
+        secret: Some("shared-secret".into()),
+        carriers: 1,
+        udp: false,
+        insecure: true,
+        max_rate: None,
+    };
+    let source = rb_transport::connect_source(&transport)
+        .await
+        .expect("authenticated source");
+    let destination = rb_transport::connect_destination(&transport)
+        .await
+        .expect("authenticated destination");
+
+    let mut destination_stream = destination.open_stream().await.expect("open stream");
+    let mut source_stream = source.accept_stream().await.expect("accept stream");
+    destination_stream
+        .write_all(b"authenticated relay")
+        .await
+        .expect("write payload");
+    destination_stream
+        .shutdown()
+        .await
+        .expect("shutdown payload");
+    let mut received = Vec::new();
+    source_stream
+        .read_to_end(&mut received)
+        .await
+        .expect("read payload");
+    assert_eq!(received, b"authenticated relay");
+
+    let wrong_secret = TransportConfig {
+        channel: "wrong-secret".into(),
+        secret: Some("wrong-secret".into()),
+        ..transport.clone()
+    };
+    let wrong_error = match rb_transport::connect_source(&wrong_secret).await {
+        Ok(_) => panic!("wrong secret must be rejected"),
+        Err(error) => error,
+    };
+    assert!(wrong_error.to_string().contains("authentication failed"));
+
+    let missing_secret = TransportConfig {
+        channel: "missing-secret".into(),
+        secret: None,
+        ..transport
+    };
+    let missing_error = match rb_transport::connect_source(&missing_secret).await {
+        Ok(_) => panic!("missing secret must be rejected"),
+        Err(error) => error,
+    };
+    assert!(missing_error
+        .to_string()
+        .contains("server requires a secret"));
+    server.abort();
+}
+
+#[tokio::test]
 async fn consumer_stream_can_arrive_before_provider_registration() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");

@@ -98,9 +98,13 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
             }
             Ok(channel)
         }
-        Some(ServerMsg::Error(reason)) => Err(BackupError::phase(
+        Some(ServerMsg::Error { reason }) => Err(BackupError::phase(
             rb_core::error::Phase::Connect,
             format!("server error: {reason}"),
+        )),
+        Some(ServerMsg::Challenge { .. }) => Err(BackupError::phase(
+            rb_core::error::Phase::Connect,
+            "server requires a secret, but none was provided",
         )),
         other => Err(BackupError::phase(
             rb_core::error::Phase::Connect,
@@ -168,9 +172,13 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
             }
             Ok(channel)
         }
-        Some(ServerMsg::Error(reason)) => Err(BackupError::phase(
+        Some(ServerMsg::Error { reason }) => Err(BackupError::phase(
             rb_core::error::Phase::Connect,
             format!("server error: {reason}"),
+        )),
+        Some(ServerMsg::Challenge { .. }) => Err(BackupError::phase(
+            rb_core::error::Phase::Connect,
+            "server requires a secret, but none was provided",
         )),
         other => Err(BackupError::phase(
             rb_core::error::Phase::Connect,

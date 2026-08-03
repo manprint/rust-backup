@@ -39,7 +39,10 @@ pub enum ClientMsg {
     /// Connect as the destination/consumer for a channel.
     Connect { channel: String },
     /// Authenticate with the server using the provided HMAC tag.
-    Authenticate(String),
+    ///
+    /// This must remain a struct variant: internally tagged Serde enums cannot
+    /// serialize a newtype variant whose payload is a scalar.
+    Authenticate { tag: String },
     /// Heartbeat to keep the connection alive.
     Heartbeat,
     /// Offer UDP candidate addresses for hole-punching to the server.
@@ -60,13 +63,14 @@ pub enum ClientMsg {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerMsg {
     /// Authentication challenge (UUID); client must respond with Authenticate.
-    Challenge(Uuid),
+    /// See [`ClientMsg::Authenticate`] for why this is a struct variant.
+    Challenge { challenge: Uuid },
     /// Success (registration/connection/auth accepted).
     Ok,
     /// Heartbeat echo.
     Heartbeat,
     /// Error message; connection will close.
-    Error(String),
+    Error { reason: String },
     /// Forward the peer's UDP candidate addresses for hole-punching.
     UdpPunch {
         peer_addrs: Vec<SocketAddr>,
