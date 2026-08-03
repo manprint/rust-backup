@@ -182,9 +182,17 @@ pub async fn stream_in(
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
 
     // 1. Cluster scope: roles, then databases.
-    let boot = PgConnection::connect(params, &params.bootstrap_database()).await?;
+    // When overwriting `postgres` (or another configured bootstrap database),
+    // run cluster DDL from a database that is not itself being replaced.
+    let bootstrap = restore_bootstrap_database(params, &payload);
+    let boot = PgConnection::connect(params, &bootstrap).await?;
     let ddl = build_cluster_ddl(&payload, boot.server_major)?;
     run_statements(&boot.client, &ddl.roles).await?;
+    if params.overwrite {
+        for database in &payload.databases {
+            drop_database_for_overwrite(&boot.client, &database.name).await?;
+        }
+    }
     run_statements(&boot.client, &ddl.databases).await?;
     drop(boot);
 
@@ -206,6 +214,108 @@ pub async fn stream_in(
         if let Some(conn) = conns.get(&dbddl.name) {
             run_statements(&conn.client, &dbddl.post_data).await?;
         }
+    }
+    Ok(())
+}
+
+/// Select a cluster database that is not one of the overwrite targets.
+fn restore_bootstrap_database(params: &PostgresParams, payload: &PgPlanPayload) -> String {
+    let preferred = params.bootstrap_database();
+    if payload.databases.iter().all(|db| db.name != preferred) {
+        return preferred;
+    }
+    if payload.databases.iter().all(|db| db.name != "postgres") {
+        return "postgres".to_string();
+    }
+    // Source discovery excludes template databases, making template1 the safe
+    // administrative fallback when the standard postgres database is a target.
+    "template1".to_string()
+}
+
+fn alter_database_connections(name: &str, allowed: bool) -> String {
+    format!(
+        "ALTER DATABASE {} WITH ALLOW_CONNECTIONS = {};",
+        quote_ident(name),
+        allowed
+    )
+}
+
+fn drop_database_sql(name: &str) -> String {
+    format!("DROP DATABASE {};", quote_ident(name))
+}
+
+/// Replace one existing database on every supported PostgreSQL major. Disabling
+/// new connections closes the race that a plain terminate-then-drop sequence
+/// would leave on PostgreSQL 10–12 (which lack `DROP DATABASE ... FORCE`).
+async fn drop_database_for_overwrite(client: &Client, name: &str) -> Result<()> {
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1)",
+            &[&name],
+        )
+        .await
+        .map_err(|error| {
+            BackupError::phase_src(
+                Phase::Apply,
+                format!("check existing database {name:?}"),
+                error,
+            )
+        })?
+        .get(0);
+    if !exists {
+        return Ok(());
+    }
+
+    let disable = alter_database_connections(name, false);
+    client.batch_execute(&disable).await.map_err(|error| {
+        BackupError::phase_src(
+            Phase::Apply,
+            format!("disable connections before overwriting database {name:?}"),
+            error,
+        )
+    })?;
+
+    let terminated = client
+        .query(
+            "SELECT pg_catalog.pg_terminate_backend(pid) \
+             FROM pg_catalog.pg_stat_activity \
+             WHERE datname = $1 AND pid <> pg_catalog.pg_backend_pid()",
+            &[&name],
+        )
+        .await;
+    let rows = match terminated {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = client
+                .batch_execute(&alter_database_connections(name, true))
+                .await;
+            return Err(BackupError::phase_src(
+                Phase::Apply,
+                format!("terminate sessions before overwriting database {name:?}"),
+                error,
+            ));
+        }
+    };
+    if rows.iter().any(|row| !row.get::<_, bool>(0)) {
+        let _ = client
+            .batch_execute(&alter_database_connections(name, true))
+            .await;
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!("not permitted to terminate every session on database {name:?}"),
+        ));
+    }
+
+    let drop_sql = drop_database_sql(name);
+    if let Err(error) = client.batch_execute(&drop_sql).await {
+        let _ = client
+            .batch_execute(&alter_database_connections(name, true))
+            .await;
+        return Err(BackupError::phase_src(
+            Phase::Apply,
+            format!("drop database {name:?} for overwrite"),
+            error,
+        ));
     }
     Ok(())
 }
@@ -353,6 +463,52 @@ mod tests {
             createrole,
             existing_databases: HashSet::new(),
         }
+    }
+
+    fn params(database: Option<&str>) -> PostgresParams {
+        PostgresParams {
+            host: "localhost".into(),
+            port: 5432,
+            user: "postgres".into(),
+            password: None,
+            database: database.map(str::to_string),
+            sslmode: "disable".into(),
+            sslrootcert: None,
+            admin: true,
+            overwrite: true,
+        }
+    }
+
+    #[test]
+    fn overwrite_uses_a_non_target_bootstrap_database() {
+        let mut payload = crate::model::test_fixture();
+        assert_eq!(
+            restore_bootstrap_database(&params(None), &payload),
+            "postgres"
+        );
+        assert_eq!(
+            restore_bootstrap_database(&params(Some("appdb")), &payload),
+            "postgres"
+        );
+
+        payload.databases[0].name = "postgres".into();
+        assert_eq!(
+            restore_bootstrap_database(&params(None), &payload),
+            "template1"
+        );
+    }
+
+    #[test]
+    fn overwrite_database_ddl_quotes_names_and_controls_connections() {
+        assert_eq!(
+            alter_database_connections("odd\"db", false),
+            "ALTER DATABASE \"odd\"\"db\" WITH ALLOW_CONNECTIONS = false;"
+        );
+        assert_eq!(
+            alter_database_connections("odd\"db", true),
+            "ALTER DATABASE \"odd\"\"db\" WITH ALLOW_CONNECTIONS = true;"
+        );
+        assert_eq!(drop_database_sql("odd\"db"), "DROP DATABASE \"odd\"\"db\";");
     }
 
     #[test]

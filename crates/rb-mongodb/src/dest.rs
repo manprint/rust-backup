@@ -78,7 +78,7 @@ pub fn assess(
             } else if overwrite {
                 format!("'{key}' exists — will be replaced (--overwrite)")
             } else {
-                format!("'{key}' already exists (set -P overwrite=true to replace)")
+                format!("'{key}' already exists (use --overwrite to replace)")
             };
             pf = pf.check(format!("collection:{key}"), ok, detail);
         }

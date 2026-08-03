@@ -22,7 +22,9 @@ and grants. Source reads are read-only; data streams straight into the tunnel.
 Use a read-only source account able to inspect the required catalogs and `SELECT`
 the copied tables. The destination needs an administrative account: it creates
 roles/databases/schemas and applies ownership/grants. `--admin` marks this intent;
-`overwrite=true` is required when restoring over existing target databases.
+`--overwrite` (or `overwrite: true` in YAML) is required when restoring over
+existing target databases. The destination disables new connections, terminates
+existing sessions and recreates each target database from scratch.
 
 ## Limits
 

@@ -170,6 +170,9 @@ struct ModuleParamArgs {
     /// postgres: connect as admin (destination).
     #[arg(long)]
     admin: bool,
+    /// Destination: replace existing databases, collections or objects.
+    #[arg(long, env = "RUST_BACKUP_OVERWRITE")]
+    overwrite: bool,
     /// s3: use path-style addressing (MinIO).
     #[arg(long = "path-style")]
     path_style: bool,
@@ -263,6 +266,9 @@ impl ModuleParamArgs {
         // bool flags fold only when they flip a default.
         if self.admin {
             m.insert("admin".into(), Value::Bool(true));
+        }
+        if self.overwrite {
+            m.insert("overwrite".into(), Value::Bool(true));
         }
         if self.path_style {
             m.insert("path_style".into(), Value::Bool(true));
@@ -987,6 +993,32 @@ targets:
         assert_eq!(params.0["host"], "escape-host");
         assert_eq!(params.0["port"], 6000);
         assert_eq!(params.0["overwrite"], true);
+    }
+
+    #[test]
+    fn overwrite_flag_is_accepted_after_destination_options() {
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--host",
+            "db",
+            "--admin",
+            "--yes",
+            "--overwrite",
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, auto_accept) =
+            resolve_target(&a, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(params.0["overwrite"], true);
+        assert_eq!(params.0["admin"], true);
+        assert!(auto_accept);
     }
 
     /// The `plan` dry-run subcommand parses and carries module params only.

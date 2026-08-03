@@ -154,7 +154,7 @@ async fn authenticated_relay_accepts_matching_and_rejects_invalid_secrets() {
 }
 
 #[tokio::test]
-async fn consumer_stream_can_arrive_before_provider_registration() {
+async fn destination_can_arrive_before_provider_registration() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let cfg = rb_core::config::ServerConfig {
@@ -178,17 +178,28 @@ async fn consumer_stream_can_arrive_before_provider_registration() {
         max_rate: None,
     };
 
-    let destination = rb_transport::connect_destination(&transport)
-        .await
-        .expect("destination connects first");
-    let mut destination_stream = destination
-        .open_stream()
-        .await
-        .expect("consumer opens before provider exists");
+    let destination_transport = transport.clone();
+    let destination_task =
+        tokio::spawn(
+            async move { rb_transport::connect_destination(&destination_transport).await },
+        );
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    assert!(
+        !destination_task.is_finished(),
+        "destination waits for provider registration"
+    );
     let source = rb_transport::connect_source(&transport)
         .await
         .expect("provider registers later");
+    let destination = tokio::time::timeout(tokio::time::Duration::from_secs(2), destination_task)
+        .await
+        .expect("destination registration must be bounded")
+        .expect("destination join")
+        .expect("destination connects after provider");
+    let mut destination_stream = destination
+        .open_stream()
+        .await
+        .expect("consumer opens stream");
     let mut source_stream =
         tokio::time::timeout(tokio::time::Duration::from_secs(2), source.accept_stream())
             .await

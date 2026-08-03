@@ -116,8 +116,8 @@ database_metadata() { # container
        FROM pg_database d WHERE d.datname = 'appdb'"
 }
 
-run_transfer() { # src_port dst_port channel [abort]
-  local src_port="$1" dst_port="$2" channel="$3" abort="${4:-}"
+run_transfer() { # src_port dst_port channel [abort|overwrite]
+  local src_port="$1" dst_port="$2" channel="$3" mode="${4:-}"
   "$BIN" server --bind-addr 127.0.0.1 --control-port "$CTRL_PORT" >/tmp/rb-server.log 2>&1 &
   local server_pid=$!; PIDS+=("$server_pid")
   sleep 1
@@ -128,16 +128,20 @@ run_transfer() { # src_port dst_port channel [abort]
     --password "$PASSWORD" --database appdb --sslmode disable >/tmp/rb-src.log 2>&1 &
   local src_pid=$!; PIDS+=("$src_pid")
 
-  if [[ "$abort" == "abort" ]]; then
+  if [[ "$mode" == "abort" ]]; then
     sleep 2; kill -9 "$src_pid" >/dev/null 2>&1 || true
     kill "$server_pid" >/dev/null 2>&1 || true
     return 0
   fi
 
   sleep 2
-  "$BIN" postgres destination --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
+  local destination_args=(postgres destination --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
     --no-udp --insecure --yes --admin --host 127.0.0.1 --port "$dst_port" --user postgres \
-    --password "$PASSWORD" --sslmode disable >/tmp/rb-dst.log 2>&1 &
+    --password "$PASSWORD" --sslmode disable)
+  if [[ "$mode" == "overwrite" ]]; then
+    destination_args+=(--overwrite)
+  fi
+  "$BIN" "${destination_args[@]}" >/tmp/rb-dst.log 2>&1 &
   local dst_pid=$!; PIDS+=("$dst_pid")
 
   wait "$src_pid"; local src_rc=$?
@@ -206,6 +210,18 @@ for MAJOR in "${MAJORS[@]}"; do
   else
     echo "FAIL: database locale metadata differs: source=${source_db_metadata} destination=${destination_db_metadata}"
     FAIL=$((FAIL+1))
+  fi
+
+  # 7) Regression: the typed --overwrite flag must pass preflight, disconnect
+  # users, drop the existing database and restore it from scratch.
+  docker exec "$DST" psql -U postgres -d appdb -v ON_ERROR_STOP=1 -c \
+    "INSERT INTO app.accounts (email) VALUES ('destination-only@x')" >/dev/null
+  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-overwrite-${MAJOR}" overwrite && \
+     [[ "$(data_checksum "$SRC" appdb)" == "$(data_checksum "$DST" appdb)" ]] && \
+     [[ "$(database_metadata "$SRC")" == "$(database_metadata "$DST")" ]]; then
+    echo "PASS: --overwrite replaces the existing database"; PASS=$((PASS+1))
+  else
+    echo "FAIL: --overwrite did not replace the existing database"; FAIL=$((FAIL+1))
   fi
 
   docker rm -f "$SRC" "$DST" >/dev/null 2>&1 || true

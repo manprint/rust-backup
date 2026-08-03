@@ -15,7 +15,8 @@ bounded batches, then creates indexes.
 The source needs read access to listed databases/collections and catalog commands
 such as `listCollections`; user visibility may require `usersInfo` privileges.
 The destination needs permission to create/drop collections and indexes. Set
-`overwrite=true` only when replacing existing collections is intended.
+Use `--overwrite` (or `overwrite: true` in YAML) only when replacing existing
+collections is intended.
 
 ## Limits
 
@@ -25,4 +26,3 @@ The destination needs permission to create/drop collections and indexes. Set
 - Discrete host/port parameters are plaintext unless the server policy provides
   transport protection. A URI with `?tls=true` is the current TLS path.
 - Live matrix verification requires Docker: `e2e/mongodb_matrix.sh 4 5 6 7 8`.
-

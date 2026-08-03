@@ -24,7 +24,7 @@ const DIRECT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// half-open peer, so this app-level keepalive is what keeps the registry entry
 /// live. Independent of the relay/direct split — it rides the relay control
 /// substream, which always exists.
-const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
+pub(crate) const CTRL_CLIENT_HEARTBEAT: Duration = Duration::from_secs(20);
 
 /// A paired byte channel between source and destination.
 pub struct PairedChannel {

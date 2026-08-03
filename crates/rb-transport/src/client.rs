@@ -3,11 +3,12 @@
 use rb_core::config::TransportConfig;
 use rb_core::error::BackupError;
 use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 
 use crate::auth::Authenticator;
-use crate::channel::PairedChannel;
+use crate::channel::{PairedChannel, CTRL_CLIENT_HEARTBEAT};
 #[cfg(feature = "udp")]
 use crate::connectivity::{derive_check_key, run_connectivity_checks, CheckConfig, CheckRole};
 use crate::mux;
@@ -32,6 +33,58 @@ enum DirectRole {
     Provider,
     /// Destination: dials the QUIC connection (opens data substreams).
     Consumer,
+}
+
+/// Wait for Register/Connect acknowledgement while keeping the control stream
+/// active through reverse proxies. A destination can legitimately wait several
+/// minutes for its source to be started.
+async fn await_registration<S>(control: &mut Delimited<S>) -> rb_core::error::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut heartbeat = tokio::time::interval(CTRL_CLIENT_HEARTBEAT);
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                control.send_client(ClientMsg::Heartbeat).await.map_err(|error| {
+                    BackupError::phase(
+                        rb_core::error::Phase::Connect,
+                        format!("send registration heartbeat: {error}"),
+                    )
+                })?;
+            }
+            response = control.recv_server() => {
+                match response.map_err(|error| {
+                    BackupError::phase(
+                        rb_core::error::Phase::Connect,
+                        format!("receive registration response: {error}"),
+                    )
+                })? {
+                    Some(ServerMsg::Ok) => return Ok(()),
+                    Some(ServerMsg::Heartbeat) => {}
+                    Some(ServerMsg::Error { reason }) => {
+                        return Err(BackupError::phase(
+                            rb_core::error::Phase::Connect,
+                            format!("server error: {reason}"),
+                        ));
+                    }
+                    Some(ServerMsg::Challenge { .. }) => {
+                        return Err(BackupError::phase(
+                            rb_core::error::Phase::Connect,
+                            "server requires a secret, but none was provided",
+                        ));
+                    }
+                    other => {
+                        return Err(BackupError::phase(
+                            rb_core::error::Phase::Connect,
+                            format!("unexpected registration response: {other:?}"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<PairedChannel> {
@@ -69,48 +122,27 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
         })?;
     }
 
-    match control
-        .recv_server()
+    await_registration(&mut control).await?;
+    // Negotiate the direct path on the transport control stream BEFORE it is
+    // moved into the channel (best-effort; falls back to relay on any failure).
+    #[cfg(feature = "udp")]
+    let direct = if cfg.udp {
+        setup_direct(
+            &mut control,
+            DirectRole::Provider,
+            &cfg.channel,
+            cfg.secret.as_deref(),
+        )
         .await
-        .map_err(|e| BackupError::phase(rb_core::error::Phase::Connect, format!("recv: {e}")))?
-    {
-        Some(ServerMsg::Ok) => {
-            // Negotiate the direct path on the transport control stream BEFORE it
-            // is moved into the channel (best-effort; falls back to relay on any
-            // failure). The module's plan exchange runs on a separate data
-            // substream, so consuming the UDP-broker messages here is safe.
-            #[cfg(feature = "udp")]
-            let direct = if cfg.udp {
-                setup_direct(
-                    &mut control,
-                    DirectRole::Provider,
-                    &cfg.channel,
-                    cfg.secret.as_deref(),
-                )
-                .await
-            } else {
-                None
-            };
-            let channel = PairedChannel::source_with_carriers(acceptor, control, cfg.carriers);
-            #[cfg(feature = "udp")]
-            if let Some((dc, token)) = direct {
-                channel.set_direct_with_token(dc, token).await;
-            }
-            Ok(channel)
-        }
-        Some(ServerMsg::Error { reason }) => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            format!("server error: {reason}"),
-        )),
-        Some(ServerMsg::Challenge { .. }) => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            "server requires a secret, but none was provided",
-        )),
-        other => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            format!("unexpected response: {other:?}"),
-        )),
+    } else {
+        None
+    };
+    let channel = PairedChannel::source_with_carriers(acceptor, control, cfg.carriers);
+    #[cfg(feature = "udp")]
+    if let Some((dc, token)) = direct {
+        channel.set_direct_with_token(dc, token).await;
     }
+    Ok(channel)
 }
 
 pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Result<PairedChannel> {
@@ -147,44 +179,25 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
         })?;
     }
 
-    match control
-        .recv_server()
+    await_registration(&mut control).await?;
+    #[cfg(feature = "udp")]
+    let direct = if cfg.udp {
+        setup_direct(
+            &mut control,
+            DirectRole::Consumer,
+            &cfg.channel,
+            cfg.secret.as_deref(),
+        )
         .await
-        .map_err(|e| BackupError::phase(rb_core::error::Phase::Connect, format!("recv: {e}")))?
-    {
-        Some(ServerMsg::Ok) => {
-            #[cfg(feature = "udp")]
-            let direct = if cfg.udp {
-                setup_direct(
-                    &mut control,
-                    DirectRole::Consumer,
-                    &cfg.channel,
-                    cfg.secret.as_deref(),
-                )
-                .await
-            } else {
-                None
-            };
-            let channel = PairedChannel::destination_with_carriers(opener, control, cfg.carriers);
-            #[cfg(feature = "udp")]
-            if let Some((dc, token)) = direct {
-                channel.set_direct_with_token(dc, token).await;
-            }
-            Ok(channel)
-        }
-        Some(ServerMsg::Error { reason }) => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            format!("server error: {reason}"),
-        )),
-        Some(ServerMsg::Challenge { .. }) => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            "server requires a secret, but none was provided",
-        )),
-        other => Err(BackupError::phase(
-            rb_core::error::Phase::Connect,
-            format!("unexpected response: {other:?}"),
-        )),
+    } else {
+        None
+    };
+    let channel = PairedChannel::destination_with_carriers(opener, control, cfg.carriers);
+    #[cfg(feature = "udp")]
+    if let Some((dc, token)) = direct {
+        channel.set_direct_with_token(dc, token).await;
     }
+    Ok(channel)
 }
 
 // --- Direct (QUIC hole-punch) path setup --------------------------------------
@@ -492,6 +505,35 @@ fn parse_xor_mapped_address(msg: &[u8], txid: &[u8; 12]) -> anyhow::Result<Socke
         i += 4 + len.div_ceil(4) * 4; // attributes are 32-bit aligned
     }
     anyhow::bail!("no XOR-MAPPED-ADDRESS in STUN response");
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_registration_heartbeats_until_server_is_ready() {
+        let (client_side, server_side) = duplex(1024);
+        let mut client = Delimited::new(client_side);
+        let mut server = Delimited::new(server_side);
+        let waiter = tokio::spawn(async move { await_registration(&mut client).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(CTRL_CLIENT_HEARTBEAT).await;
+        assert_eq!(
+            server.recv_client().await.expect("receive heartbeat"),
+            Some(ClientMsg::Heartbeat)
+        );
+        server
+            .send_server(ServerMsg::Ok)
+            .await
+            .expect("send registration ok");
+        waiter
+            .await
+            .expect("registration task")
+            .expect("registration succeeds");
+    }
 }
 
 #[cfg(all(test, feature = "udp"))]

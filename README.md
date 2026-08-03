@@ -227,8 +227,8 @@ current safe backend; symlinks themselves are preserved. See
 
 The source account must be read-only. The destination account needs the rights
 reported by preflight (normally cluster administration, role and database
-creation). Existing target databases are rejected unless `overwrite=true` is
-explicitly configured.
+creation). Existing target databases are rejected unless `--overwrite` (or the
+equivalent `overwrite: true` YAML parameter) is explicitly configured.
 
 ```bash
 # Source

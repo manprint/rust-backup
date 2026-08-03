@@ -24,10 +24,11 @@ use crate::transport::load_server_tls;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const UDP_BROKER_TIMEOUT: Duration = Duration::from_secs(10);
-/// A consumer is allowed to arrive first.  Its first relay stream waits briefly
-/// for the provider registration instead of being irreversibly dropped by a
-/// lookup race.
-const PROVIDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// A destination may be started before the source. Keep its lightweight control
+/// connection pending for the same operator-scale window used by plan exchange,
+/// rather than opening a relay stream that is discarded after ten seconds.
+const PEER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const REGISTRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Control substream recv deadline: the coordination server reaps a registry
 /// entry whose control substream has been silent this long. A yamux substream
@@ -167,6 +168,51 @@ impl UdpMatchmaker {
 enum BrokerSide {
     Provider,
     Consumer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderWait {
+    Available,
+    ClientClosed,
+    TimedOut,
+}
+
+/// Wait for a source registration before acknowledging the destination. This
+/// keeps destination-first startup order reliable without holding a relay
+/// stream or a `max_conns` permit while an operator starts the other command.
+async fn wait_for_provider<S>(
+    control: &mut Delimited<S>,
+    registry: &Registry,
+    id: &str,
+    wait: Duration,
+) -> Result<ProviderWait>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if registry.contains_key(id) {
+        return Ok(ProviderWait::Available);
+    }
+
+    let deadline = tokio::time::sleep(wait);
+    tokio::pin!(deadline);
+    let mut poll = interval(REGISTRY_POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                if registry.contains_key(id) {
+                    return Ok(ProviderWait::Available);
+                }
+            }
+            _ = &mut deadline => return Ok(ProviderWait::TimedOut),
+            message = control.recv_client() => {
+                match message? {
+                    Some(ClientMsg::Heartbeat) => {}
+                    Some(message) => warn!(%id, ?message, "unexpected message while waiting for provider"),
+                    None => return Ok(ProviderWait::ClientClosed),
+                }
+            }
+        }
+    }
 }
 
 /// Shared control-plane loop for both peers. Sends the server heartbeat, brokers
@@ -477,6 +523,19 @@ async fn serve_consumer(
     _peer: SocketAddr,
     max_conns: Arc<Semaphore>,
 ) -> Result<()> {
+    match wait_for_provider(&mut control, &registry, &id, PEER_REGISTRATION_TIMEOUT).await? {
+        ProviderWait::Available => {}
+        ProviderWait::ClientClosed => return Ok(()),
+        ProviderWait::TimedOut => {
+            control
+                .send_server(ServerMsg::Error {
+                    reason: format!("source did not register channel '{id}' within 10 minutes"),
+                })
+                .await?;
+            return Ok(());
+        }
+    }
+
     control.send_server(ServerMsg::Ok).await?;
     info!(%id, "consumer connected");
 
@@ -526,22 +585,16 @@ async fn accept_relays(
     }
 }
 
-/// Broker UDP candidates: when consumer offers, look up the provider.
-/// If provider has already offered candidates, send both sides UdpPunch.
+/// Relay one consumer substream to the provider that was present when the
+/// consumer control connection was acknowledged.
 async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Result<()> {
     let mut marker = [0u8; 1];
     consumer.read_exact(&mut marker).await?;
 
-    let pool = tokio::time::timeout(PROVIDER_REGISTRATION_TIMEOUT, async {
-        loop {
-            if let Some(pool) = registry.get(id).map(|entry| Arc::clone(entry.value())) {
-                break pool;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("provider registration timed out for '{id}'"))?;
+    let pool = registry
+        .get(id)
+        .map(|entry| Arc::clone(entry.value()))
+        .with_context(|| format!("source for channel '{id}' is no longer available"))?;
     let opener = pool.pick().context("no live provider carrier")?;
     let mut provider = opener.open().await.context("provider unavailable")?;
     provider.write_all(&[mux::STREAM_READY]).await?;
@@ -568,6 +621,59 @@ impl Drop for DropGuard {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[tokio::test(start_paused = true)]
+    async fn destination_waits_beyond_the_old_ten_second_registration_window() {
+        let registry = Arc::new(DashMap::new());
+        let (server_side, client_side) = duplex(1024);
+        let mut control = Delimited::new(server_side);
+        let wait_registry = Arc::clone(&registry);
+        let waiter = tokio::spawn(async move {
+            wait_for_provider(
+                &mut control,
+                &wait_registry,
+                "delayed-source",
+                Duration::from_secs(10 * 60),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            !waiter.is_finished(),
+            "destination must still wait after the former ten-second cutoff"
+        );
+
+        drop(client_side);
+        assert_eq!(
+            waiter.await.expect("wait task").expect("wait result"),
+            ProviderWait::ClientClosed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn destination_provider_wait_has_an_explicit_deadline() {
+        let registry = Arc::new(DashMap::new());
+        let (server_side, _client_side) = duplex(1024);
+        let mut control = Delimited::new(server_side);
+        let waiter = tokio::spawn(async move {
+            wait_for_provider(
+                &mut control,
+                &registry,
+                "missing-source",
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            waiter.await.expect("wait task").expect("wait result"),
+            ProviderWait::TimedOut
+        );
+    }
 
     /// A peer whose control substream goes silent is reaped once the recv deadline
     /// elapses — even while the server keeps heartbeating it. Drains server→client
