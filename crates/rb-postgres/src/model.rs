@@ -69,6 +69,18 @@ pub struct PgTablespace {
     pub location: String,
 }
 
+/// Locale implementation backing a database's default collation.
+///
+/// PostgreSQL 10–14 only support `libc` at database scope. PostgreSQL 15 adds
+/// ICU and PostgreSQL 17 adds the built-in provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PgLocaleProvider {
+    Libc,
+    Icu,
+    Builtin,
+}
+
 /// A database plus its full object tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PgDatabase {
@@ -77,6 +89,16 @@ pub struct PgDatabase {
     pub encoding: String,
     pub collate: String,
     pub ctype: String,
+    /// Database locale provider. Missing only in plans produced before this
+    /// field was introduced; those plans are interpreted as `libc`.
+    #[serde(default)]
+    pub locale_provider: Option<PgLocaleProvider>,
+    /// ICU locale (PostgreSQL 15–16) or provider locale (PostgreSQL 17+).
+    #[serde(default)]
+    pub provider_locale: Option<String>,
+    /// Additional ICU collation rules (PostgreSQL 16+).
+    #[serde(default)]
+    pub icu_rules: Option<String>,
     /// `None` when the database is on `pg_default`.
     pub tablespace: Option<String>,
     pub connlimit: i32,
@@ -291,6 +313,9 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                 encoding: "UTF8".to_string(),
                 collate: "en_US.utf8".to_string(),
                 ctype: "en_US.utf8".to_string(),
+                locale_provider: Some(PgLocaleProvider::Libc),
+                provider_locale: None,
+                icu_rules: None,
                 tablespace: None,
                 connlimit: -1,
                 allow_connections: true,
@@ -422,5 +447,22 @@ mod tests {
         let s = serde_json::to_string(&payload).expect("to_string");
         let back: PgPlanPayload = serde_json::from_str(&s).expect("from_str");
         assert_eq!(payload, back);
+    }
+
+    #[test]
+    fn legacy_payload_without_locale_provider_defaults_to_libc_compatibility() {
+        let payload = super::test_fixture();
+        let mut json = serde_json::to_value(&payload).expect("serialize");
+        let db = json["databases"][0]
+            .as_object_mut()
+            .expect("database object");
+        db.remove("locale_provider");
+        db.remove("provider_locale");
+        db.remove("icu_rules");
+
+        let back: PgPlanPayload = serde_json::from_value(json).expect("legacy deserialize");
+        assert_eq!(back.databases[0].locale_provider, None);
+        assert_eq!(back.databases[0].provider_locale, None);
+        assert_eq!(back.databases[0].icu_rules, None);
     }
 }

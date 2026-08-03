@@ -12,7 +12,8 @@
 //!   `pg_get_expr`, `pg_get_partkeydef`) instead of hand-reconstructing DDL.
 //! - `left(nspname,3) <> 'pg_'` to skip system schemas (no `LIKE`-escape pitfalls).
 //! - Version-branch the few catalog columns that differ across 10..=latest
-//!   (`attgenerated` is 12+, `prokind` is 11+).
+//!   (`attgenerated` is 12+, `prokind` is 11+, database locale metadata is
+//!   provider-aware in 15+ and renamed in 17).
 //! - Exclude extension-owned objects from DDL (recreated by `CREATE EXTENSION`).
 //!
 //! NOTE: the live introspection is validated against a real server via the e2e
@@ -44,7 +45,7 @@ pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload
     let memberships = gather_memberships(&boot.client).await?;
     let tablespaces = gather_tablespaces(&boot.client).await?;
     let names = target_database_names(params, &boot.client).await?;
-    let mut databases = gather_databases_meta(&boot.client, &names).await?;
+    let mut databases = gather_databases_meta(&boot.client, &names, server_major).await?;
     drop(boot);
 
     // Per-database trees require a connection to each database.
@@ -159,43 +160,79 @@ async fn target_database_names(params: &PostgresParams, client: &Client) -> Resu
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-async fn gather_databases_meta(client: &Client, names: &[String]) -> Result<Vec<PgDatabase>> {
+/// Catalog projection normalized to provider / provider-locale / ICU-rules.
+/// Keep this aligned with PostgreSQL's own `pg_dump` version branches.
+fn database_locale_projection(server_major: u32) -> &'static str {
+    if server_major >= 17 {
+        "d.datlocprovider::text, d.datlocale::text, d.daticurules::text"
+    } else if server_major >= 16 {
+        "d.datlocprovider::text, d.daticulocale::text, d.daticurules::text"
+    } else if server_major >= 15 {
+        "d.datlocprovider::text, d.daticulocale::text, NULL::text"
+    } else {
+        "'c'::text, NULL::text, NULL::text"
+    }
+}
+
+fn parse_locale_provider(value: &str) -> Result<PgLocaleProvider> {
+    match value {
+        "c" => Ok(PgLocaleProvider::Libc),
+        "i" => Ok(PgLocaleProvider::Icu),
+        "b" => Ok(PgLocaleProvider::Builtin),
+        other => Err(BackupError::phase(
+            Phase::Analyze,
+            format!("introspect: unsupported database locale provider {other:?}"),
+        )),
+    }
+}
+
+async fn gather_databases_meta(
+    client: &Client,
+    names: &[String],
+    server_major: u32,
+) -> Result<Vec<PgDatabase>> {
+    let locale_projection = database_locale_projection(server_major);
+    let sql = format!(
+        "SELECT d.datname::text, pg_catalog.pg_get_userbyid(d.datdba)::text, \
+                pg_catalog.pg_encoding_to_char(d.encoding)::text, \
+                d.datcollate::text, d.datctype::text, {locale_projection}, \
+                ts.spcname::text, d.datconnlimit, d.datallowconn, d.datistemplate, \
+                pg_catalog.shobj_description(d.oid, 'pg_database')::text, \
+                (SELECT s.setconfig FROM pg_catalog.pg_db_role_setting s \
+                    WHERE s.setdatabase = d.oid AND s.setrole = 0) \
+         FROM pg_catalog.pg_database d \
+         LEFT JOIN pg_catalog.pg_tablespace ts \
+            ON ts.oid = d.dattablespace AND ts.spcname <> 'pg_default' \
+         WHERE d.datname = ANY($1) \
+         ORDER BY d.datname"
+    );
     let rows = client
-        .query(
-            "SELECT d.datname::text, pg_catalog.pg_get_userbyid(d.datdba)::text, \
-                    pg_catalog.pg_encoding_to_char(d.encoding)::text, \
-                    d.datcollate::text, d.datctype::text, ts.spcname::text, \
-                    d.datconnlimit, d.datallowconn, d.datistemplate, \
-                    pg_catalog.shobj_description(d.oid, 'pg_database')::text, \
-                    (SELECT s.setconfig FROM pg_catalog.pg_db_role_setting s \
-                        WHERE s.setdatabase = d.oid AND s.setrole = 0) \
-             FROM pg_catalog.pg_database d \
-             LEFT JOIN pg_catalog.pg_tablespace ts \
-                ON ts.oid = d.dattablespace AND ts.spcname <> 'pg_default' \
-             WHERE d.datname = ANY($1) \
-             ORDER BY d.datname",
-            &[&names],
-        )
+        .query(&sql, &[&names])
         .await
         .map_err(|e| analyze_err("databases", e))?;
-    Ok(rows
-        .iter()
-        .map(|r| PgDatabase {
-            name: r.get(0),
-            owner: r.get(1),
-            encoding: r.get(2),
-            collate: r.get(3),
-            ctype: r.get(4),
-            tablespace: r.get(5),
-            connlimit: r.get(6),
-            allow_connections: r.get(7),
-            is_template: r.get(8),
-            comment: r.get(9),
-            config: r.get::<_, Option<Vec<String>>>(10).unwrap_or_default(),
-            extensions: Vec::new(),
-            schemas: Vec::new(),
+    rows.iter()
+        .map(|r| {
+            let locale_provider = parse_locale_provider(&r.get::<_, String>(5))?;
+            Ok(PgDatabase {
+                name: r.get(0),
+                owner: r.get(1),
+                encoding: r.get(2),
+                collate: r.get(3),
+                ctype: r.get(4),
+                locale_provider: Some(locale_provider),
+                provider_locale: r.get(6),
+                icu_rules: r.get(7),
+                tablespace: r.get(8),
+                connlimit: r.get(9),
+                allow_connections: r.get(10),
+                is_template: r.get(11),
+                comment: r.get(12),
+                config: r.get::<_, Option<Vec<String>>>(13).unwrap_or_default(),
+                extensions: Vec::new(),
+                schemas: Vec::new(),
+            })
         })
-        .collect())
+        .collect()
 }
 
 // --- per-database ------------------------------------------------------------
@@ -712,6 +749,47 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_locale_catalog_projection_covers_supported_majors() {
+        for major in 10..=14 {
+            assert_eq!(
+                database_locale_projection(major),
+                "'c'::text, NULL::text, NULL::text"
+            );
+        }
+        assert_eq!(
+            database_locale_projection(15),
+            "d.datlocprovider::text, d.daticulocale::text, NULL::text"
+        );
+        assert_eq!(
+            database_locale_projection(16),
+            "d.datlocprovider::text, d.daticulocale::text, d.daticurules::text"
+        );
+        for major in 17..=18 {
+            assert_eq!(
+                database_locale_projection(major),
+                "d.datlocprovider::text, d.datlocale::text, d.daticurules::text"
+            );
+        }
+    }
+
+    #[test]
+    fn database_locale_provider_catalog_codes_are_strict() {
+        assert_eq!(
+            parse_locale_provider("c").expect("libc"),
+            PgLocaleProvider::Libc
+        );
+        assert_eq!(
+            parse_locale_provider("i").expect("icu"),
+            PgLocaleProvider::Icu
+        );
+        assert_eq!(
+            parse_locale_provider("b").expect("builtin"),
+            PgLocaleProvider::Builtin
+        );
+        assert!(parse_locale_provider("future-provider").is_err());
+    }
 
     #[test]
     fn rfc3339_known_vectors() {

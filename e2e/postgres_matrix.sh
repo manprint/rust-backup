@@ -57,7 +57,11 @@ seed_source() { # container
 CREATE ROLE app_owner LOGIN PASSWORD 'x';
 CREATE ROLE readers;
 GRANT readers TO app_owner;
-CREATE DATABASE appdb OWNER app_owner;
+-- Deliberately differs from the UTF8 template1 in the official image. Restore
+-- must select template0 automatically or CREATE DATABASE is rejected before
+-- any schema/data is applied.
+CREATE DATABASE appdb OWNER app_owner TEMPLATE template0
+  ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C';
 \connect appdb
 CREATE SCHEMA app AUTHORIZATION app_owner;
 CREATE TABLE app.accounts (
@@ -93,6 +97,23 @@ data_checksum() { # container db
 schema_dump() { # container db
   docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
     | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict '
+}
+
+# Immutable database properties, with catalog columns normalized across 10..18.
+database_metadata() { # container
+  local locale_columns
+  if (( MAJOR >= 17 )); then
+    locale_columns="d.datlocprovider::text, coalesce(d.datlocale, ''), coalesce(d.daticurules, '')"
+  elif (( MAJOR >= 16 )); then
+    locale_columns="d.datlocprovider::text, coalesce(d.daticulocale, ''), coalesce(d.daticurules, '')"
+  elif (( MAJOR >= 15 )); then
+    locale_columns="d.datlocprovider::text, coalesce(d.daticulocale, ''), ''"
+  else
+    locale_columns="'c', '', ''"
+  fi
+  docker exec "$1" psql -U postgres -d postgres -At -F'|' -c \
+    "SELECT pg_encoding_to_char(d.encoding), d.datcollate, d.datctype, ${locale_columns}
+       FROM pg_database d WHERE d.datname = 'appdb'"
 }
 
 run_transfer() { # src_port dst_port channel [abort]
@@ -173,6 +194,18 @@ for MAJOR in "${MAJORS[@]}"; do
     echo "PASS: destination schema matches source"; PASS=$((PASS+1))
   else
     echo "FAIL: schema differs (see /tmp/rb-schema.diff)"; FAIL=$((FAIL+1))
+  fi
+
+  # 6) Regression: encoding, collation and locale-provider metadata survive a
+  # restore even though they differ from destination template1.
+  source_db_metadata=$(database_metadata "$SRC")
+  destination_db_metadata=$(database_metadata "$DST")
+  if [[ "$source_db_metadata" == "SQL_ASCII|C|C|c||" && \
+        "$source_db_metadata" == "$destination_db_metadata" ]]; then
+    echo "PASS: database locale metadata matches source"; PASS=$((PASS+1))
+  else
+    echo "FAIL: database locale metadata differs: source=${source_db_metadata} destination=${destination_db_metadata}"
+    FAIL=$((FAIL+1))
   fi
 
   docker rm -f "$SRC" "$DST" >/dev/null 2>&1 || true

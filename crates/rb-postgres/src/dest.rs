@@ -20,7 +20,7 @@ use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{human_bytes, BackupPlan, Preflight};
 
-use crate::ddl::{build_cluster_ddl, quote_ident, quote_qualified};
+use crate::ddl::{build_cluster_ddl, create_database, quote_ident, quote_qualified};
 use crate::model::PgPlanPayload;
 use crate::source::ItemMeta;
 use crate::{PgConnection, PostgresParams};
@@ -92,6 +92,26 @@ pub fn assess(
             format!("'{}' already exists (use --overwrite to replace)", db.name)
         };
         pf = pf.check(format!("database:{}", db.name), ok, detail);
+
+        match create_database(db, probe.dest_major) {
+            Ok(_) => {
+                pf = pf.check(
+                    format!("database_locale:{}", db.name),
+                    true,
+                    format!(
+                        "encoding and locale can be recreated on PostgreSQL {}",
+                        probe.dest_major
+                    ),
+                );
+            }
+            Err(error) => {
+                pf = pf.check(
+                    format!("database_locale:{}", db.name),
+                    false,
+                    error.to_string(),
+                );
+            }
+        }
     }
 
     // Informational only: free disk is not visible over a SQL connection.
@@ -160,10 +180,10 @@ pub async fn stream_in(
 ) -> Result<()> {
     let payload: PgPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
-    let ddl = build_cluster_ddl(&payload);
 
     // 1. Cluster scope: roles, then databases.
     let boot = PgConnection::connect(params, &params.bootstrap_database()).await?;
+    let ddl = build_cluster_ddl(&payload, boot.server_major)?;
     run_statements(&boot.client, &ddl.roles).await?;
     run_statements(&boot.client, &ddl.databases).await?;
     drop(boot);
@@ -359,6 +379,20 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name == "server_version" && !c.passed));
+    }
+
+    #[test]
+    fn preflight_rejects_incomplete_locale_metadata() {
+        let mut payload = crate::model::test_fixture();
+        payload.databases[0].locale_provider = Some(crate::model::PgLocaleProvider::Icu);
+        payload.databases[0].provider_locale = None;
+
+        let pf = assess(&payload, &probe(16, true, true, true), false, 0);
+        assert!(!pf.ok);
+        assert!(pf
+            .checks
+            .iter()
+            .any(|c| c.name == "database_locale:appdb" && !c.passed));
     }
 
     #[test]

@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: [10, 12, 14, 16, 18]
+        version: [10, 11, 12, 13, 14, 15, 16, 17, 18]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

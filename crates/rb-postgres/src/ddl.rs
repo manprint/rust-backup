@@ -18,6 +18,7 @@
 //! letters. Roles are created without passwords (not captured — see `model`).
 
 use crate::model::*;
+use rb_core::error::{BackupError, Phase, Result};
 
 /// Cluster-wide DDL split by the connection it must run on.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,16 +142,107 @@ pub fn create_tablespace(t: &PgTablespace) -> String {
     )
 }
 
-/// `CREATE DATABASE … WITH …;`.
-pub fn create_database(d: &PgDatabase) -> String {
+/// `CREATE DATABASE … WITH TEMPLATE = template0 …;`, rendered for the
+/// destination major. `template0` is required when encoding or locale differ
+/// from the destination cluster's `template1`.
+pub fn create_database(d: &PgDatabase, destination_major: u32) -> Result<String> {
+    if destination_major < 10 {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!("cannot create database on unsupported PostgreSQL {destination_major}"),
+        ));
+    }
+
+    // Historical plans did not capture enough data to distinguish providers;
+    // preserve their former libc-style interpretation.
+    let provider = d.locale_provider.unwrap_or(PgLocaleProvider::Libc);
+    match provider {
+        PgLocaleProvider::Icu if destination_major < 15 => {
+            return Err(BackupError::phase(
+                Phase::Apply,
+                format!(
+                    "database {:?} uses ICU, unsupported by PostgreSQL {destination_major}",
+                    d.name
+                ),
+            ));
+        }
+        PgLocaleProvider::Builtin if destination_major < 17 => {
+            return Err(BackupError::phase(
+                Phase::Apply,
+                format!(
+                    "database {:?} uses the builtin locale provider, unsupported by PostgreSQL {destination_major}",
+                    d.name
+                ),
+            ));
+        }
+        _ => {}
+    }
+    if d.icu_rules.is_some() && provider != PgLocaleProvider::Icu {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!("database {:?} has ICU rules but is not using ICU", d.name),
+        ));
+    }
+    if d.icu_rules.is_some() && destination_major < 16 {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!(
+                "database {:?} has ICU rules, unsupported by PostgreSQL {destination_major}",
+                d.name
+            ),
+        ));
+    }
+    if matches!(provider, PgLocaleProvider::Icu | PgLocaleProvider::Builtin)
+        && d.provider_locale.is_none()
+    {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!(
+                "database {:?} is missing its {} locale",
+                d.name,
+                match provider {
+                    PgLocaleProvider::Icu => "ICU",
+                    PgLocaleProvider::Builtin => "builtin",
+                    PgLocaleProvider::Libc => "provider",
+                }
+            ),
+        ));
+    }
+
     let mut s = format!(
-        "CREATE DATABASE {} WITH OWNER = {} ENCODING = {} LC_COLLATE = {} LC_CTYPE = {}",
+        "CREATE DATABASE {} WITH TEMPLATE = template0 OWNER = {} ENCODING = {}",
         quote_ident(&d.name),
         quote_ident(&d.owner),
         quote_literal(&d.encoding),
-        quote_literal(&d.collate),
-        quote_literal(&d.ctype),
     );
+    if destination_major >= 15 {
+        let provider_name = match provider {
+            PgLocaleProvider::Libc => "libc",
+            PgLocaleProvider::Icu => "icu",
+            PgLocaleProvider::Builtin => "builtin",
+        };
+        s.push_str(&format!(" LOCALE_PROVIDER = {provider_name}"));
+    }
+    // LC_COLLATE/LC_CTYPE are understood by every supported major. The LOCALE
+    // shortcut was added after PostgreSQL 10, so do not use it here.
+    s.push_str(&format!(" LC_COLLATE = {}", quote_literal(&d.collate)));
+    s.push_str(&format!(" LC_CTYPE = {}", quote_literal(&d.ctype)));
+    if let Some(locale) = &d.provider_locale {
+        let option = match provider {
+            PgLocaleProvider::Icu => "ICU_LOCALE",
+            PgLocaleProvider::Builtin => "BUILTIN_LOCALE",
+            PgLocaleProvider::Libc => {
+                return Err(BackupError::phase(
+                    Phase::Apply,
+                    format!("database {:?} has a provider locale but uses libc", d.name),
+                ));
+            }
+        };
+        s.push_str(&format!(" {option} = {}", quote_literal(locale)));
+    }
+    if let Some(rules) = &d.icu_rules {
+        s.push_str(&format!(" ICU_RULES = {}", quote_literal(rules)));
+    }
     if let Some(ts) = &d.tablespace {
         s.push_str(&format!(" TABLESPACE = {}", quote_ident(ts)));
     }
@@ -161,7 +253,7 @@ pub fn create_database(d: &PgDatabase) -> String {
         s.push_str(" ALLOW_CONNECTIONS = false");
     }
     s.push(';');
-    s
+    Ok(s)
 }
 
 /// `ALTER DATABASE … SET k TO v;` for each database GUC (best-effort).
@@ -411,8 +503,18 @@ pub fn grants_from_acl(objtype: &str, qual: &str, acl: &[String]) -> Vec<String>
 
 // --- assembly ----------------------------------------------------------------
 
-/// Assemble the full, ordered cluster DDL from the payload.
-pub fn build_cluster_ddl(payload: &PgPlanPayload) -> ClusterDdl {
+/// Assemble the full, ordered cluster DDL from the payload, adapting database
+/// locale syntax to the actual destination PostgreSQL major.
+pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Result<ClusterDdl> {
+    if destination_major < payload.server_major {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!(
+                "destination PostgreSQL {destination_major} is older than source PostgreSQL {}",
+                payload.server_major
+            ),
+        ));
+    }
     let mut roles = Vec::new();
     for r in &payload.roles {
         roles.push(create_role(r));
@@ -429,17 +531,17 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload) -> ClusterDdl {
 
     let mut databases = Vec::new();
     for d in &payload.databases {
-        databases.push(create_database(d));
+        databases.push(create_database(d, destination_major)?);
         databases.extend(alter_database_settings(d));
     }
 
     let per_database = payload.databases.iter().map(build_database_ddl).collect();
 
-    ClusterDdl {
+    Ok(ClusterDdl {
         roles,
         databases,
         per_database,
-    }
+    })
 }
 
 fn build_database_ddl(d: &PgDatabase) -> DatabaseDdl {
@@ -703,14 +805,106 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            create_database(&d),
-            "CREATE DATABASE \"appdb\" WITH OWNER = \"app_owner\" ENCODING = 'UTF8' \
-             LC_COLLATE = 'en_US.utf8' LC_CTYPE = 'en_US.utf8';"
+            create_database(&d, 16).expect("database DDL"),
+            "CREATE DATABASE \"appdb\" WITH TEMPLATE = template0 OWNER = \"app_owner\" \
+             ENCODING = 'UTF8' LOCALE_PROVIDER = libc LC_COLLATE = 'en_US.utf8' \
+             LC_CTYPE = 'en_US.utf8';"
         );
         assert_eq!(
             alter_database_settings(&d),
             vec!["ALTER DATABASE \"appdb\" SET statement_timeout TO 0;"]
         );
+    }
+
+    #[test]
+    fn database_locale_ddl_is_version_aware_from_10_through_18() {
+        let base = PgDatabase {
+            name: "appdb".into(),
+            owner: "app_owner".into(),
+            encoding: "UTF8".into(),
+            collate: "C".into(),
+            ctype: "en_US.utf8".into(),
+            locale_provider: Some(PgLocaleProvider::Libc),
+            connlimit: -1,
+            allow_connections: true,
+            ..Default::default()
+        };
+
+        for major in 10..=14 {
+            assert_eq!(
+                create_database(&base, major).expect("libc DDL"),
+                "CREATE DATABASE \"appdb\" WITH TEMPLATE = template0 OWNER = \"app_owner\" \
+                 ENCODING = 'UTF8' LC_COLLATE = 'C' LC_CTYPE = 'en_US.utf8';"
+            );
+        }
+        for major in 15..=18 {
+            assert_eq!(
+                create_database(&base, major).expect("libc provider DDL"),
+                "CREATE DATABASE \"appdb\" WITH TEMPLATE = template0 OWNER = \"app_owner\" \
+                 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LC_COLLATE = 'C' \
+                 LC_CTYPE = 'en_US.utf8';"
+            );
+        }
+    }
+
+    #[test]
+    fn database_icu_and_builtin_options_follow_server_capabilities() {
+        let mut database = PgDatabase {
+            name: "localized".into(),
+            owner: "owner".into(),
+            encoding: "UTF8".into(),
+            collate: "C".into(),
+            ctype: "C".into(),
+            locale_provider: Some(PgLocaleProvider::Icu),
+            provider_locale: Some("und-u-ks-level2".into()),
+            connlimit: -1,
+            allow_connections: true,
+            ..Default::default()
+        };
+
+        assert!(create_database(&database, 14).is_err());
+        let pg15 = create_database(&database, 15).expect("PostgreSQL 15 ICU");
+        assert!(pg15.contains("LOCALE_PROVIDER = icu"));
+        assert!(pg15.contains("ICU_LOCALE = 'und-u-ks-level2'"));
+        assert!(!pg15.contains("ICU_RULES"));
+
+        database.icu_rules = Some("&V < w <<< W".into());
+        assert!(create_database(&database, 15).is_err());
+        for major in 16..=18 {
+            let ddl = create_database(&database, major).expect("ICU rules DDL");
+            assert!(ddl.contains("ICU_RULES = '&V < w <<< W'"));
+        }
+
+        database.locale_provider = Some(PgLocaleProvider::Builtin);
+        database.provider_locale = Some("C.UTF-8".into());
+        database.icu_rules = None;
+        assert!(create_database(&database, 16).is_err());
+        for major in 17..=18 {
+            let ddl = create_database(&database, major).expect("builtin DDL");
+            assert!(ddl.contains("LOCALE_PROVIDER = builtin"));
+            assert!(ddl.contains("BUILTIN_LOCALE = 'C.UTF-8'"));
+        }
+    }
+
+    #[test]
+    fn legacy_database_plan_is_treated_as_libc() {
+        let database = PgDatabase {
+            name: "legacy".into(),
+            owner: "owner".into(),
+            encoding: "UTF8".into(),
+            collate: "C".into(),
+            ctype: "C".into(),
+            connlimit: -1,
+            allow_connections: true,
+            ..Default::default()
+        };
+        let pg14 = create_database(&database, 14).expect("legacy PostgreSQL 14 DDL");
+        assert!(pg14.contains("TEMPLATE = template0"));
+        assert!(pg14.contains("LC_COLLATE = 'C' LC_CTYPE = 'C'"));
+        assert!(!pg14.contains(" LOCALE = "));
+        assert!(create_database(&database, 18)
+            .expect("legacy PostgreSQL 18 DDL")
+            .contains("LOCALE_PROVIDER = libc"));
     }
 
     #[test]
@@ -908,7 +1102,7 @@ mod tests {
     #[test]
     fn cluster_ddl_assembly_ordering() {
         let payload = crate::model::test_fixture();
-        let ddl = build_cluster_ddl(&payload);
+        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
 
         // Roles created, then memberships, then tablespaces.
         assert!(ddl.roles[0].starts_with("CREATE ROLE \"app_owner\""));

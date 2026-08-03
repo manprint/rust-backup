@@ -3,6 +3,12 @@
 `postgres` performs a logical PostgreSQL 10..=18 copy with pure-Rust catalog
 introspection and binary `COPY`; it never calls `pg_dump`.
 
+Database encoding and locale are restored independently of the destination
+cluster defaults. The module uses `template0` automatically and preserves the
+database locale provider using the catalog and DDL available in each supported
+major (`libc` on 10–14, ICU metadata on 15+, ICU rules on 16+, and `builtin` on
+17+).
+
 ## Captured and restore order
 
 The source captures cluster roles, memberships, databases, schemas, extensions,
@@ -25,4 +31,4 @@ roles/databases/schemas and applies ownership/grants. `--admin` marks this inten
 - `sslmode=require`, `verify-ca`, and `verify-full` use rustls. Pass a private
   root CA as `-P sslrootcert=/path/to/ca.pem`; TLS modes are never downgraded.
 - Live version-matrix verification requires Docker: `e2e/postgres_matrix.sh
-  10 12 14 16 18`.
+  10 11 12 13 14 15 16 17 18`.
