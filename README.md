@@ -8,13 +8,14 @@
 `rust-backup` streams a backup directly from a read-only source to its
 destination through a coordination server. It does not create an intermediate
 archive. The destination validates a self-contained plan before applying data,
-each item and the complete payload are verified with BLAKE3, and the source is
-fingerprinted again on every exit path to prove that it was not modified.
+each item and the complete payload are verified with BLAKE3, the persisted
+destination is read back through the backend, and the source is fingerprinted
+again on every exit path to prove that it was not modified.
 
 Supported modules:
 
 - PostgreSQL 10–18: logical cluster metadata and binary `COPY` data.
-- MongoDB 4–8: databases, collections, indexes, users and BSON documents.
+- MongoDB 4–8: databases, collection options, indexes and BSON documents.
 - POSIX filesystem: files, directories, links, modes, ownership and mtimes.
 - AWS S3 and compatible storage such as MinIO: streaming multipart restore.
 
@@ -58,13 +59,36 @@ docker run --rm ghcr.io/manprint/rust-backup:latest --version
  source ──register(channel)──▶ coordination server ◀──connect(channel)── destination
    │ analyze → plan ───────────── relay/direct stream ────────────────▶ validate
    │ read-only stream ═════ BLAKE3 chunks + backpressure ════════════▶ restore
-   └ source fingerprint unchanged                 CompleteAck ◀───────┘
+   │                                          persisted backend read-back
+   └ source fingerprint unchanged        VerificationAck ◀───────────┘
 ```
 
 Source and destination must use the same coordination address, channel and
 secret. Start the source first; it waits for the destination. A destination
 prints the plan and asks for confirmation unless `--yes` or
 `auto_accept: true` is set.
+
+## Verified completion
+
+Exit code `0` is issued only after both sides complete the formal proof. The
+destination reopens the restored backend, compares its restorable catalog or
+metadata, streams every persisted data item again, and reproduces the source
+item and payload BLAKE3 commitments. The source then proves its own complete
+fingerprint is unchanged. A legacy completion acknowledgement without read-back
+evidence is rejected.
+
+Successful runs end with `status="verified"` at `100.0%` and these messages on
+the respective peers:
+
+```text
+BACKUP VERIFIED: source unchanged; destination read-back matches
+RESTORE VERIFIED: persisted destination matches source
+```
+
+Both messages include the same payload BLAKE3. Apply, catalog, data read-back,
+source audit, timeout, or acknowledgement failures produce a non-zero exit and
+never print verified completion. See each module document for the exact
+restorable contract and its explicit exclusions.
 
 ## Deploy the coordination server
 
@@ -348,12 +372,14 @@ sudo -n "$PWD/e2e/filesystem_disk_full.sh"
 sudo -n "$PWD/e2e/transport_netns_test.sh"
 sudo -n "$PWD/e2e/bandwidth_netem.sh"
 
-# PostgreSQL 10, 12, 14, 16 and 18.
+# PostgreSQL same-major and cross-major restores.
 bash e2e/postgres_introspect.sh 16
-bash e2e/postgres_matrix.sh 10 12 14 16 18
+bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18
+bash e2e/postgres_matrix.sh 10:18 12:16 14:17 16:18
 
-# MongoDB 4, 5, 6, 7 and 8.
+# MongoDB same-major and cross-major restores.
 bash e2e/mongodb_matrix.sh 4 5 6 7 8
+bash e2e/mongodb_matrix.sh 4:8 5:7 6:8
 
 # S3-compatible and optional credential-gated real AWS.
 bash e2e/s3_minio_test.sh

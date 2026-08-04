@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use crate::channel::{ChunkSink, ChunkSource};
 use crate::error::{BackupError, Result};
 use crate::plan::{BackupPlan, Preflight};
+use crate::verification::{RestoreEvidence, VerificationReport};
 
 /// Opaque per-target parameter bag (merged from CLI/env/yaml). Each module
 /// deserializes it into its own typed params struct.
@@ -67,6 +68,15 @@ pub trait Destination: Send + Sync {
 
     /// Apply the streamed payload to reach 1:1 with the source. No temp files.
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()>;
+
+    /// Read the persisted destination back and prove that every selected item
+    /// matches the source commitment. Success is not acknowledged to the
+    /// source until this verification completes.
+    async fn verify(
+        &self,
+        plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport>;
 }
 
 /// A backup-capable backend type. One instance per module, registered once.

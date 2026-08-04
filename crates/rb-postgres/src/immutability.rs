@@ -1,15 +1,16 @@
 //! Source-immutability fingerprint (plan Phase 2.7).
 //!
 //! [`fingerprint`] produces a stable digest of the source: a structural catalog
-//! hash (estimates/sequence values normalized out, since autovacuum/ANALYZE move
-//! them without any user mutation) plus, per data-bearing table, an exact
-//! `COUNT(*)` and a deterministic sampled content checksum. The session captures
+//! hash (planner estimates normalized out, since autovacuum/ANALYZE moves them
+//! without user mutation) plus, per data-bearing table, an exact `COUNT(*)` and
+//! a complete deterministic content checksum. The session captures
 //! it before and after every run and raises `BackupError::SourceMutated` on any
 //! drift (I-IMMUT). All queries are read-only, on a `connect_read_only` session.
 //!
 //! The digest COMPOSITION is pure and unit-tested; the catalog/COUNT/checksum
 //! queries are exercised by the postgres e2e (incl. the mid-`COPY`-abort case).
 
+use futures_util::StreamExt;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::wire::blake3_hex;
 use tokio_postgres::Client;
@@ -19,15 +20,12 @@ use crate::introspect;
 use crate::model::PgPlanPayload;
 use crate::{PgConnection, PostgresParams};
 
-/// Max rows hashed per table for the content checksum (deterministic sample).
-const CHECKSUM_SAMPLE_ROWS: usize = 10_000;
-
 /// Snapshot the source fingerprint composes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFingerprint {
     /// Hash of the structural catalog (estimates normalized out).
     pub catalog_hash: String,
-    /// Per-table exact row count + sampled content checksum.
+    /// Per-table exact row count + complete content checksum.
     pub tables: Vec<TableStat>,
 }
 
@@ -37,7 +35,7 @@ pub struct TableStat {
     /// `database.schema.table`.
     pub name: String,
     pub rows: i64,
-    /// Hex digest over a deterministic row sample (`""` when empty/unreadable).
+    /// BLAKE3 over every row in deterministic text order.
     pub checksum: String,
 }
 
@@ -86,18 +84,14 @@ pub fn compose(snap: &SourceFingerprint) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Zero out fields that drift without user mutation (planner estimates, sequence
-/// values) so the structural hash reflects schema/DDL only.
+/// Zero out planner estimates that drift without user mutation. Sequence state
+/// is retained because it is restored state and any change is real source drift.
 fn normalize(p: &mut PgPlanPayload) {
     for db in &mut p.databases {
         for s in &mut db.schemas {
             for t in &mut s.tables {
                 t.estimated_rows = 0;
                 t.estimated_bytes = 0;
-            }
-            for seq in &mut s.sequences {
-                seq.last_value = None;
-                seq.is_called = false;
             }
         }
     }
@@ -110,7 +104,7 @@ fn hash_catalog(p: &PgPlanPayload) -> String {
     blake3_hex(&bytes)
 }
 
-/// Exact `COUNT(*)` plus a deterministic sampled content checksum for one table.
+/// Exact `COUNT(*)` plus a complete streaming checksum for one table.
 async fn table_stat(client: &Client, db: &str, schema: &str, table: &str) -> Result<TableStat> {
     let qual = quote_qualified(schema, table);
 
@@ -120,18 +114,23 @@ async fn table_stat(client: &Client, db: &str, schema: &str, table: &str) -> Res
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {qual}"), e))?;
     let rows: i64 = count_row.get(0);
 
-    // Deterministic sample: hash each row's text, ordered by that text, capped.
-    // Ordering by the row text makes the sample stable across runs when data is
-    // unchanged (a bare LIMIT would pick arbitrary rows and falsely "drift").
-    let sum_sql = format!(
-        "SELECT coalesce(md5(string_agg(h, '')), '') FROM \
-         (SELECT md5(t::text) AS h FROM {qual} t ORDER BY t::text LIMIT {CHECKSUM_SAMPLE_ROWS}) s"
+    // Stream hashes of all rows instead of aggregating them in server memory.
+    // Sorting by row text is order-independent and duplicate rows remain visible.
+    let copy_sql = format!(
+        "COPY (SELECT md5(t::text) FROM {qual} t ORDER BY t::text COLLATE \"C\") TO STDOUT"
     );
-    let checksum_row = client
-        .query_one(&sum_sql, &[])
+    let stream = client
+        .copy_out(&copy_sql)
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("checksum {qual}"), e))?;
-    let checksum: String = checksum_row.get(0);
+    futures_util::pin_mut!(stream);
+    let mut hasher = blake3::Hasher::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("checksum {qual}"), e))?;
+        hasher.update(&chunk);
+    }
+    let checksum = hasher.finalize().to_hex().to_string();
 
     Ok(TableStat {
         name: format!("{db}.{schema}.{table}"),
@@ -191,14 +190,17 @@ mod tests {
     #[test]
     fn normalize_zeroes_volatile_estimates() {
         let mut p = crate::model::test_fixture();
-        // fixture has non-zero estimates + a sequence last_value.
+        // Planner estimates are volatile; sequence state is not.
         assert_ne!(p.databases[0].schemas[0].tables[0].estimated_bytes, 0);
-        assert!(p.databases[0].schemas[0].sequences[0].last_value.is_some());
+        let sequence_value = p.databases[0].schemas[0].sequences[0].last_value;
 
         normalize(&mut p);
         assert_eq!(p.databases[0].schemas[0].tables[0].estimated_bytes, 0);
         assert_eq!(p.databases[0].schemas[0].tables[0].estimated_rows, 0);
-        assert!(p.databases[0].schemas[0].sequences[0].last_value.is_none());
+        assert_eq!(
+            p.databases[0].schemas[0].sequences[0].last_value,
+            sequence_value
+        );
     }
 
     #[test]

@@ -535,7 +535,11 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
         databases.extend(alter_database_settings(d));
     }
 
-    let per_database = payload.databases.iter().map(build_database_ddl).collect();
+    let per_database = payload
+        .databases
+        .iter()
+        .map(|database| build_database_ddl(database, destination_major))
+        .collect();
 
     Ok(ClusterDdl {
         roles,
@@ -544,7 +548,7 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
     })
 }
 
-fn build_database_ddl(d: &PgDatabase) -> DatabaseDdl {
+fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
     let mut pre = Vec::new();
     let mut post = Vec::new();
 
@@ -553,6 +557,21 @@ fn build_database_ddl(d: &PgDatabase) -> DatabaseDdl {
     }
     for sc in &d.schemas {
         pre.push(create_schema(sc));
+        // `CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION ...` does not alter
+        // the pre-created schema. PostgreSQL 15+ also creates it under the
+        // virtual pg_database_owner role, so cross-major restores must make
+        // ownership and default grants explicit.
+        pre.push(format!(
+            "ALTER SCHEMA {} OWNER TO {};",
+            quote_ident(&sc.name),
+            quote_ident(&sc.owner)
+        ));
+        if sc.name == "public" {
+            pre.push("REVOKE ALL ON SCHEMA \"public\" FROM PUBLIC;".to_string());
+            if destination_major >= 15 {
+                pre.push("REVOKE ALL ON SCHEMA \"public\" FROM \"pg_database_owner\";".to_string());
+            }
+        }
         if let Some(c) = &sc.comment {
             pre.push(comment_on("SCHEMA", &quote_ident(&sc.name), c));
         }
@@ -1139,5 +1158,30 @@ mod tests {
         assert!(db.pre_data.iter().all(|s| !s.contains("ADD CONSTRAINT")));
         // setval is post-data.
         assert!(db.post_data.iter().any(|s| s.contains("pg_catalog.setval")));
+    }
+
+    #[test]
+    fn public_schema_defaults_are_reset_before_source_acl_is_restored() {
+        let mut payload = crate::model::test_fixture();
+        payload.server_major = 14;
+        let schema = &mut payload.databases[0].schemas[0];
+        schema.name = "public".into();
+        schema.owner = "app_owner".into();
+        schema.acl = vec!["=U/app_owner".into()];
+
+        let pg14 = build_cluster_ddl(&payload, 14).expect("PostgreSQL 14 DDL");
+        let pre14 = &pg14.per_database[0].pre_data;
+        assert!(pre14.contains(&"ALTER SCHEMA \"public\" OWNER TO \"app_owner\";".to_string()));
+        assert!(pre14.contains(&"REVOKE ALL ON SCHEMA \"public\" FROM PUBLIC;".to_string()));
+        assert!(pre14.iter().all(|sql| !sql.contains("pg_database_owner")));
+
+        let pg18 = build_cluster_ddl(&payload, 18).expect("PostgreSQL 18 DDL");
+        let db18 = &pg18.per_database[0];
+        assert!(db18
+            .pre_data
+            .contains(&"REVOKE ALL ON SCHEMA \"public\" FROM \"pg_database_owner\";".to_string()));
+        assert!(db18
+            .post_data
+            .contains(&"GRANT USAGE ON SCHEMA \"public\" TO PUBLIC;".to_string()));
     }
 }

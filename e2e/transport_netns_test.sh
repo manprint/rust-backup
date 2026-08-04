@@ -161,8 +161,9 @@ run_transfer() { # label initial-udp-block drop-after-direct
   local src_digest dst_digest
   src_digest=$(rb_tree_digest "$src")
   dst_digest=$(rb_tree_digest "$dst")
-  if (( src_rc == 0 && dst_rc == 0 )) && [[ "$src_digest" == "$dst_digest" ]]; then
-    pass "$label: transfer completed with identical tree"
+  if (( src_rc == 0 && dst_rc == 0 )) && [[ "$src_digest" == "$dst_digest" ]] && \
+     rb_assert_formal_verification "$work/$label-source.log" "$work/$label-destination.log"; then
+    pass "$label: transfer completed with identical tree and persisted read-back proof"
   else
     fail "$label: transfer/tree verification failed"
     printf 'DIAG: %s source_rc=%d destination_rc=%d source_digest=%s destination_digest=%s\n' \

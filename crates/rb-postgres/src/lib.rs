@@ -27,9 +27,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use rb_core::channel::{ChunkSink, ChunkSource};
-use rb_core::error::Result;
+use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
+use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 
 /// PostgreSQL connection parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +154,26 @@ impl Destination for PostgresDestination {
 
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
         dest::stream_in(&self.params, plan, src).await
+    }
+
+    async fn verify(
+        &self,
+        plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        dest::verify_catalog(&self.params, plan).await?;
+        let mut verifier = VerificationSink::new(evidence);
+        source::stream_out(&self.params, plan, &mut verifier)
+            .await
+            .map_err(|error| {
+                BackupError::phase_src(
+                    Phase::Verify,
+                    "read back restored PostgreSQL table data",
+                    error,
+                )
+            })?;
+        verifier.finish().await?;
+        verifier.report("PostgreSQL catalog and deterministic binary COPY read-back match")
     }
 }
 

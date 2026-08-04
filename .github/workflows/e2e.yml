@@ -71,6 +71,30 @@ jobs:
           DATABASE_VERSION: ${{ matrix.version }}
         run: bash e2e/postgres_matrix.sh "$DATABASE_VERSION"
 
+  postgres-cross-version:
+    name: PostgreSQL ${{ matrix.pair }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ['10:18', '12:16', '14:17', '16:18']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-pg-cross-${{ matrix.pair }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_PAIR: ${{ matrix.pair }}
+        run: bash e2e/postgres_matrix.sh "$DATABASE_PAIR"
+
   mongodb:
     name: MongoDB ${{ matrix.version }}
     runs-on: ubuntu-24.04
@@ -94,6 +118,30 @@ jobs:
       - env:
           DATABASE_VERSION: ${{ matrix.version }}
         run: bash e2e/mongodb_matrix.sh "$DATABASE_VERSION"
+
+  mongodb-cross-version:
+    name: MongoDB ${{ matrix.pair }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ['4:8', '5:7', '6:8']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-mongo-cross-${{ matrix.pair }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_PAIR: ${{ matrix.pair }}
+        run: bash e2e/mongodb_matrix.sh "$DATABASE_PAIR"
 
   filesystem-privileged:
     name: Filesystem metadata and ENOSPC

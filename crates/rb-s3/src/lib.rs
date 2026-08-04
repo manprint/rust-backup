@@ -9,7 +9,7 @@
 //! GET bodies are forwarded in wire-sized chunks. Restores use bounded (5 MiB)
 //! multipart parts, never a staging file or a whole-object buffer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{
     BackupMode, BackupPlan, IntegritySpec, PlanItem, Preflight, PLAN_FORMAT_VERSION,
 };
+use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 use rb_core::wire::CHUNK_SIZE;
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
@@ -315,6 +316,38 @@ async fn list_objects(params: &S3Params, phase: Phase) -> Result<Vec<S3Object>> 
     Ok(objects)
 }
 
+async fn list_keys(
+    client: &Client,
+    bucket: &str,
+    prefix: Option<&str>,
+    phase: Phase,
+) -> Result<BTreeSet<String>> {
+    let mut token = None;
+    let mut keys = BTreeSet::new();
+    loop {
+        let page = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .set_prefix(prefix.map(str::to_owned))
+            .set_continuation_token(token)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::phase(phase, format!("list destination S3 scope: {error}"))
+            })?;
+        for object in page.contents() {
+            if let Some(key) = object.key() {
+                keys.insert(key.to_string());
+            }
+        }
+        if !page.is_truncated().unwrap_or(false) {
+            break;
+        }
+        token = page.next_continuation_token().map(str::to_owned);
+    }
+    Ok(keys)
+}
+
 fn now_rfc3339() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -447,14 +480,19 @@ impl Source for S3Source {
 
     async fn fingerprint(&self) -> Result<String> {
         let objects = list_objects(&self.params, Phase::Analyze).await?;
+        let policy = client(&self.params)
+            .await
+            .get_bucket_policy()
+            .bucket(&self.params.bucket)
+            .send()
+            .await
+            .ok()
+            .and_then(|response| response.policy().map(str::to_owned));
         let mut hash = blake3::Hasher::new();
-        for object in objects {
-            hash.update(object.key.as_bytes());
-            hash.update(&[0]);
-            hash.update(object.etag.as_deref().unwrap_or("").as_bytes());
-            hash.update(&[0]);
-            hash.update(&object.size.to_le_bytes());
-        }
+        hash.update(b"rust-backup/s3-fingerprint/v2\n");
+        hash.update(&serde_json::to_vec(&objects).unwrap_or_default());
+        hash.update(b"\npolicy:");
+        hash.update(policy.as_deref().unwrap_or("").as_bytes());
         Ok(hash.finalize().to_hex().to_string())
     }
 }
@@ -467,6 +505,69 @@ fn target_key(payload: &S3Plan, target_prefix: Option<&str>, source_key: &str) -
         None => source_key,
     };
     Ok(format!("{}{}", target_prefix.unwrap_or(""), relative))
+}
+
+/// Preserve bucket-policy semantics when source and destination bucket names
+/// differ. S3 policies address the bucket by ARN, so copying the source JSON
+/// verbatim would produce a policy that no longer governs the restored bucket.
+fn translated_policy(
+    policy: &str,
+    source_bucket: &str,
+    destination_bucket: &str,
+    phase: Phase,
+) -> Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(policy).map_err(|error| {
+        BackupError::phase(phase, format!("source S3 policy is invalid JSON: {error}"))
+    })?;
+    let source_arn = format!("arn:aws:s3:::{source_bucket}");
+    let destination_arn = format!("arn:aws:s3:::{destination_bucket}");
+    rewrite_bucket_arns(&mut value, &source_arn, &destination_arn);
+    serde_json::to_string(&value)
+        .map_err(|error| BackupError::phase_src(phase, "serialize translated S3 policy", error))
+}
+
+fn rewrite_bucket_arns(value: &mut serde_json::Value, source: &str, destination: &str) {
+    match value {
+        serde_json::Value::String(string) => {
+            if string == source {
+                *string = destination.to_string();
+            } else if let Some(suffix) = string.strip_prefix(source) {
+                if suffix.starts_with('/') {
+                    *string = format!("{destination}{suffix}");
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rewrite_bucket_arns(value, source, destination);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                rewrite_bucket_arns(value, source, destination);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_policy(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values.iter_mut() {
+                canonicalize_policy(value);
+            }
+            // IAM policy Statement/Action/Resource/condition-value arrays are
+            // sets. Providers may return them in a different order after PUT.
+            values.sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                canonicalize_policy(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[async_trait]
@@ -491,26 +592,50 @@ impl Destination for S3Destination {
                 "destination bucket is missing; set create_bucket=true to permit creation"
             },
         );
-        if exists && !self.params.overwrite {
-            for object in &payload.objects {
-                let key = target_key(&payload, self.params.prefix.as_deref(), &object.key)?;
-                let collision = client
-                    .head_object()
-                    .bucket(&self.params.bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .is_ok();
-                result = result.check(
-                    format!("object:{key}"),
-                    !collision,
-                    if collision {
-                        "target object exists; set overwrite=true to permit replacement"
-                    } else {
-                        "target key is unused"
-                    },
-                );
+        if exists {
+            let expected: BTreeSet<_> = payload
+                .objects
+                .iter()
+                .map(|object| target_key(&payload, self.params.prefix.as_deref(), &object.key))
+                .collect::<Result<_>>()?;
+            let actual = list_keys(
+                &client,
+                &self.params.bucket,
+                self.params.prefix.as_deref(),
+                Phase::Validate,
+            )
+            .await?;
+            if !self.params.overwrite {
+                for key in &expected {
+                    let collision = actual.contains(key);
+                    result = result.check(
+                        format!("object:{key}"),
+                        !collision,
+                        if collision {
+                            "target object exists; set overwrite=true to permit replacement"
+                        } else {
+                            "target key is unused"
+                        },
+                    );
+                }
             }
+            let unexpected: Vec<_> = actual.difference(&expected).cloned().collect();
+            result = result.check(
+                "destination-scope",
+                unexpected.is_empty() || self.params.overwrite,
+                if unexpected.is_empty() {
+                    "destination prefix contains no objects outside the backup plan".to_string()
+                } else if self.params.overwrite {
+                    format!(
+                        "{} stale object(s) will be removed from the destination prefix (--overwrite)",
+                        unexpected.len()
+                    )
+                } else {
+                    format!(
+                        "destination prefix contains stale objects not in the source: {unexpected:?}; use --overwrite to replace the scope"
+                    )
+                },
+            );
         }
         Ok(result)
     }
@@ -538,6 +663,34 @@ impl Destination for S3Destination {
                 .await
                 .map_err(|e| BackupError::phase(Phase::Apply, format!("create S3 bucket: {e}")))?;
         }
+        let expected_keys: BTreeSet<_> = payload
+            .objects
+            .iter()
+            .map(|object| target_key(&payload, self.params.prefix.as_deref(), &object.key))
+            .collect::<Result<_>>()?;
+        if self.params.overwrite {
+            let actual_keys = list_keys(
+                &client,
+                &self.params.bucket,
+                self.params.prefix.as_deref(),
+                Phase::Apply,
+            )
+            .await?;
+            for stale in actual_keys.difference(&expected_keys) {
+                client
+                    .delete_object()
+                    .bucket(&self.params.bucket)
+                    .key(stale)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        BackupError::phase(
+                            Phase::Apply,
+                            format!("remove stale S3 object {stale:?}: {error}"),
+                        )
+                    })?;
+            }
+        }
         for item in &plan.items {
             let object = payload
                 .objects
@@ -546,7 +699,13 @@ impl Destination for S3Destination {
             let key = target_key(&payload, self.params.prefix.as_deref(), &object.key)?;
             restore_object(&client, &self.params.bucket, &key, object, item, source).await?;
         }
-        if let Some(policy) = payload.policy {
+        if let Some(policy) = &payload.policy {
+            let policy = translated_policy(
+                policy,
+                &payload.source_bucket,
+                &self.params.bucket,
+                Phase::Apply,
+            )?;
             client
                 .put_bucket_policy()
                 .bucket(&self.params.bucket)
@@ -564,6 +723,173 @@ impl Destination for S3Destination {
                 "received data beyond S3 plan",
             )),
         }
+    }
+
+    async fn verify(
+        &self,
+        plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        verify_restored_objects(&self.params, plan, evidence).await
+    }
+}
+
+async fn verify_restored_objects(
+    params: &S3Params,
+    plan: &BackupPlan,
+    evidence: &RestoreEvidence,
+) -> Result<VerificationReport> {
+    let payload = decode_plan(plan, Phase::Verify)?;
+    let client = client(params).await;
+    let expected_keys: BTreeSet<_> = payload
+        .objects
+        .iter()
+        .map(|object| target_key(&payload, params.prefix.as_deref(), &object.key))
+        .collect::<Result<_>>()?;
+    let actual_keys = list_keys(
+        &client,
+        &params.bucket,
+        params.prefix.as_deref(),
+        Phase::Verify,
+    )
+    .await?;
+    if actual_keys != expected_keys {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!(
+                "restored S3 prefix key set differs: source={expected_keys:?} destination={actual_keys:?}"
+            ),
+        ));
+    }
+    let mut verifier = VerificationSink::new(evidence);
+    for item in &plan.items {
+        let object = payload
+            .objects
+            .get(item.id as usize)
+            .ok_or_else(|| BackupError::phase(Phase::Verify, "plan item has no S3 object"))?;
+        let key = target_key(&payload, params.prefix.as_deref(), &object.key)?;
+        let head = client
+            .head_object()
+            .bucket(&params.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("head restored S3 object {key:?}: {error}"),
+                )
+            })?;
+        let size = head.content_length().unwrap_or(-1).max(0) as u64;
+        let metadata: BTreeMap<_, _> = head
+            .metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if size != object.size
+            || head.content_type().map(str::to_owned) != object.content_type
+            || metadata != object.metadata
+        {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("restored S3 metadata mismatch for {key:?}"),
+            ));
+        }
+
+        let response = client
+            .get_object()
+            .bucket(&params.bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("read restored S3 object {key:?}: {error}"),
+                )
+            })?;
+        let mut body = response.body.into_async_read();
+        let mut hasher = blake3::Hasher::new();
+        let mut offset = 0_u64;
+        let mut buffer = vec![0_u8; CHUNK_SIZE];
+        loop {
+            let read = body.read(&mut buffer).await.map_err(|error| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("stream restored S3 object {key:?}: {error}"),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            verifier
+                .send_chunk(item.id, offset, &buffer[..read])
+                .await?;
+            offset += read as u64;
+        }
+        let digest = hasher.finalize().to_hex().to_string();
+        verifier.finish_item(item.id, offset, &digest).await?;
+    }
+
+    if let Some(expected_policy) = &payload.policy {
+        let actual_policy = client
+            .get_bucket_policy()
+            .bucket(&params.bucket)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::phase(Phase::Verify, format!("read restored S3 policy: {error}"))
+            })?
+            .policy()
+            .map(str::to_owned)
+            .ok_or_else(|| BackupError::phase(Phase::Verify, "restored S3 policy is missing"))?;
+        let expected_policy = translated_policy(
+            expected_policy,
+            &payload.source_bucket,
+            &params.bucket,
+            Phase::Verify,
+        )?;
+        let mut expected_json: serde_json::Value =
+            serde_json::from_str(&expected_policy).map_err(|e| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("translated S3 policy is invalid JSON: {e}"),
+                )
+            })?;
+        let mut actual_json: serde_json::Value =
+            serde_json::from_str(&actual_policy).map_err(|e| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("destination S3 policy is invalid JSON: {e}"),
+                )
+            })?;
+        canonicalize_policy(&mut expected_json);
+        canonicalize_policy(&mut actual_json);
+        if actual_json != expected_json {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!(
+                    "restored S3 bucket policy differs from source: source={} destination={}",
+                    compact_json(&expected_json),
+                    compact_json(&actual_json)
+                ),
+            ));
+        }
+    }
+
+    verifier.finish().await?;
+    verifier.report("S3 object metadata, policy and GET read-back match")
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    const MAX: usize = 500;
+    let rendered = value.to_string();
+    if rendered.chars().count() <= MAX {
+        rendered
+    } else {
+        format!("{}…", rendered.chars().take(MAX).collect::<String>())
     }
 }
 
@@ -823,6 +1149,39 @@ async fn abort_upload<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_policy_arns_follow_the_destination_bucket() {
+        let source = r#"{
+          "Statement": [{
+            "Resource": ["arn:aws:s3:::source", "arn:aws:s3:::source/in/*"],
+            "Unrelated": "arn:aws:s3:::source-extra/in/*"
+          }]
+        }"#;
+        let translated = translated_policy(source, "source", "destination", Phase::Apply).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&translated).unwrap();
+        assert_eq!(
+            json["Statement"][0]["Resource"],
+            serde_json::json!(["arn:aws:s3:::destination", "arn:aws:s3:::destination/in/*"])
+        );
+        assert_eq!(
+            json["Statement"][0]["Unrelated"],
+            "arn:aws:s3:::source-extra/in/*"
+        );
+    }
+
+    #[test]
+    fn policy_array_order_is_semantically_irrelevant() {
+        let mut first = serde_json::json!({
+            "Statement": [{"Action": ["s3:GetObject", "s3:ListBucket"]}, {"Sid": "b"}]
+        });
+        let mut second = serde_json::json!({
+            "Statement": [{"Sid": "b"}, {"Action": ["s3:ListBucket", "s3:GetObject"]}]
+        });
+        canonicalize_policy(&mut first);
+        canonicalize_policy(&mut second);
+        assert_eq!(first, second);
+    }
     #[test]
     fn destination_prefix_rewrites_only_source_prefix() {
         let plan = S3Plan {

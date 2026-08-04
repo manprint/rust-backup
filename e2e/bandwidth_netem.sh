@@ -77,7 +77,13 @@ run_case() { # label bytes max-rate-or-empty
   monitor=$!
   wait "$spid" || rc=1; wait "$dpid" || rc=1; wait "$monitor" || true
   elapsed=$(( $(date +%s) - started )); max_rss=$(sort -n "$work/$label-rss.log" | tail -1); max_rss=${max_rss:-0}
-  if (( rc == 0 )) && [[ "$before" == "$(rb_tree_digest "$src")" ]] && [[ "$(rb_tree_digest "$src")" == "$(rb_tree_digest "$dst")" ]]; then pass "$label: transfer and digest verification"; else fail "$label: transfer or digest verification"; fi
+  if (( rc == 0 )) && [[ "$before" == "$(rb_tree_digest "$src")" ]] && \
+     [[ "$(rb_tree_digest "$src")" == "$(rb_tree_digest "$dst")" ]] && \
+     rb_assert_formal_verification "$work/$label-source.log" "$work/$label-destination.log"; then
+    pass "$label: transfer, digest, and persisted read-back verification"
+  else
+    fail "$label: transfer or formal verification"
+  fi
   if (( max_rss <= RSS_LIMIT_KIB )); then pass "$label: source RSS ${max_rss} KiB <= ${RSS_LIMIT_KIB} KiB"; else fail "$label: source RSS ${max_rss} KiB exceeds cap"; fi
   CASE_ELAPSED=$elapsed
   CASE_BYTES=$bytes

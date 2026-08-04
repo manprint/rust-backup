@@ -22,6 +22,7 @@ use crate::error::{BackupError, Phase, Result};
 use crate::module::{Destination, Source};
 use crate::plan::BackupPlan;
 use crate::progress::Progress;
+use crate::verification::{RestoreEvidence, VerificationReport};
 use crate::wire::{self, ControlFrame};
 
 /// Budget for the plan/ack exchange. Data traffic has its independent idle
@@ -35,6 +36,7 @@ const DEFAULT_PLAN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// a transport-level EOF.
 const DESTINATION_ABORT_GRACE: Duration = Duration::from_secs(1);
 const ABORT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DESTINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn plan_exchange_timeout() -> Duration {
     std::env::var("RUST_BACKUP_PLAN_TIMEOUT")
@@ -43,6 +45,15 @@ fn plan_exchange_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_PLAN_EXCHANGE_TIMEOUT)
+}
+
+fn destination_verify_timeout() -> Duration {
+    std::env::var("RUST_BACKUP_VERIFY_TIMEOUT")
+        .ok()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_DESTINATION_VERIFY_TIMEOUT)
 }
 
 async fn exchange_timeout<T>(
@@ -65,27 +76,31 @@ async fn exchange_timeout_with<T>(
     })?
 }
 
-fn validate_completion_ack(frame: Option<ControlFrame>) -> Result<()> {
+fn validate_completion_ack(frame: Option<ControlFrame>) -> Result<VerificationReport> {
     match frame {
-        Some(ControlFrame::CompleteAck) => Ok(()),
+        Some(ControlFrame::VerificationAck { report }) => Ok(report),
+        Some(ControlFrame::CompleteAck) => Err(BackupError::phase(
+            Phase::Verify,
+            "legacy destination did not provide persisted read-back evidence",
+        )),
         Some(ControlFrame::Abort { reason }) => Err(BackupError::phase(
             Phase::Apply,
             format!("destination aborted: {reason}"),
         )),
         other => Err(BackupError::phase(
             Phase::Verify,
-            format!("expected CompleteAck, got {other:?}"),
+            format!("expected VerificationAck, got {other:?}"),
         )),
     }
 }
 
-async fn send_completion_ack<S>(stream: &mut S) -> Result<()>
+async fn send_completion_ack<S>(stream: &mut S, report: VerificationReport) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    wire::send_frame(stream, &ControlFrame::CompleteAck).await?;
+    wire::send_frame(stream, &ControlFrame::VerificationAck { report }).await?;
     let ack = tokio::time::timeout(
-        wire::IO_IDLE_TIMEOUT,
+        destination_verify_timeout(),
         wire::recv_frame::<_, ControlFrame>(stream),
     )
     .await
@@ -95,26 +110,31 @@ where
             "timed out waiting for source completion acknowledgement",
         )
     })??;
-    if !matches!(ack, Some(ControlFrame::CompleteAckAck)) {
-        return Err(BackupError::phase(
-            Phase::Verify,
-            format!("expected CompleteAckAck, got {ack:?}"),
-        ));
+    match ack {
+        Some(ControlFrame::CompleteAckAck) => {}
+        Some(ControlFrame::Abort { reason }) => {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("source rejected completion: {reason}"),
+            ));
+        }
+        other => {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!("expected CompleteAckAck, got {other:?}"),
+            ));
+        }
     }
-    stream.shutdown().await.map_err(|error| {
-        BackupError::phase_src(
-            Phase::Transfer,
-            "gracefully close destination completion stream",
-            error,
-        )
-    })
+    wire::send_frame(stream, &ControlFrame::VerificationComplete).await?;
+    await_peer_close(stream, "source").await
 }
 
 async fn send_completion_ack_ack<S>(stream: &mut S) -> Result<()>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     wire::send_frame(stream, &ControlFrame::CompleteAckAck).await?;
+    await_verification_complete(stream).await?;
     stream.shutdown().await.map_err(|error| {
         BackupError::phase_src(
             Phase::Transfer,
@@ -124,11 +144,140 @@ where
     })
 }
 
+async fn send_completion_ack_ack_split<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    wire::send_frame(writer, &ControlFrame::CompleteAckAck).await?;
+    await_verification_complete(reader).await?;
+    writer.shutdown().await.map_err(|error| {
+        BackupError::phase_src(
+            Phase::Transfer,
+            "gracefully close source completion stream",
+            error,
+        )
+    })
+}
+
+async fn await_verification_complete<R>(reader: &mut R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = tokio::time::timeout(
+        wire::IO_IDLE_TIMEOUT,
+        wire::recv_frame::<_, ControlFrame>(reader),
+    )
+    .await
+    .map_err(|_| {
+        BackupError::phase(
+            Phase::Verify,
+            "timed out waiting for destination final verification confirmation",
+        )
+    })??;
+    match frame {
+        Some(ControlFrame::VerificationComplete) => Ok(()),
+        other => Err(BackupError::phase(
+            Phase::Verify,
+            format!("expected VerificationComplete, got {other:?}"),
+        )),
+    }
+}
+
+async fn await_peer_close<R>(reader: &mut R, peer: &str) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = tokio::time::timeout(
+        wire::IO_IDLE_TIMEOUT,
+        wire::recv_frame::<_, ControlFrame>(reader),
+    )
+    .await
+    .map_err(|_| {
+        BackupError::phase(
+            Phase::Verify,
+            format!("timed out waiting for {peer} verified close"),
+        )
+    })??;
+    match frame {
+        None => Ok(()),
+        other => Err(BackupError::phase(
+            Phase::Verify,
+            format!("expected {peer} verified close, got {other:?}"),
+        )),
+    }
+}
+
+async fn audit_source_before_ack<S>(
+    source: &dyn Source,
+    baseline: &str,
+    stream: &mut S,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let current = match source.fingerprint().await {
+        Ok(current) => current,
+        Err(error) => {
+            let error = BackupError::phase_src(
+                Phase::Verify,
+                "post-run source fingerprint audit failed",
+                error,
+            );
+            let _ = wire::send_frame(
+                stream,
+                &ControlFrame::Abort {
+                    reason: error.to_string(),
+                },
+            )
+            .await;
+            let _ = stream.shutdown().await;
+            return Err(error);
+        }
+    };
+    if current != baseline {
+        let error = BackupError::SourceMutated(format!(
+            "source fingerprint changed during backup ({baseline} -> {current})"
+        ));
+        let _ = wire::send_frame(
+            stream,
+            &ControlFrame::Abort {
+                reason: error.to_string(),
+            },
+        )
+        .await;
+        let _ = stream.shutdown().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn verify_destination(
+    dest: &dyn Destination,
+    plan: &BackupPlan,
+    evidence: &RestoreEvidence,
+) -> Result<VerificationReport> {
+    info!(
+        items = evidence.item_blake3.len(),
+        bytes = evidence.total_bytes,
+        "destination read-back verification started"
+    );
+    tokio::time::timeout(destination_verify_timeout(), dest.verify(plan, evidence))
+        .await
+        .map_err(|_| {
+            BackupError::phase(
+                Phase::Verify,
+                "destination read-back verification timed out",
+            )
+        })?
+}
+
 /// Outcome of a completed source run (returned for logging/tests).
 #[derive(Debug)]
 pub struct SourceOutcome {
     pub plan: BackupPlan,
     pub bytes_sent: u64,
+    pub verification: VerificationReport,
 }
 
 /// Run the SOURCE side: analyze (read-only) → send plan → await accept → stream
@@ -156,44 +305,47 @@ pub async fn run_source_limited(
     // 1. Immutability baseline (read-only).
     let fp_before = source.fingerprint().await?;
 
-    let outcome = source_run(source, channel, progress, max_rate).await;
+    let outcome = source_run(source, channel, progress, max_rate, &fp_before).await;
 
     // 6. Immutability audit — the central invariant. It runs on EVERY exit path,
     // including a run that failed or was aborted mid-stream: an aborted transfer
     // is exactly the case where a half-applied source write would hide.
-    match source.fingerprint().await {
-        Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
-            "source fingerprint changed during backup ({fp_before} -> {fp_after})"
-        ))),
-        Ok(_) => {
-            if let Ok(o) = &outcome {
-                info!(bytes = o.bytes_sent, "source done; immutability verified");
-            } else {
-                info!("source run failed; source verified unchanged");
-            }
-            outcome
+    match outcome {
+        Ok(outcome) => {
+            progress.complete();
+            info!(
+                items = outcome.verification.items_verified,
+                bytes = outcome.verification.bytes_verified,
+                blake3 = %outcome.verification.payload_blake3,
+                detail = %outcome.verification.detail,
+                "BACKUP VERIFIED: source unchanged; destination read-back matches"
+            );
+            Ok(outcome)
         }
-        // A failed audit cannot prove immutability. If the run itself already
-        // failed, that error is the more informative one; otherwise surface the
-        // audit failure — a "successful" run we cannot audit is not a success.
-        Err(audit_err) => match outcome {
-            Err(run_err) => Err(run_err),
-            Ok(_) => Err(BackupError::phase_src(
-                Phase::Verify,
-                "post-run source fingerprint audit failed",
-                audit_err,
-            )),
+        Err(run_error) => match source.fingerprint().await {
+            Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
+                "source fingerprint changed during backup ({fp_before} -> {fp_after})"
+            ))),
+            Ok(_) => {
+                info!("source run failed; source verified unchanged");
+                Err(run_error)
+            }
+            // The run already failed, so preserve its more useful primary
+            // error even if the best-effort failure-path audit also fails.
+            Err(_) => Err(run_error),
         },
     }
 }
 
 /// The source run proper (analyze → plan exchange → stream → Done), without the
-/// immutability audit, which [`run_source_limited`] applies to every exit path.
+/// success-path immutability audit. [`run_source_limited`] also audits every
+/// failure path.
 async fn source_run(
     source: &dyn Source,
     channel: &dyn DataChannel,
     progress: &Progress,
     max_rate: Option<u64>,
+    source_baseline: &str,
 ) -> Result<SourceOutcome> {
     // 2. Analyze and build the self-contained plan (read-only).
     let plan = source.analyze().await?;
@@ -220,7 +372,10 @@ async fn source_run(
 
     if separate_data_streams || agreed_carriers > 1 {
         return source_stream_multi(
-            source,
+            SourceAudit {
+                source,
+                baseline: source_baseline,
+            },
             channel,
             progress,
             max_rate,
@@ -271,7 +426,7 @@ async fn source_run(
     )
     .await?;
     let completion = tokio::time::timeout(
-        wire::IO_IDLE_TIMEOUT,
+        destination_verify_timeout(),
         wire::recv_frame::<_, ControlFrame>(&mut stream),
     )
     .await
@@ -281,17 +436,27 @@ async fn source_run(
             "timed out waiting for destination completion acknowledgement",
         )
     })??;
-    validate_completion_ack(completion)?;
+    let verification = validate_completion_ack(completion)?;
+    audit_source_before_ack(source, source_baseline, &mut stream).await?;
     send_completion_ack_ack(&mut stream).await?;
 
-    Ok(SourceOutcome { plan, bytes_sent })
+    Ok(SourceOutcome {
+        plan,
+        bytes_sent,
+        verification,
+    })
+}
+
+struct SourceAudit<'a> {
+    source: &'a dyn Source,
+    baseline: &'a str,
 }
 
 /// Source payload path for the negotiated separate-data layout. The plan/control
 /// stream is kept out of the data plane even with one carrier; an item always
 /// maps to exactly one data substream.
 async fn source_stream_multi(
-    source: &dyn Source,
+    audit: SourceAudit<'_>,
     channel: &dyn DataChannel,
     progress: &Progress,
     max_rate: Option<u64>,
@@ -324,7 +489,7 @@ async fn source_stream_multi(
         let mut control_read = control_read;
         let received = wire::recv_frame::<_, ControlFrame>(&mut control_read).await;
         let observed = match &received {
-            Ok(Some(ControlFrame::CompleteAck)) => None,
+            Ok(Some(ControlFrame::CompleteAck | ControlFrame::VerificationAck { .. })) => None,
             Ok(Some(ControlFrame::Abort { reason })) => {
                 Some(format!("destination aborted: {reason}"))
             }
@@ -337,12 +502,12 @@ async fn source_stream_multi(
         if let Some(observed) = observed {
             let _ = abort_tx.send(Some(observed));
         }
-        received
+        (received, control_read)
     });
     let mut data_sink = MultiStreamChunkSink::new_counted(streams, progress.clone())?;
     let (streamed, payload_digest) = {
         let mut sink = PacedSink::new(&mut data_sink, max_rate).with_abort_watch(&mut abort_rx);
-        let result = match source.stream_out(&plan, &mut sink).await {
+        let result = match audit.source.stream_out(&plan, &mut sink).await {
             Ok(()) => sink.finish().await,
             Err(e) => Err(e),
         };
@@ -383,23 +548,30 @@ async fn source_stream_multi(
         let _ = abort_task.await;
         return Err(error);
     }
-    let completion = tokio::time::timeout(wire::IO_IDLE_TIMEOUT, abort_task)
-        .await
-        .map_err(|_| {
-            BackupError::phase(
-                Phase::Verify,
-                "timed out waiting for destination completion acknowledgement",
-            )
-        })?
-        .map_err(|error| {
-            BackupError::phase(
-                Phase::Transfer,
-                format!("completion watcher task failed: {error}"),
-            )
-        })??;
-    validate_completion_ack(completion)?;
-    send_completion_ack_ack(&mut control_write).await?;
-    Ok(SourceOutcome { plan, bytes_sent })
+    let (completion, mut control_read) =
+        tokio::time::timeout(destination_verify_timeout(), abort_task)
+            .await
+            .map_err(|_| {
+                BackupError::phase(
+                    Phase::Verify,
+                    "timed out waiting for destination completion acknowledgement",
+                )
+            })?
+            .map_err(|error| {
+                BackupError::phase(
+                    Phase::Transfer,
+                    format!("completion watcher task failed: {error}"),
+                )
+            })?;
+    let completion = completion?;
+    let verification = validate_completion_ack(completion)?;
+    audit_source_before_ack(audit.source, audit.baseline, &mut control_write).await?;
+    send_completion_ack_ack_split(&mut control_read, &mut control_write).await?;
+    Ok(SourceOutcome {
+        plan,
+        bytes_sent,
+        verification,
+    })
 }
 
 struct PacedSink<'a> {
@@ -638,6 +810,7 @@ where
     let mut src = StreamChunkSource::new_counted(stream, progress.clone());
     let apply_result = dest.stream_in(&plan, &mut src).await;
     let received_items = src.completed_item_ids();
+    let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();
     let mut stream = src.into_inner();
     if let Err(error) = apply_result {
@@ -696,8 +869,34 @@ where
                     "Done.blake3 does not match verified item digests",
                 ));
             }
-            send_completion_ack(&mut stream).await?;
-            info!(bytes = total_bytes, "destination done; restore complete");
+            let evidence = RestoreEvidence {
+                total_bytes,
+                payload_blake3: blake3,
+                item_blake3: received_item_digests,
+            };
+            let report = match verify_destination(dest, &plan, &evidence).await {
+                Ok(report) => report,
+                Err(error) => {
+                    let _ = wire::send_frame(
+                        &mut stream,
+                        &ControlFrame::Abort {
+                            reason: error.to_string(),
+                        },
+                    )
+                    .await;
+                    let _ = stream.shutdown().await;
+                    return Err(error);
+                }
+            };
+            send_completion_ack(&mut stream, report.clone()).await?;
+            progress.complete();
+            info!(
+                items = report.items_verified,
+                bytes = report.bytes_verified,
+                blake3 = %report.payload_blake3,
+                detail = %report.detail,
+                "RESTORE VERIFIED: persisted destination matches source"
+            );
         }
         Some(ControlFrame::Abort { reason }) => {
             return Err(BackupError::phase(
@@ -780,6 +979,7 @@ async fn destination_stream_multi(
         MultiStreamChunkSource::new_ordered(streams, expected_item_ids, progress.clone())?;
     let apply_result = dest.stream_in(&plan, &mut src).await;
     let received_items = src.completed_item_ids();
+    let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();
     if let Err(error) = apply_result {
         let sent = wire::send_frame(
@@ -844,11 +1044,34 @@ async fn destination_stream_multi(
                     "Done.blake3 does not match verified item digests",
                 ));
             }
-            send_completion_ack(&mut control).await?;
+            let evidence = RestoreEvidence {
+                total_bytes,
+                payload_blake3: blake3,
+                item_blake3: received_item_digests,
+            };
+            let report = match verify_destination(dest, &plan, &evidence).await {
+                Ok(report) => report,
+                Err(error) => {
+                    let _ = wire::send_frame(
+                        &mut control,
+                        &ControlFrame::Abort {
+                            reason: error.to_string(),
+                        },
+                    )
+                    .await;
+                    let _ = control.shutdown().await;
+                    return Err(error);
+                }
+            };
+            send_completion_ack(&mut control, report.clone()).await?;
+            progress.complete();
             info!(
-                bytes = total_bytes,
+                items = report.items_verified,
+                bytes = report.bytes_verified,
+                blake3 = %report.payload_blake3,
+                detail = %report.detail,
                 carriers = channel.carriers(),
-                "destination done; restore complete"
+                "RESTORE VERIFIED: persisted destination matches source"
             );
         }
         Some(ControlFrame::Abort { reason }) => {
@@ -869,12 +1092,56 @@ async fn destination_stream_multi(
 
 #[cfg(test)]
 mod pacing_tests {
-    use super::{exchange_timeout_with, PacedSink};
+    use super::{
+        exchange_timeout_with, send_completion_ack_ack, validate_completion_ack, PacedSink,
+    };
     use crate::channel::ChunkSink;
     use crate::error::{BackupError, Phase, Result};
     use async_trait::async_trait;
     use std::time::Duration;
     use tokio::sync::watch;
+
+    #[test]
+    fn legacy_completion_without_readback_evidence_fails_closed() {
+        let error = validate_completion_ack(Some(crate::wire::ControlFrame::CompleteAck))
+            .expect_err("legacy completion must not be accepted as verified");
+        assert!(error
+            .to_string()
+            .contains("did not provide persisted read-back evidence"));
+    }
+
+    #[tokio::test]
+    async fn source_success_waits_for_destination_final_confirmation() {
+        let (mut source, mut destination) = tokio::io::duplex(4096);
+        let mut confirmation =
+            tokio::spawn(async move { send_completion_ack_ack(&mut source).await });
+        let frame = crate::wire::recv_frame::<_, crate::wire::ControlFrame>(&mut destination)
+            .await
+            .unwrap();
+        assert!(matches!(
+            frame,
+            Some(crate::wire::ControlFrame::CompleteAckAck)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut confirmation)
+                .await
+                .is_err(),
+            "source must remain pending until destination confirms both proofs"
+        );
+        crate::wire::send_frame(
+            &mut destination,
+            &crate::wire::ControlFrame::VerificationComplete,
+        )
+        .await
+        .unwrap();
+        confirmation.await.unwrap().unwrap();
+        assert!(
+            crate::wire::recv_frame::<_, crate::wire::ControlFrame>(&mut destination)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     struct BlockingSink;
 

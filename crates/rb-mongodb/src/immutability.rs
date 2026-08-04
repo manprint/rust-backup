@@ -3,7 +3,7 @@
 //! [`fingerprint`] produces a stable digest of the source: a structural hash of
 //! the introspected catalog (volatile size/count estimates normalized out, since
 //! they drift without any user mutation) plus, per collection, an exact
-//! `count_documents` and a deterministic `_id`-ordered content checksum. The
+//! `count_documents` and a complete deterministic `_id`-ordered content checksum. The
 //! session captures it before and after every run and raises
 //! `BackupError::SourceMutated` on any drift (I-IMMUT). All queries are reads.
 //!
@@ -20,15 +20,12 @@ use crate::introspect;
 use crate::model::MongoPlanPayload;
 use crate::{MongoConnection, MongoDbParams};
 
-/// Max documents hashed per collection for the content checksum.
-const CHECKSUM_SAMPLE_DOCS: i64 = 10_000;
-
 /// Snapshot the source fingerprint composes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFingerprint {
     /// Hash of the structural catalog (estimates normalized out).
     pub catalog_hash: String,
-    /// Per-collection exact doc count + sampled content checksum.
+    /// Per-collection exact doc count + complete content checksum.
     pub collections: Vec<CollStat>,
 }
 
@@ -38,7 +35,7 @@ pub struct CollStat {
     /// `database.collection`.
     pub name: String,
     pub docs: i64,
-    /// Hex digest over a deterministic `_id`-ordered document sample.
+    /// Hex digest over every document in deterministic `_id` order.
     pub checksum: String,
 }
 
@@ -99,7 +96,7 @@ fn hash_catalog(p: &MongoPlanPayload) -> String {
     blake3_hex(&bytes)
 }
 
-/// Exact `count_documents` plus a deterministic `_id`-ordered content checksum.
+/// Exact `count_documents` plus a complete deterministic content checksum.
 async fn coll_stat(conn: &MongoConnection, db: &str, coll: &str) -> Result<CollStat> {
     let collection = conn.client.database(db).collection::<Document>(coll);
 
@@ -109,13 +106,11 @@ async fn coll_stat(conn: &MongoConnection, db: &str, coll: &str) -> Result<CollS
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {db}.{coll}"), e))?
         as i64;
 
-    // Deterministic sample: documents ordered by `_id`, capped, hashed in order.
-    // `_id` is unique and indexed, so the order is stable across runs when the
-    // data is unchanged.
+    // `_id` is unique and indexed, so hashing every document in this order is
+    // stable and cannot miss a mutation in a collection larger than a sample.
     let mut cursor = collection
         .find(doc! {})
         .sort(doc! { "_id": 1 })
-        .limit(CHECKSUM_SAMPLE_DOCS)
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("sample {db}.{coll}"), e))?;
 

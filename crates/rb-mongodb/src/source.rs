@@ -54,9 +54,15 @@ pub async fn stream_out(
             .client
             .database(&meta.database)
             .collection::<Document>(&meta.collection);
-        let cursor = coll.find(doc! {}).await.map_err(|e| {
-            BackupError::phase_src(Phase::Transfer, format!("find {}", item.name), e)
-        })?;
+        // A stable order makes the source commitment reproducible when the
+        // destination is read back after restore. `_id` is unique and indexed.
+        let cursor = coll
+            .find(doc! {})
+            .sort(doc! { "_id": 1 })
+            .await
+            .map_err(|e| {
+                BackupError::phase_src(Phase::Transfer, format!("find {}", item.name), e)
+            })?;
         docs_to_sink(item.id, cursor, sink).await?;
     }
     Ok(())

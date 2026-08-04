@@ -25,7 +25,9 @@ fi
 if [[ ${RUST_BACKUP_FULL_DB_MATRIX:-0} == 1 ]]; then
   run bash e2e/postgres_introspect.sh 16
   run bash e2e/postgres_matrix.sh 10 12 14 16 18
+  run bash e2e/postgres_matrix.sh 10:18 12:16 14:17 16:18
   run bash e2e/mongodb_matrix.sh 4 5 6 7 8
+  run bash e2e/mongodb_matrix.sh 4:8 5:7 6:8
 fi
 printf 'e2e summary: %d passed, %d failed\n' "$passed" "$failed"
 (( failed == 0 ))

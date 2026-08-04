@@ -28,6 +28,7 @@ pub mod module;
 pub mod plan;
 pub mod progress;
 pub mod session;
+pub mod verification;
 pub mod wire;
 
 pub use error::{BackupError, Phase, Result};

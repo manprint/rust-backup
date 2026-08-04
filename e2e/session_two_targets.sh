@@ -46,6 +46,13 @@ if (( progress_lines < 4 )); then
   sed -n '1,240p' "$work/run.log" >&2
   exit 1
 fi
+if [[ $(grep -c 'BACKUP VERIFIED:' "$work/run.log" || true) -ne 2 || \
+      $(grep -c 'RESTORE VERIFIED:' "$work/run.log" || true) -ne 2 || \
+      $(grep -Ec 'status="?verified"?.*\(100\.0%\)|\(100\.0%\).*status="?verified"?' "$work/run.log" || true) -ne 4 ]]; then
+  echo 'FAIL: every session target must finish with formal verification and 100% progress' >&2
+  sed -n '1,260p' "$work/run.log" >&2
+  exit 1
+fi
 
 cat >"$work/fail-fast.yml" <<EOF
 targets:

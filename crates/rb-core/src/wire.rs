@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{BackupError, Phase, Result};
 use crate::plan::BackupPlan;
+use crate::verification::VerificationReport;
 
 /// Max bytes per data chunk on the wire.
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
@@ -59,12 +60,19 @@ pub enum ControlFrame {
     },
     /// Source → Destination: all items streamed; final whole-payload digest.
     Done { total_bytes: u64, blake3: String },
-    /// Destination → Source: apply and final verification both succeeded.
-    /// The source must not report success before receiving this frame.
+    /// Legacy destination acknowledgement retained only so current peers can
+    /// decode it and fail closed with a precise missing-evidence error.
     CompleteAck,
-    /// Source → Destination: confirms `CompleteAck` was received, allowing the
-    /// destination to close TLS/yamux without racing buffered delivery.
+    /// Destination → Source: persisted backend state was read back and matched
+    /// every source item. This evidence-bearing acknowledgement is mandatory
+    /// for a successful current-protocol run.
+    VerificationAck { report: VerificationReport },
+    /// Source → Destination: confirms `VerificationAck` and the source audit;
+    /// the destination answers with `VerificationComplete`.
     CompleteAckAck,
+    /// Destination → Source: both persisted read-back and source immutability
+    /// proofs are known to the destination. The source may now close cleanly.
+    VerificationComplete,
     /// Either side: abort with reason (clean teardown, no partial apply).
     Abort { reason: String },
     /// Receiver → aborting peer: confirms the structured abort reason was

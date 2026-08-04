@@ -61,6 +61,37 @@ PY
   return 1
 }
 
+# A successful CLI exit is not sufficient: require the protocol's persisted
+# read-back proof, matching source/destination commitment, and a terminal 100%
+# progress record on both peers.
+rb_strip_ansi() {
+  sed $'s/\033\[[0-9;]*[mK]//g'
+}
+
+rb_assert_formal_verification() { # source-log destination-log
+  local source_log=$1 destination_log=$2 source_digest destination_digest
+  rb_strip_ansi <"$source_log" | grep 'BACKUP VERIFIED: source unchanged; destination read-back matches' >/dev/null || {
+    echo "FAIL: source log has no formal BACKUP VERIFIED evidence: $source_log" >&2
+    return 1
+  }
+  rb_strip_ansi <"$destination_log" | grep 'RESTORE VERIFIED: persisted destination matches source' >/dev/null || {
+    echo "FAIL: destination log has no formal RESTORE VERIFIED evidence: $destination_log" >&2
+    return 1
+  }
+  for log in "$source_log" "$destination_log"; do
+    rb_strip_ansi <"$log" | grep -E 'status="?verified"?.*\(100\.0%\)|\(100\.0%\).*status="?verified"?' >/dev/null || {
+      echo "FAIL: no terminal verified 100% progress record: $log" >&2
+      return 1
+    }
+  done
+  source_digest=$(rb_strip_ansi <"$source_log" | grep 'BACKUP VERIFIED:' | tail -n1 | grep -oE 'blake3=[0-9a-f]{64}' | cut -d= -f2 || true)
+  destination_digest=$(rb_strip_ansi <"$destination_log" | grep 'RESTORE VERIFIED:' | tail -n1 | grep -oE 'blake3=[0-9a-f]{64}' | cut -d= -f2 || true)
+  if [[ -z $source_digest || $source_digest != "$destination_digest" ]]; then
+    echo "FAIL: source/destination verification commitments differ" >&2
+    return 1
+  fi
+}
+
 # Stable tree digest: content, type, mode, ownership, mtime, and link topology.
 # Atime is deliberately excluded: callers needing I-IMMUT use rb_atime_manifest.
 rb_tree_digest() {

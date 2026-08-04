@@ -63,7 +63,10 @@ if (( FAIL == 0 )); then
   RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "$endpoint" --channel relay-smoke \
     --no-udp --insecure --carriers "$carriers" --yes --root "$dst" >"$work/destination.log" 2>&1 &
   destination_pid=$!
-  if wait "$source_pid" && wait "$destination_pid"; then pass 'relay transfer completed'; else fail 'relay transfer failed'; fi
+  if wait "$source_pid" && wait "$destination_pid" && \
+     rb_assert_formal_verification "$work/source.log" "$work/destination.log"; then
+    pass 'relay transfer completed with persisted read-back proof'
+  else fail 'relay transfer or formal verification failed'; fi
 fi
 
 if (( FAIL == 0 )) && [[ "$(rb_tree_digest "$src")" == "$(rb_tree_digest "$dst")" ]]; then

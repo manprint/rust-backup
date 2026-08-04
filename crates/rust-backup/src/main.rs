@@ -644,7 +644,12 @@ const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5)
 /// Periodic progress reporter (phase-agnostic: it renders whatever counters the
 /// session has published). Aborted with its guard when the run ends, so a
 /// finished run never keeps logging.
-struct ProgressReporter(tokio::task::JoinHandle<()>);
+struct ProgressReporter {
+    task: tokio::task::JoinHandle<()>,
+    progress: Progress,
+    label: String,
+    started: std::time::Instant,
+}
 
 impl ProgressReporter {
     fn spawn(progress: Progress, label: String) -> Self {
@@ -657,7 +662,9 @@ impl ProgressReporter {
             "{}",
             progress.line(started.elapsed().as_secs_f64())
         );
-        ProgressReporter(tokio::spawn(async move {
+        let task_progress = progress.clone();
+        let task_label = label.clone();
+        let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval_at(
                 tokio::time::Instant::now() + PROGRESS_INTERVAL,
                 PROGRESS_INTERVAL,
@@ -665,18 +672,37 @@ impl ProgressReporter {
             loop {
                 tick.tick().await;
                 tracing::info!(
-                    target_label = %label,
+                    target_label = %task_label,
                     "{}",
-                    progress.line(started.elapsed().as_secs_f64())
+                    task_progress.line(started.elapsed().as_secs_f64())
                 );
             }
-        }))
+        });
+        ProgressReporter {
+            task,
+            progress,
+            label,
+            started,
+        }
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        self.task.abort();
+        if succeeded {
+            self.progress.complete();
+        }
+        tracing::info!(
+            target_label = %self.label,
+            status = if succeeded { "verified" } else { "failed" },
+            "{}",
+            self.progress.line(self.started.elapsed().as_secs_f64())
+        );
     }
 }
 
 impl Drop for ProgressReporter {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -689,58 +715,63 @@ async fn execute(
     auto_accept: bool,
 ) -> anyhow::Result<()> {
     let progress = Progress::default();
-    let _reporter =
+    let mut reporter =
         ProgressReporter::spawn(progress.clone(), format!("{}/{:?}", module.name(), role));
-    match role {
-        Role::Source => {
-            let src = module
-                .open_source(params)
-                .await
-                .map_err(anyhow::Error::new)?;
-            let ch = rb_transport::connect_source(transport).await.map_err(|e| {
-                anyhow::Error::new(rb_core::BackupError::phase_src(
-                    rb_core::Phase::Connect,
-                    "connect source transport",
-                    e,
-                ))
-            })?;
-            session::run_source_limited(&*src, &ch, &progress, transport.max_rate)
-                .await
-                .map_err(anyhow::Error::new)?;
-        }
-        Role::Destination => {
-            let dst = module
-                .open_destination(params)
-                .await
-                .map_err(anyhow::Error::new)?;
-            let ch = rb_transport::connect_destination(transport)
-                .await
-                .map_err(|e| {
+    let result: anyhow::Result<()> = async {
+        match role {
+            Role::Source => {
+                let src = module
+                    .open_source(params)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                let ch = rb_transport::connect_source(transport).await.map_err(|e| {
                     anyhow::Error::new(rb_core::BackupError::phase_src(
                         rb_core::Phase::Connect,
-                        "connect destination transport",
+                        "connect source transport",
                         e,
                     ))
                 })?;
-            let mut accept = move |plan: &BackupPlan| -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = bool> + Send>,
-            > {
-                if auto_accept {
-                    return Box::pin(async { true });
-                }
-                let rendered = plan.render();
-                Box::pin(async move {
-                    tokio::task::spawn_blocking(move || prompt_yes_rendered(&rendered))
-                        .await
-                        .unwrap_or(false)
-                })
-            };
-            session::run_destination_with_accept(&*dst, &ch, &progress, &mut accept)
-                .await
-                .map_err(anyhow::Error::new)?;
+                session::run_source_limited(&*src, &ch, &progress, transport.max_rate)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+            }
+            Role::Destination => {
+                let dst = module
+                    .open_destination(params)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                let ch = rb_transport::connect_destination(transport)
+                    .await
+                    .map_err(|e| {
+                        anyhow::Error::new(rb_core::BackupError::phase_src(
+                            rb_core::Phase::Connect,
+                            "connect destination transport",
+                            e,
+                        ))
+                    })?;
+                let mut accept = move |plan: &BackupPlan| -> std::pin::Pin<
+                    Box<dyn std::future::Future<Output = bool> + Send>,
+                > {
+                    if auto_accept {
+                        return Box::pin(async { true });
+                    }
+                    let rendered = plan.render();
+                    Box::pin(async move {
+                        tokio::task::spawn_blocking(move || prompt_yes_rendered(&rendered))
+                            .await
+                            .unwrap_or(false)
+                    })
+                };
+                session::run_destination_with_accept(&*dst, &ch, &progress, &mut accept)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    .await;
+    reporter.finish(result.is_ok());
+    result
 }
 
 /// Interactive async-accept: show the plan and read `yes`/`no` from stdin.

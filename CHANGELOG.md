@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Successful completion now requires backend read-back evidence: filesystem,
+  PostgreSQL, MongoDB and S3 re-introspect their restorable metadata/catalog and
+  reread all persisted payload to reproduce source BLAKE3 commitments. Both
+  peers finish at a truthful verified 100%; evidence-free legacy completion is
+  rejected. Source immutability audits now cover complete PostgreSQL and MongoDB
+  datasets instead of samples.
+- Hardened real-service regressions cover PostgreSQL 10–18 and MongoDB 4–8 both
+  same-version and cross-version, PostgreSQL 18 NOT NULL catalogs and `public`
+  schema defaults, database locale/template0 recreation, empty MongoDB
+  collections and indexes, filesystem ownership contracts, and S3 metadata,
+  policy, exact key-set, overwrite and multipart cleanup.
 - Added pinned GitHub Actions for Rust CI, the complete end-to-end matrix,
   dependency/security analysis, multi-architecture container publication, and
   reproducible Linux release artifacts with checksums and provenance.
@@ -14,11 +25,11 @@
 - Multi-carrier transfers now negotiate the safe count on the wire and bind
   relay data streams by explicit carrier identity; filesystem restores are
   plan-ordered and item-pinned without intra-item striping.
-- Added a final `CompleteAck`/`CompleteAckAck` handshake: a source cannot report
-  success before destination apply and digest verification finish, and the
-  destination does not close before the acknowledgement is known to be received.
-  Destination aborts now interrupt source pacing and blocked chunk writes, and
-  truncated carriers/offset gaps are rejected.
+- Added an evidence-bearing `VerificationAck` → `CompleteAckAck` →
+  `VerificationComplete` handshake: neither peer reports success before
+  destination read-back and source immutability proofs are mutually observed,
+  on both relay and direct QUIC streams. Destination aborts now interrupt source
+  pacing and blocked chunk writes, and truncated carriers/offset gaps are rejected.
 - Destination failures now use an `Abort`/`AbortAck` control-plane handshake, so
   relay teardown cannot replace an apply error such as ENOSPC with a generic EOF.
   Progress also emits an initial per-target snapshot synchronously, including for

@@ -34,6 +34,20 @@ module-specific setting that has no dedicated flag. `run` accepts
 | `--config <file>` | `RUST_BACKUP_CONFIG` | — | YAML config underlay |
 | `-v` | — | — | increase log verbosity (repeatable) |
 
+`RUST_BACKUP_VERIFY_TIMEOUT` sets the maximum destination read-back verification
+time in seconds (default 86400). It is deliberately separate from transfer time:
+large databases and buckets may require a complete second read.
+
+## Verified completion
+
+A successful source prints `BACKUP VERIFIED`, a successful destination prints
+`RESTORE VERIFIED`, and their final progress line is `status="verified"` at
+`100.0%`. Both lines carry the same full-payload BLAKE3. The destination must
+first re-introspect backend metadata/catalogs and reread all persisted payload;
+the source must then pass its full post-run immutability audit. Missing legacy
+evidence, mismatches, unreadable restored data, and verification timeouts fail
+the command with a non-zero exit.
+
 ## Server
 
 ```sh
@@ -86,10 +100,11 @@ sudo rust-backup filesystem destination --to coord:7835 --channel fs --root /res
 Params: `--root --follow-symlinks --preserve-ownership(true) --preserve-xattr`.
 
 > **sudo / ownership.** Restoring arbitrary `uid`/`gid` requires `root` or
-> `CAP_CHOWN`. Without it, file **contents and mode** are restored but ownership
-> falls back to the running user, and preflight emits a warning. Run the
-> **destination** under `sudo` to preserve ownership exactly. The **source** never
-> needs privileges (read-only). See `docs/modules/FILESYSTEM.md`.
+> `CAP_CHOWN`. With ownership preservation enabled (the default), preflight
+> fails if the destination cannot reproduce the planned ownership. Run the
+> **destination** under `sudo`, or explicitly choose the reduced contract with
+> `--no-preserve-ownership`. The **source** never needs privileges (read-only).
+> See `docs/modules/FILESYSTEM.md`.
 
 ### s3 (AWS S3 + MinIO)
 

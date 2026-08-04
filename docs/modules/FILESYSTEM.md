@@ -29,17 +29,25 @@ Linux. It requires the **destination** process to run as `root` or hold `CAP_CHO
   ```sh
   sudo rust-backup filesystem destination --to coord:7835 --channel fs --root /restore --yes
   ```
-- **Without privilege**: contents, mode, mtime, and links are restored, but every
-  file is owned by the running user. The destination **preflight** records a warning
-  for each ownership it cannot honor; the run still completes (degraded fidelity).
+- **Without privilege**: the default ownership-preserving contract fails during
+  **preflight** if any planned `uid`/`gid` cannot be honored. Use
+  `--no-preserve-ownership` only when running-user ownership is intentional;
+  this explicit reduced contract still verifies contents, modes, mtimes and links.
 
 The **source** never needs privilege — it only reads (opened read-only, with
 `O_NOATIME` where the platform allows, so the source's access times are not even
 touched, upholding I-IMMUT).
 
-`--preserve-ownership` (default `true`) toggles the attempt; set it `false` to skip
-ownership entirely and silence the warnings when you intentionally want
-running-user ownership.
+`--preserve-ownership` defaults to `true`; `--no-preserve-ownership` is the
+explicit opt-out.
+
+## Completion proof
+
+Before reporting verified completion, the destination rescans the root and
+compares the exact planned path/type set, sizes, modes, mtimes, symlink and
+hardlink topology, requested ownership and xattrs. It then reopens every regular
+file and reproduces all item and payload BLAKE3 commitments. Extra, missing,
+unreadable, changed or truncated entries fail the run.
 
 ## Current limits
 
@@ -61,6 +69,6 @@ running-user ownership.
 - An item is published directly at its final path, but its active file is removed
   on EOF, Abort, integrity failure, write error, or ENOSPC; a truncated active
   file is never left looking committed.
-- Implementation status: the core path and interrupted-file cleanup are
-  unit-tested; privileged root/CAP_CHOWN live coverage still requires the
-  documented sudo matrix.
+- The privileged matrix verifies exact ownership/modes, default non-root
+  preflight refusal, the explicit ownership opt-out, interrupted-file cleanup,
+  source immutability, and formal persisted read-back evidence.

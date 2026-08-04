@@ -54,6 +54,17 @@ impl Progress {
         self.inner.bytes_done.load(Ordering::Relaxed)
     }
 
+    /// Replace estimates with observed final totals. Backends such as
+    /// PostgreSQL plan from on-disk relation sizes while transferring a smaller
+    /// logical stream, so an acknowledged success must use actuals to render a
+    /// truthful 100% terminal snapshot.
+    pub fn complete(&self) {
+        let items = self.inner.items_done.load(Ordering::Relaxed);
+        let bytes = self.inner.bytes_done.load(Ordering::Relaxed);
+        self.inner.items_total.store(items, Ordering::Relaxed);
+        self.inner.bytes_total.store(bytes, Ordering::Relaxed);
+    }
+
     /// Render a one-line progress string given the elapsed seconds (the caller
     /// owns the clock — core never reads time directly).
     pub fn line(&self, elapsed_secs: f64) -> String {
@@ -77,5 +88,22 @@ impl Progress {
             human_bytes(total),
             human_bytes(rate),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_replaces_estimates_with_actuals() {
+        let progress = Progress::new(4, 50_000);
+        progress.add_bytes(1000);
+        progress.item_done();
+        progress.complete();
+        let line = progress.line(1.0);
+        assert!(line.contains("items 1/1"), "{line}");
+        assert!(line.contains("1000 B/1000 B"), "{line}");
+        assert!(line.contains("(100.0%)"), "{line}");
     }
 }

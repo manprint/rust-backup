@@ -10,12 +10,21 @@ definitions, document/size estimates, and user/role metadata for visibility and
 immutability checks. Restore creates collections, streams BSON documents in
 bounded batches, then creates indexes.
 
+## Completion proof
+
+After apply, the destination re-lists collections, options and indexes and
+compares the restorable catalog with the source plan. It then reads every BSON
+document in deterministic `_id` order and reproduces every item and payload
+BLAKE3 commitment. The source also fingerprints all documents before and after
+the run. Empty collections, nested documents, arrays, nulls, compound/partial
+indexes, abort cleanup and overwrite retries are covered by the live matrices.
+
 ## Privileges
 
 The source needs read access to listed databases/collections and catalog commands
 such as `listCollections`; user visibility may require `usersInfo` privileges.
-The destination needs permission to create/drop collections and indexes. Set
-Use `--overwrite` (or `overwrite: true` in YAML) only when replacing existing
+The destination needs permission to create/drop collections and indexes. Use
+`--overwrite` (or `overwrite: true` in YAML) only when replacing existing
 collections is intended.
 
 ## Limits
@@ -26,3 +35,5 @@ collections is intended.
 - Discrete host/port parameters are plaintext unless the server policy provides
   transport protection. A URI with `?tls=true` is the current TLS path.
 - Live matrix verification requires Docker: `e2e/mongodb_matrix.sh 4 5 6 7 8`.
+  Cross-major syntax is `source:destination`, for example
+  `e2e/mongodb_matrix.sh 4:8 5:7 6:8`.

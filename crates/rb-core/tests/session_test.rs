@@ -10,6 +10,7 @@ use rb_core::module::{Destination, Source};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, Preflight};
 use rb_core::progress::Progress;
 use rb_core::session;
+use rb_core::verification::{RestoreEvidence, VerificationReport};
 
 /// In-memory single-substream channel: consumer half via `open_stream`,
 /// provider half via `accept_stream`.
@@ -230,6 +231,8 @@ struct OrderedDest {
     ends: Arc<Mutex<Vec<u32>>>,
 }
 
+struct FailingVerifyDest;
+
 #[async_trait]
 impl Destination for OrderedDest {
     fn max_carriers(&self) -> usize {
@@ -248,6 +251,14 @@ impl Destination for OrderedDest {
                 ChunkEvent::Chunk { .. } => {}
             }
         }
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Ok(evidence.report("ordered in-memory destination read-back"))
     }
 }
 #[async_trait]
@@ -270,6 +281,37 @@ impl Destination for MockDest {
             }
         }
         Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Ok(evidence.report("in-memory destination read-back"))
+    }
+}
+
+#[async_trait]
+impl Destination for FailingVerifyDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        while !matches!(src.next().await?, ChunkEvent::End) {}
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Err(rb_core::error::BackupError::phase(
+            rb_core::error::Phase::Verify,
+            "injected persisted read-back mismatch",
+        ))
     }
 }
 
@@ -321,6 +363,13 @@ impl Destination for FailingPreflightDest {
     async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {
         panic!("must never apply: preflight failed")
     }
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        panic!("must never verify: preflight failed")
+    }
 }
 
 /// Fails only after consuming the final ItemEnd.  Without CompleteAck the
@@ -350,6 +399,14 @@ impl Destination for FailingLastItemDest {
                 ChunkEvent::Chunk { .. } => {}
             }
         }
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        panic!("must never verify: apply failed")
     }
 }
 
@@ -399,6 +456,14 @@ impl Destination for FailFirstChunkDest {
             )),
             other => panic!("expected first chunk, got {other:?}"),
         }
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        panic!("must never verify: apply failed")
     }
 }
 
@@ -466,6 +531,14 @@ impl Destination for FailAfterFirstItemDest {
                 _ => {}
             }
         }
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        panic!("must never verify: apply failed")
     }
 }
 
@@ -837,6 +910,44 @@ async fn full_run_ok() {
     assert_eq!(*received.lock().unwrap(), payload);
 }
 
+/// A destination apply is not success until persisted state is read back. The
+/// verification failure must reach the source before either side returns Ok.
+#[tokio::test]
+async fn destination_readback_failure_reaches_source() {
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source = MockSource {
+        fp: "stable".into(),
+        payload: vec![42; 128],
+    };
+    let source_task =
+        tokio::spawn(
+            async move { session::run_source(&source, &*channel, &Progress::default()).await },
+        );
+    let destination_task = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&FailingVerifyDest, &*peer, &Progress::default(), &mut yes).await
+    });
+
+    let destination_error = destination_task
+        .await
+        .unwrap()
+        .expect_err("destination verification must fail");
+    assert!(destination_error
+        .to_string()
+        .contains("persisted read-back mismatch"));
+    let source_error = source_task
+        .await
+        .unwrap()
+        .expect_err("source must receive verification failure");
+    assert!(
+        source_error
+            .to_string()
+            .contains("persisted read-back mismatch"),
+        "{source_error}"
+    );
+}
+
 /// T-SESS12: four data carriers preserve the same result as one carrier. The
 /// first in-memory substream is control; all payload rides item-pinned streams.
 #[tokio::test]
@@ -984,10 +1095,14 @@ async fn mutating_source_caught() {
         session::run_destination(&dst, &*ch2, &p2, &mut yes).await
     });
     let serr = s.await.unwrap();
-    let _ = d.await.unwrap();
+    let derr = d.await.unwrap();
     let err = serr.expect_err("must trip immutability guard");
     assert!(
         matches!(err, rb_core::error::BackupError::SourceMutated(_)),
         "got: {err}"
+    );
+    assert!(
+        derr.is_err(),
+        "destination must not report success before source immutability proof"
     );
 }

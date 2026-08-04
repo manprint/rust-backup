@@ -25,7 +25,11 @@ targets from YAML with `rust-backup run --config targets.yml --parallel-targets 
 `--max-rate BYTES_PER_SECOND` limits aggregate source output. `--carriers N` is
 valid for filesystem (up to 32); postgres, mongodb and S3 negotiate down to one.
 A progress line reports completed items, transferred bytes, percent and rate for
-each source/destination label.
+each source/destination label. Exit `0` additionally requires both peer logs to
+end with `status="verified"` at `100.0%`, matching 64-character payload BLAKE3
+values, and the respective `BACKUP VERIFIED` / `RESTORE VERIFIED` messages. The
+destination proof is produced by re-introspection plus complete persisted
+payload read-back, not by trusting successful writes.
 
 Exit codes: 2 configuration, 3 preflight, 4 plan rejection, 5 integrity/verify,
 6 source mutation, 7 transport. Attach both peer logs and the command line when

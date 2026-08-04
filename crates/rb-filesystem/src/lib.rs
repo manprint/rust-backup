@@ -22,9 +22,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use rb_core::channel::{ChunkSink, ChunkSource};
-use rb_core::error::Result;
+use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
+use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 
 /// Filesystem backup parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +153,30 @@ impl Destination for FilesystemDestination {
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
         dest::stream_in(&self.params, plan, src).await
     }
+
+    async fn verify(
+        &self,
+        plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        dest::verify_metadata(&self.params, plan)?;
+        let mut verifier = VerificationSink::new(evidence);
+        source::stream_out(&self.params, plan, &mut verifier)
+            .await
+            .map_err(|error| {
+                BackupError::phase_src(
+                    Phase::Verify,
+                    "read back restored filesystem contents",
+                    error,
+                )
+            })?;
+        verifier.finish().await?;
+        verifier.report(if self.params.preserve_ownership {
+            "filesystem requested metadata contract and file contents read back exactly"
+        } else {
+            "filesystem metadata except opted-out ownership and file contents read back exactly"
+        })
+    }
 }
 
 /// Register the filesystem module.
@@ -161,6 +186,7 @@ pub fn module() -> Arc<dyn BackupModule> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -169,6 +195,7 @@ mod tests {
 
     use async_trait::async_trait;
     use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
+    use rb_core::verification::RestoreEvidence;
 
     use super::*;
 
@@ -190,6 +217,21 @@ mod tests {
         }
         async fn finish(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl RecordingSink {
+        fn evidence(&self) -> RestoreEvidence {
+            let item_blake3: BTreeMap<_, _> = self
+                .completed
+                .iter()
+                .map(|(id, _, digest)| (*id, digest.clone()))
+                .collect();
+            RestoreEvidence {
+                total_bytes: self.completed.iter().map(|(_, total, _)| total).sum(),
+                payload_blake3: rb_core::channel::completion_digest(&item_blake3),
+                item_blake3,
+            }
         }
     }
 
@@ -285,6 +327,7 @@ mod tests {
         let plan = source.analyze().await.unwrap();
         let mut sink = RecordingSink::default();
         source.stream_out(&plan, &mut sink).await.unwrap();
+        let evidence = sink.evidence();
         let mut events = VecDeque::new();
         for (id, offset, data) in sink.chunks {
             events.push_back(ChunkEvent::Chunk {
@@ -324,6 +367,9 @@ mod tests {
             .stream_in(&plan, &mut EventSource(events))
             .await
             .unwrap();
+        let report = destination.verify(&plan, &evidence).await.unwrap();
+        assert_eq!(report.items_verified, plan.items.len());
+        assert_eq!(report.bytes_verified, evidence.total_bytes);
         assert_eq!(
             fs::read(destination_root.join("nested/data.bin")).unwrap(),
             fs::read(source_root.join("nested/data.bin")).unwrap()
@@ -346,6 +392,20 @@ mod tests {
                 .mode()
                 & 0o7777,
             0o4640
+        );
+
+        fs::write(
+            destination_root.join("nested/data.bin"),
+            b"post-restore corruption",
+        )
+        .unwrap();
+        let error = destination
+            .verify(&plan, &evidence)
+            .await
+            .expect_err("persisted corruption must invalidate a completed restore");
+        assert!(
+            error.to_string().contains("mismatch"),
+            "unexpected verification error: {error}"
         );
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();

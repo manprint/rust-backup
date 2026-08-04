@@ -52,9 +52,11 @@ pub(crate) async fn validate(params: &FilesystemParams, plan: &BackupPlan) -> Re
         )
         .check(
             "ownership",
-            true,
+            !ownership_needed || ownership_possible,
             if ownership_needed && !ownership_possible {
-                String::from("warning: uid/gid will remain the destination process owner (not root/CAP_CHOWN)")
+                String::from(
+                    "exact uid/gid restore requires root or CAP_CHOWN; use --no-preserve-ownership to explicitly exclude ownership from the restore contract",
+                )
             } else if params.preserve_ownership {
                 String::from("uid/gid restoration is available")
             } else {
@@ -160,6 +162,60 @@ pub(crate) async fn stream_in(
     }
     create_links(root, &payload)?;
     apply_metadata(root, &payload, params.preserve_ownership && has_cap_chown())?;
+    Ok(())
+}
+
+/// Re-scan the destination after apply and compare every selected path and
+/// restorable metadata field with the source plan. File bytes are verified by
+/// the shared read-back sink in `lib.rs`.
+pub(crate) fn verify_metadata(params: &FilesystemParams, plan: &BackupPlan) -> Result<()> {
+    let expected = payload(plan, Phase::Verify)?;
+    let root = crate::walk::checked_root(params, Phase::Verify)?;
+    let actual = crate::walk::collect(&root).map_err(|error| {
+        BackupError::phase_src(Phase::Verify, "scan restored filesystem", error)
+    })?;
+    if actual.entries.len() != expected.entries.len() {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!(
+                "filesystem entry count mismatch: source={} destination={}",
+                expected.entries.len(),
+                actual.entries.len()
+            ),
+        ));
+    }
+    for (source, destination) in expected.entries.iter().zip(&actual.entries) {
+        let ownership_matches = !params.preserve_ownership
+            || (source.uid == destination.uid && source.gid == destination.gid);
+        if source.path != destination.path
+            || source.kind != destination.kind
+            || source.size != destination.size
+            || source.mode != destination.mode
+            || source.mtime != destination.mtime
+            || source.mtime_nsec != destination.mtime_nsec
+            || source.target != destination.target
+            || source.hardlink_to != destination.hardlink_to
+            || source.xattrs != destination.xattrs
+            || !ownership_matches
+        {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!(
+                    "filesystem metadata mismatch at {:?}: source={source:?} destination={destination:?}",
+                    source.path
+                ),
+            ));
+        }
+    }
+    if actual.total_bytes != expected.total_bytes {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!(
+                "filesystem byte total mismatch: source={} destination={}",
+                expected.total_bytes, actual.total_bytes
+            ),
+        ));
+    }
     Ok(())
 }
 

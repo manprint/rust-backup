@@ -3,11 +3,18 @@
 The coordination server accepts TCP control connections and multiplexes them with
 yamux. Provider and consumer rendezvous on a channel id; the payload stream then
 carries `Plan`, acknowledgement, ordered data frames, `StreamEnd`, `Done`, and a
-final `CompleteAck`/`CompleteAckAck` handshake. The destination verifies every
-expected data-bearing item and the final byte and completion digest before
-acknowledging; the source never reports success before that acknowledgement.
-The source then confirms receipt, so the destination cannot close a TLS/yamux
-stream while its completion acknowledgement is still buffered.
+final `VerificationAck`/`CompleteAckAck`/`VerificationComplete` handshake. After
+validating the received stream, the destination reopens its persisted backend,
+verifies the restorable catalog/metadata, rereads every data item, and reproduces
+the source BLAKE3 commitments. Only then does it send the evidence-bearing
+`VerificationAck`.
+The source verifies its own full post-run fingerprint and sends
+`CompleteAckAck`; the destination answers `VerificationComplete`. The source
+then closes and the destination verifies that close. This explicit four-step
+exchange works consistently across relay and direct QUIC streams and prevents a
+peer from treating an unobserved semantic acknowledgement as success. The old
+evidence-free `CompleteAck` can be decoded for a precise compatibility error but
+is rejected as unsuccessful.
 
 `https://host:port` selects TLS for the control connection. The server enables it
 only when both `--tls-cert` and `--tls-key` are provided. Normal certificate

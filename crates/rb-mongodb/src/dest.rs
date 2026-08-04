@@ -153,6 +153,68 @@ pub async fn stream_in(
     Ok(())
 }
 
+/// Re-introspect each restored database and compare collection options and
+/// indexes with the source plan. Users and volatile size/count estimates are
+/// intentionally outside the restorable contract.
+pub async fn verify_catalog(params: &MongoDbParams, plan: &BackupPlan) -> Result<()> {
+    let mut expected: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
+        .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
+    normalize_catalog(&mut expected);
+
+    for expected_db in &expected.databases {
+        let mut scoped = params.clone();
+        scoped.database = Some(expected_db.name.clone());
+        let mut actual = crate::introspect::introspect_cluster(&scoped)
+            .await
+            .map_err(|error| {
+                BackupError::phase_src(
+                    Phase::Verify,
+                    format!("re-introspect MongoDB database {}", expected_db.name),
+                    error,
+                )
+            })?;
+        normalize_catalog(&mut actual);
+        let actual_db = actual.databases.into_iter().next().ok_or_else(|| {
+            BackupError::phase(
+                Phase::Verify,
+                format!(
+                    "restored MongoDB database {:?} is missing",
+                    expected_db.name
+                ),
+            )
+        })?;
+        if &actual_db != expected_db {
+            return Err(BackupError::phase(
+                Phase::Verify,
+                format!(
+                    "MongoDB catalog mismatch for database {:?}",
+                    expected_db.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_catalog(payload: &mut MongoPlanPayload) {
+    payload.server_version.clear();
+    payload.server_major = 0;
+    payload.databases.sort_by(|a, b| a.name.cmp(&b.name));
+    for database in &mut payload.databases {
+        // Credentials are not available from a logical backup and are not
+        // restored; this limitation is already enforced/documented separately.
+        database.users.clear();
+        database.collections.sort_by(|a, b| a.name.cmp(&b.name));
+        for collection in &mut database.collections {
+            collection.estimated_docs = 0;
+            collection.estimated_bytes = 0;
+            collection
+                .indexes
+                .sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+        }
+    }
+}
+
 /// Create one collection via the `create` command, merging its captured options.
 /// On `overwrite`, drop any existing collection first (best-effort).
 async fn create_collection(
@@ -238,12 +300,7 @@ async fn apply_data(
                 }
             }
             ChunkEvent::ItemEnd { item_id, total, .. } => {
-                let open = current.as_ref().ok_or_else(|| {
-                    BackupError::phase(
-                        Phase::Apply,
-                        format!("ItemEnd item={item_id} without open collection"),
-                    )
-                })?;
+                let open = current_for_item_end(current.take(), metas, item_id)?;
                 if open.item_id != item_id || open.bytes != total {
                     return Err(BackupError::phase(
                         Phase::Verify,
@@ -253,9 +310,7 @@ async fn apply_data(
                         ),
                     ));
                 }
-                if let Some(c) = current.take() {
-                    c.finish(conn).await?;
-                }
+                open.finish(conn).await?;
             }
             ChunkEvent::End => {
                 if let Some(c) = current.take() {
@@ -266,6 +321,24 @@ async fn apply_data(
         }
     }
     Ok(())
+}
+
+fn current_for_item_end(
+    current: Option<CurrentItem>,
+    metas: &HashMap<u32, ItemMeta>,
+    item_id: u32,
+) -> Result<CurrentItem> {
+    if let Some(current) = current {
+        return Ok(current);
+    }
+    let meta = metas.get(&item_id).ok_or_else(|| {
+        BackupError::phase(
+            Phase::Apply,
+            format!("ItemEnd for unknown collection item={item_id}"),
+        )
+    })?;
+    // An empty collection legitimately has ItemEnd without a preceding Chunk.
+    Ok(CurrentItem::new(item_id, meta))
 }
 
 /// Per-item restore state: a byte accumulator for partial BSON across chunk
@@ -373,6 +446,22 @@ fn take_documents(buf: &mut Vec<u8>, out: &mut Vec<Document>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_collection_item_end_opens_zero_byte_restore_state() {
+        let metas = HashMap::from([(
+            7,
+            ItemMeta {
+                database: "appdb".into(),
+                collection: "empty".into(),
+            },
+        )]);
+        let current = current_for_item_end(None, &metas, 7).expect("empty collection state");
+        assert_eq!(current.item_id, 7);
+        assert_eq!(current.bytes, 0);
+        assert!(current.buf.is_empty());
+        assert!(current.batch.is_empty());
+    }
     use mongodb::bson::doc;
 
     fn probe(major: u32, existing: &[&str]) -> DestProbe {

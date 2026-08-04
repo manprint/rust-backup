@@ -90,7 +90,13 @@ fn copy_out_sql(meta: &ItemMeta) -> String {
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("COPY {qual} ({cols}) TO STDOUT (FORMAT binary)")
+        // Heap order is not a database contract. Sort by the C-collated record
+        // representation so source streaming and destination read-back produce
+        // the same commitment independently of physical row placement. Equal
+        // rows have equal COPY bytes, so duplicate ordering is irrelevant.
+        format!(
+            "COPY (SELECT {cols} FROM {qual} ORDER BY (ROW({cols})::text) COLLATE \"C\") TO STDOUT (FORMAT binary)"
+        )
     }
 }
 
@@ -172,7 +178,7 @@ mod tests {
         };
         assert_eq!(
             copy_out_sql(&m),
-            "COPY \"app\".\"accounts\" (\"id\", \"email\") TO STDOUT (FORMAT binary)"
+            "COPY (SELECT \"id\", \"email\" FROM \"app\".\"accounts\" ORDER BY (ROW(\"id\", \"email\")::text) COLLATE \"C\") TO STDOUT (FORMAT binary)"
         );
         let m2 = ItemMeta {
             columns: vec![],

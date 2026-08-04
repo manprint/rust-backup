@@ -439,24 +439,24 @@ async fn gather_columns(client: &Client, major: u32) -> Result<HashMap<i64, Vec<
     Ok(map)
 }
 
+const CONSTRAINTS_QUERY: &str = "SELECT con.conrelid::int8, con.conname::text, con.contype::text, \
+            pg_catalog.pg_get_constraintdef(con.oid, true)::text, \
+            CASE WHEN con.contype = 'f' THEN \
+                 (SELECT (fn.nspname || '.' || fc.relname)::text \
+                  FROM pg_catalog.pg_class fc \
+                  JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
+                  WHERE fc.oid = con.confrelid) END \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE c.relkind IN ('r', 'p') \
+       AND con.contype IN ('p', 'u', 'f', 'c', 'x') \
+       AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+     ORDER BY con.conrelid, con.conname";
+
 async fn gather_constraints(client: &Client) -> Result<HashMap<i64, Vec<PgConstraint>>> {
     let rows = client
-        .query(
-            "SELECT con.conrelid::int8, con.conname::text, con.contype::text, \
-                    pg_catalog.pg_get_constraintdef(con.oid, true)::text, \
-                    CASE WHEN con.contype = 'f' THEN \
-                         (SELECT (fn.nspname || '.' || fc.relname)::text \
-                          FROM pg_catalog.pg_class fc \
-                          JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
-                          WHERE fc.oid = con.confrelid) END \
-             FROM pg_catalog.pg_constraint con \
-             JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p') \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
-             ORDER BY con.conrelid, con.conname",
-            &[],
-        )
+        .query(CONSTRAINTS_QUERY, &[])
         .await
         .map_err(|e| analyze_err("constraints", e))?;
     let mut map: HashMap<i64, Vec<PgConstraint>> = HashMap::new();
@@ -789,6 +789,12 @@ mod tests {
             PgLocaleProvider::Builtin
         );
         assert!(parse_locale_provider("future-provider").is_err());
+    }
+
+    #[test]
+    fn constraints_query_excludes_pg18_not_null_catalog_constraints() {
+        assert!(CONSTRAINTS_QUERY.contains("con.contype IN ('p', 'u', 'f', 'c', 'x')"));
+        assert!(!CONSTRAINTS_QUERY.contains("'n'"));
     }
 
     #[test]

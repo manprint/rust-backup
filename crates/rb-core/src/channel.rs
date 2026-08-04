@@ -213,6 +213,11 @@ impl<S: DuplexStream> StreamChunkSource<S> {
         self.completed_items.keys().copied().collect()
     }
 
+    /// Verified source digest for every completed item.
+    pub fn completed_item_digests(&self) -> BTreeMap<u32, String> {
+        self.completed_items.clone()
+    }
+
     /// Order-independent whole-payload commitment, derived from verified item
     /// digests. Stable ordering by item id makes the trailing `Done` frame
     /// meaningful without buffering payload bytes.
@@ -481,6 +486,11 @@ impl MultiStreamChunkSource {
 
     pub fn completed_item_ids(&self) -> BTreeSet<u32> {
         self.completed_items.keys().copied().collect()
+    }
+
+    /// Verified source digest for every completed item.
+    pub fn completed_item_digests(&self) -> BTreeMap<u32, String> {
+        self.completed_items.clone()
     }
 
     pub fn completion_digest(&self) -> String {

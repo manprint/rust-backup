@@ -8,18 +8,20 @@
 # move the cluster over the relay; finally schema + per-table data checksums are
 # compared and the source is proven unchanged.
 #
-# Usage:  bash e2e/postgres_matrix.sh [MAJOR ...]   (default: 16)
+# Usage: bash e2e/postgres_matrix.sh [SOURCE[:DESTINATION] ...] (default: 16)
+# Examples: `16` tests 16 -> 16, `12:18` tests a cross-major restore.
 # Needs:  docker, cargo. No sudo. Relay-only (--no-udp) for CI determinism.
 # Exits non-zero on any failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source e2e/lib.sh
 
-MAJORS=("${@:-16}")
+CASES=("${@:-16}")
 PASS=0
 FAIL=0
 BIN="./target/release/rust-backup"
 PASSWORD="rbpg"
-CTRL_PORT=7835
+CTRL_PORT=$(rb_free_port)
 
 CONTAINERS=()
 PIDS=()
@@ -40,11 +42,13 @@ trap cleanup EXIT INT TERM
 echo "==> building release binary"
 cargo build --release --all-features
 
-start_pg() { # name port -> starts container, waits ready
-  local name="$1" port="$2"
-  docker run -d --name "$name" -e POSTGRES_PASSWORD="$PASSWORD" \
-    -p "${port}:5432" "postgres:${MAJOR}-alpine" >/dev/null
+start_pg() { # name port major -> starts container, waits ready
+  local name="$1" port="$2" major="$3"
+  # Track the name before `docker run`: Docker can leave a created container
+  # behind when host-port programming fails.
   CONTAINERS+=("$name")
+  docker run -d --name "$name" -e POSTGRES_PASSWORD="$PASSWORD" \
+    -p "${port}:5432" "postgres:${major}-alpine" >/dev/null
   for _ in $(seq 1 30); do
     docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && return 0
     sleep 1
@@ -96,22 +100,22 @@ data_checksum() { # container db
 
 schema_dump() { # container db
   docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
-    | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict '
+    | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict |^CREATE EXTENSION IF NOT EXISTS plpgsql |^COMMENT ON EXTENSION plpgsql '
 }
 
 # Immutable database properties, with catalog columns normalized across 10..18.
-database_metadata() { # container
-  local locale_columns
-  if (( MAJOR >= 17 )); then
+database_metadata() { # container major
+  local container="$1" major="$2" locale_columns
+  if (( major >= 17 )); then
     locale_columns="d.datlocprovider::text, coalesce(d.datlocale, ''), coalesce(d.daticurules, '')"
-  elif (( MAJOR >= 16 )); then
+  elif (( major >= 16 )); then
     locale_columns="d.datlocprovider::text, coalesce(d.daticulocale, ''), coalesce(d.daticurules, '')"
-  elif (( MAJOR >= 15 )); then
+  elif (( major >= 15 )); then
     locale_columns="d.datlocprovider::text, coalesce(d.daticulocale, ''), ''"
   else
     locale_columns="'c', '', ''"
   fi
-  docker exec "$1" psql -U postgres -d postgres -At -F'|' -c \
+  docker exec "$container" psql -U postgres -d postgres -At -F'|' -c \
     "SELECT pg_encoding_to_char(d.encoding), d.datcollate, d.datctype, ${locale_columns}
        FROM pg_database d WHERE d.datname = 'appdb'"
 }
@@ -147,23 +151,40 @@ run_transfer() { # src_port dst_port channel [abort|overwrite]
   wait "$src_pid"; local src_rc=$?
   wait "$dst_pid"; local dst_rc=$?
   kill "$server_pid" >/dev/null 2>&1 || true
-  [[ $src_rc -eq 0 && $dst_rc -eq 0 ]]
+  [[ $src_rc -eq 0 && $dst_rc -eq 0 ]] && \
+    rb_assert_formal_verification /tmp/rb-src.log /tmp/rb-dst.log
 }
 
-for MAJOR in "${MAJORS[@]}"; do
-  echo "================  PostgreSQL ${MAJOR}  ================"
-  SRC="rb-pg-src-${MAJOR}-$$"; DST="rb-pg-dst-${MAJOR}-$$"
-  SRC_PORT=$((55000 + MAJOR)); DST_PORT=$((56000 + MAJOR))
+for CASE in "${CASES[@]}"; do
+  if [[ $CASE == *:* ]]; then
+    SOURCE_MAJOR=${CASE%%:*}
+    DESTINATION_MAJOR=${CASE##*:}
+  else
+    SOURCE_MAJOR=$CASE
+    DESTINATION_MAJOR=$CASE
+  fi
+  [[ $SOURCE_MAJOR =~ ^[0-9]+$ && $DESTINATION_MAJOR =~ ^[0-9]+$ ]] || {
+    echo "FAIL: invalid PostgreSQL case $CASE" >&2; exit 2;
+  }
+  (( DESTINATION_MAJOR >= SOURCE_MAJOR )) || {
+    echo "FAIL: destination PostgreSQL must be >= source ($CASE)" >&2; exit 2;
+  }
+  CASE_ID="${SOURCE_MAJOR}-to-${DESTINATION_MAJOR}"
+  echo "================  PostgreSQL ${SOURCE_MAJOR} -> ${DESTINATION_MAJOR}  ================"
+  SRC="rb-pg-src-${CASE_ID}-$$"; DST="rb-pg-dst-${CASE_ID}-$$"
+  SRC_PORT=$(rb_free_port)
+  DST_PORT=$(rb_free_port)
+  while [[ $DST_PORT == "$SRC_PORT" ]]; do DST_PORT=$(rb_free_port); done
 
-  start_pg "$SRC" "$SRC_PORT"
-  start_pg "$DST" "$DST_PORT"
+  start_pg "$SRC" "$SRC_PORT" "$SOURCE_MAJOR"
+  start_pg "$DST" "$DST_PORT" "$DESTINATION_MAJOR"
   seed_source "$SRC"
 
   # Source fingerprint before any transfer (external immutability baseline).
   fp_before=$(data_checksum "$SRC" appdb)
 
   # 1) Mid-transfer abort must not mutate the source (T-PG-IMMUT).
-  run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-abort-${MAJOR}" abort || true
+  run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-abort-${CASE_ID}" abort || true
   fp_after_abort=$(data_checksum "$SRC" appdb)
   if [[ "$fp_before" == "$fp_after_abort" ]]; then
     echo "PASS: source unchanged after aborted transfer"; PASS=$((PASS+1))
@@ -172,8 +193,8 @@ for MAJOR in "${MAJORS[@]}"; do
   fi
 
   # 2) Full backup -> restore.
-  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-${MAJOR}"; then
-    echo "PASS: transfer completed"; PASS=$((PASS+1))
+  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-${CASE_ID}"; then
+    echo "PASS: transfer completed with persisted read-back proof"; PASS=$((PASS+1))
   else
     echo "FAIL: transfer failed (see /tmp/rb-*.log)"; FAIL=$((FAIL+1)); continue
   fi
@@ -202,8 +223,8 @@ for MAJOR in "${MAJORS[@]}"; do
 
   # 6) Regression: encoding, collation and locale-provider metadata survive a
   # restore even though they differ from destination template1.
-  source_db_metadata=$(database_metadata "$SRC")
-  destination_db_metadata=$(database_metadata "$DST")
+  source_db_metadata=$(database_metadata "$SRC" "$SOURCE_MAJOR")
+  destination_db_metadata=$(database_metadata "$DST" "$DESTINATION_MAJOR")
   if [[ "$source_db_metadata" == "SQL_ASCII|C|C|c||" && \
         "$source_db_metadata" == "$destination_db_metadata" ]]; then
     echo "PASS: database locale metadata matches source"; PASS=$((PASS+1))
@@ -216,9 +237,9 @@ for MAJOR in "${MAJORS[@]}"; do
   # users, drop the existing database and restore it from scratch.
   docker exec "$DST" psql -U postgres -d appdb -v ON_ERROR_STOP=1 -c \
     "INSERT INTO app.accounts (email) VALUES ('destination-only@x')" >/dev/null
-  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-overwrite-${MAJOR}" overwrite && \
+  if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-overwrite-${CASE_ID}" overwrite && \
      [[ "$(data_checksum "$SRC" appdb)" == "$(data_checksum "$DST" appdb)" ]] && \
-     [[ "$(database_metadata "$SRC")" == "$(database_metadata "$DST")" ]]; then
+     [[ "$(database_metadata "$SRC" "$SOURCE_MAJOR")" == "$(database_metadata "$DST" "$DESTINATION_MAJOR")" ]]; then
     echo "PASS: --overwrite replaces the existing database"; PASS=$((PASS+1))
   else
     echo "FAIL: --overwrite did not replace the existing database"; FAIL=$((FAIL+1))

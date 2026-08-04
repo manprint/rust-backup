@@ -11,8 +11,8 @@ return non-zero on any failure.
 | `session_two_targets.sh` | T-SESSION-2 | 7 | parallel YAML pairs, progress, fail-fast |
 | `transport_netns_test.sh` | T-NET1 | 1 | direct path, setup fallback, active-loss fail-safe |
 | `postgres_introspect.sh` | T-PG-INTROSPECT | 2.2 | seed a pg, run the gated live introspection test |
-| `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT | 2.8 | pg 10/12/14/16/18 backup→restore→diff + mid-abort immutability |
-| `mongodb_matrix.sh` | — | 3 | mongo 4..8 |
+| `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT | 2.8 | pg 10..18 same/cross-major restore + catalog/data proof + abort immutability |
+| `mongodb_matrix.sh` | — | 3 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite |
 | `filesystem_netns_test.sh` | T-FS-OWN, T-FS-IMMUT | 4 | ownership (root vs non-root) + immutability |
 | `filesystem_disk_full.sh` | T-FS-ENOSPC | F2.4 | real ext4 ENOSPC, abort propagation, cleanup + immutability |
 | `bandwidth_netem.sh` | T-BW | 6 | asymmetric bandwidth/RTT, backpressure proof |
@@ -32,5 +32,15 @@ or expose a root-owned runner with narrowly validated inputs.
 `full_matrix.sh` runs plain and TLS relay (one and four carriers), the non-sudo
 fault bank, session orchestration, resource hygiene, and MinIO. Set
 `RUST_BACKUP_PRIVILEGED=1` for filesystem/ENOSPC/transport/bandwidth sudo tests.
-Set `RUST_BACKUP_FULL_DB_MATRIX=1` to additionally run PostgreSQL 10/12/14/16/18
-and MongoDB 4..8 matrices.
+Set `RUST_BACKUP_FULL_DB_MATRIX=1` to additionally run PostgreSQL 10..18 and
+MongoDB 4..8 same-version matrices plus the configured cross-version pairs.
+Each successful E2E path calls `rb_assert_formal_verification`: both peers must
+print their formal verified message, finish at `status="verified"` and `100.0%`,
+and report the same 64-character payload BLAKE3.
+
+Database arguments accept `source:destination`, for example:
+
+```bash
+bash e2e/postgres_matrix.sh 10:18 14:17
+bash e2e/mongodb_matrix.sh 4:8 6:8
+```

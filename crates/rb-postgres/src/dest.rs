@@ -218,6 +218,154 @@ pub async fn stream_in(
     Ok(())
 }
 
+/// Re-introspect every restored database plus the selected cluster-global
+/// objects and compare them with the source plan. Planner estimates and server
+/// version strings are normalized because they are not restored state.
+pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Result<()> {
+    let mut expected: PgPlanPayload = serde_json::from_value(plan.payload.clone())
+        .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
+    let role_names: HashSet<_> = expected
+        .roles
+        .iter()
+        .map(|role| role.name.clone())
+        .collect();
+    let tablespace_names: HashSet<_> = expected
+        .tablespaces
+        .iter()
+        .map(|tablespace| tablespace.name.clone())
+        .collect();
+
+    let mut actual = PgPlanPayload::default();
+    for (index, expected_db) in expected.databases.iter().enumerate() {
+        let mut scoped = params.clone();
+        scoped.database = Some(expected_db.name.clone());
+        let mut observed = crate::introspect::introspect_cluster(&scoped)
+            .await
+            .map_err(|error| {
+                BackupError::phase_src(
+                    Phase::Verify,
+                    format!("re-introspect PostgreSQL database {}", expected_db.name),
+                    error,
+                )
+            })?;
+        if index == 0 {
+            actual.server_version = expected.server_version.clone();
+            actual.server_major = expected.server_major;
+            actual.roles = observed
+                .roles
+                .into_iter()
+                .filter(|role| role_names.contains(&role.name))
+                .collect();
+            actual.memberships = observed
+                .memberships
+                .into_iter()
+                .filter(|membership| {
+                    role_names.contains(&membership.role) && role_names.contains(&membership.member)
+                })
+                .collect();
+            actual.tablespaces = observed
+                .tablespaces
+                .into_iter()
+                .filter(|tablespace| tablespace_names.contains(&tablespace.name))
+                .collect();
+        }
+        let database = observed.databases.pop().ok_or_else(|| {
+            BackupError::phase(
+                Phase::Verify,
+                format!(
+                    "restored PostgreSQL database {:?} is missing",
+                    expected_db.name
+                ),
+            )
+        })?;
+        actual.databases.push(database);
+    }
+
+    normalize_catalog(&mut expected);
+    normalize_catalog(&mut actual);
+    if actual != expected {
+        let difference = first_catalog_difference(&expected, &actual);
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!("PostgreSQL catalog read-back differs from the source plan: {difference}"),
+        ));
+    }
+    Ok(())
+}
+
+fn first_catalog_difference(expected: &PgPlanPayload, actual: &PgPlanPayload) -> String {
+    let expected = serde_json::to_value(expected).unwrap_or(serde_json::Value::Null);
+    let actual = serde_json::to_value(actual).unwrap_or(serde_json::Value::Null);
+    first_json_difference("$", &expected, &actual)
+        .unwrap_or_else(|| "different serialized catalog values".to_string())
+}
+
+fn first_json_difference(
+    path: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Option<String> {
+    use serde_json::Value;
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) => {
+            for key in expected.keys().chain(actual.keys()) {
+                match (expected.get(key), actual.get(key)) {
+                    (Some(expected), Some(actual)) if expected != actual => {
+                        return first_json_difference(&format!("{path}.{key}"), expected, actual);
+                    }
+                    (Some(_), None) => return Some(format!("{path}.{key} missing at destination")),
+                    (None, Some(_)) => {
+                        return Some(format!("{path}.{key} unexpectedly present at destination"));
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        (Value::Array(expected), Value::Array(actual)) => {
+            if expected.len() != actual.len() {
+                return Some(format!(
+                    "{path} length source={} destination={}",
+                    expected.len(),
+                    actual.len()
+                ));
+            }
+            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                if expected != actual {
+                    return first_json_difference(&format!("{path}[{index}]"), expected, actual);
+                }
+            }
+            None
+        }
+        _ => Some(format!(
+            "{path} source={} destination={}",
+            compact_json(expected),
+            compact_json(actual)
+        )),
+    }
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    const MAX: usize = 240;
+    let rendered = value.to_string();
+    if rendered.chars().count() <= MAX {
+        rendered
+    } else {
+        format!("{}…", rendered.chars().take(MAX).collect::<String>())
+    }
+}
+
+fn normalize_catalog(payload: &mut PgPlanPayload) {
+    for database in &mut payload.databases {
+        for schema in &mut database.schemas {
+            for table in &mut schema.tables {
+                table.estimated_rows = 0;
+                table.estimated_bytes = 0;
+            }
+        }
+    }
+}
+
 /// Select a cluster database that is not one of the overwrite targets.
 fn restore_bootstrap_database(params: &PostgresParams, payload: &PgPlanPayload) -> String {
     let preferred = params.bootstrap_database();

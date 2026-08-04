@@ -16,7 +16,7 @@ dst_pid=
 cleanup() {
   status=$?
   if [[ $status -ne 0 ]]; then
-    for log in server source destination abort-source abort-destination; do
+    for log in server source destination overwrite-source overwrite-destination abort-source abort-destination; do
       printf -- '--- %s log ---\n' "$log" >&2
       sed -n '1,240p' "$work/$log.log" >&2 2>/dev/null || true
     done
@@ -70,6 +70,9 @@ mc() {
 }
 mc mb src/source >/dev/null
 mc cp --recursive /seed/ src/source/in/ >/dev/null
+mc cp --attr 'Content-Type=text/x-rust-backup-e2e;origin=rust-backup-e2e' \
+  /seed/nested/hello.txt src/source/in/nested/hello.txt >/dev/null
+mc anonymous set download src/source >/dev/null
 before=$(mc ls --recursive --json src/source | sort)
 printf 'MinIO seeded\n' >&2
 
@@ -87,8 +90,30 @@ wait "$source_pid"
 printf 'Source finished\n' >&2
 wait "$dst_pid"
 printf 'Destination finished\n' >&2
+rb_assert_formal_verification "$work/source.log" "$work/destination.log"
 after=$(mc ls --recursive --json src/source | sort)
 [[ "$before" == "$after" ]]
+mc diff --quiet src/source/in/ dst/destination/out/
+mc anonymous get dst/destination | grep -q 'download'
+mc stat --json dst/destination/out/nested/hello.txt | grep -q 'rust-backup-e2e'
+
+# A retry with --overwrite must replace existing keys and remove stale keys
+# inside the declared destination prefix before it can be formally verified.
+printf 'stale destination object\n' >"$work/seed/stale.txt"
+mc cp /seed/stale.txt dst/destination/out/stale.txt >/dev/null
+source_pid='' dst_pid=''
+"$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-overwrite --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/overwrite-source.log" 2>&1 &
+source_pid=$!
+sleep 1
+"$RB_E2E_BIN" s3 destination --to 127.0.0.1:7840 --channel minio-overwrite --no-udp --yes --overwrite --bucket destination --prefix out/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style >"$work/overwrite-destination.log" 2>&1 &
+dst_pid=$!
+wait "$source_pid"
+wait "$dst_pid"
+rb_assert_formal_verification "$work/overwrite-source.log" "$work/overwrite-destination.log"
+if mc stat dst/destination/out/stale.txt >/dev/null 2>&1; then
+  echo 'stale S3 object survived --overwrite' >&2
+  exit 1
+fi
 mc diff --quiet src/source/in/ dst/destination/out/
 
 # Inject after the first completed multipart part. The destination returns a
@@ -110,4 +135,4 @@ if mc ls --incomplete --recursive --json dst/destination 2>/dev/null | grep -q .
   echo 'orphan multipart upload after injected abort' >&2
   exit 1
 fi
-printf 'S3 MinIO e2e passed (streaming multipart, abort cleanup, source immutability)\n'
+printf 'S3 MinIO e2e passed (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability)\n'

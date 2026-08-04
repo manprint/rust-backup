@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # T-FS-OWN and T-FS-IMMUT. Invoke directly: sudo -n /absolute/path/to/script.
-# Tests privileged restore, non-root ownership fallback, and abort immutability.
+# Tests privileged exact restore, explicit non-root ownership opt-out, strict
+# default ownership preflight, formal read-back proof, and abort immutability.
 set -euo pipefail
 
 source "$(dirname "$0")/lib.sh"
@@ -33,8 +34,8 @@ start_server() { # port log
   PIDS+=("$!")
   rb_wait_tcp 127.0.0.1 "$1"
 }
-transfer() { # source dest port channel [run-as-user]
-  local src=$1 dst=$2 port=$3 channel=$4 run_as=${5:-}
+transfer() { # source dest port channel [run-as-user] [no-preserve-ownership]
+  local src=$1 dst=$2 port=$3 channel=$4 run_as=${5:-} no_ownership=${6:-}
   if [[ -n "$run_as" ]]; then
     runuser -u "$run_as" -- env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --root "$src" >"$work/$channel-source.log" 2>&1 &
   else
@@ -42,13 +43,21 @@ transfer() { # source dest port channel [run-as-user]
   fi
   local spid=$!; PIDS+=("$spid")
   sleep .3
+  local destination_args=(filesystem destination --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --yes --root "$dst")
+  if [[ $no_ownership == no-preserve ]]; then
+    destination_args+=(--no-preserve-ownership)
+  fi
   if [[ -n "$run_as" ]]; then
-    runuser -u "$run_as" -- env RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --yes --root "$dst" >"$work/$channel-destination.log" 2>&1 &
+    runuser -u "$run_as" -- env RUST_LOG=info "$RB_E2E_BIN" "${destination_args[@]}" >"$work/$channel-destination.log" 2>&1 &
   else
-    RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --yes --root "$dst" >"$work/$channel-destination.log" 2>&1 &
+    RUST_LOG=info "$RB_E2E_BIN" "${destination_args[@]}" >"$work/$channel-destination.log" 2>&1 &
   fi
   local dpid=$!; PIDS+=("$dpid")
-  wait "$spid" && wait "$dpid"
+  local source_rc=0 destination_rc=0
+  wait "$spid" || source_rc=$?
+  wait "$dpid" || destination_rc=$?
+  [[ $source_rc -eq 0 && $destination_rc -eq 0 ]] && \
+    rb_assert_formal_verification "$work/$channel-source.log" "$work/$channel-destination.log"
 }
 
 # (a) root/CAP_CHOWN: exact metadata and hard-link topology.
@@ -68,7 +77,8 @@ if start_server "$port" "$work/root-server.log" && transfer "$root_src" "$root_d
   else fail 'root restore metadata/link topology differs'; fi
 else fail 'root filesystem transfer failed'; fi
 
-# (b) non-root: foreign metadata is readable, destination keeps process owner and warns.
+# (b) non-root: exact ownership is rejected by default. An explicit opt-out
+# excludes uid/gid from the contract while every remaining field is verified.
 nonroot=nobody
 id "$nonroot" >/dev/null 2>&1 || nonroot=$(getent passwd 65534 | cut -d: -f1)
 nr_src="$work/nonroot-source"; nr_dst="$work/nonroot-destination"
@@ -80,12 +90,23 @@ chown -R 0:0 "$nr_src"
 # numeric primary group instead of assuming a same-named group exists.
 chown "$(id -u "$nonroot"):$(id -g "$nonroot")" "$nr_dst"
 port=$(rb_free_port)
-if start_server "$port" "$work/nonroot-server.log" && transfer "$nr_src" "$nr_dst" "$port" fs-nonroot "$nonroot"; then
+if start_server "$port" "$work/nonroot-strict-server.log"; then
+  if transfer "$nr_src" "$nr_dst" "$port" fs-nonroot-strict "$nonroot"; then
+    fail 'non-root restore silently accepted ownership loss'
+  elif grep -q 'exact uid/gid restore requires root or CAP_CHOWN' "$work/fs-nonroot-strict-destination.log"; then
+    pass 'non-root exact ownership restore fails during preflight'
+  else
+    fail 'non-root exact ownership rejection lacks a precise diagnostic'
+  fi
+else fail 'non-root strict preflight server did not start'; fi
+
+port=$(rb_free_port)
+if start_server "$port" "$work/nonroot-server.log" && transfer "$nr_src" "$nr_dst" "$port" fs-nonroot "$nonroot" no-preserve; then
   owner=$(stat -c '%u:%g' "$nr_dst/nested/hello.txt")
   run_uid_gid=$(id -u "$nonroot"):$(id -g "$nonroot")
-  if [[ "$owner" == "$run_uid_gid" ]] && grep -q 'uid/gid will remain the destination process owner' "$work/fs-nonroot-destination.log"; then
-    pass 'non-root restore falls back to process ownership with warning'
-  else fail 'non-root ownership fallback/warning missing'; fi
+  if [[ "$owner" == "$run_uid_gid" ]]; then
+    pass 'explicit ownership opt-out keeps destination process ownership'
+  else fail 'explicit ownership opt-out produced unexpected ownership'; fi
   if [[ "$(stat -c '%a:%Y' "$nr_src/nested/hello.txt")" == "$(stat -c '%a:%Y' "$nr_dst/nested/hello.txt")" ]]; then pass 'non-root preserves mode and mtime'; else fail 'non-root mode or mtime differs'; fi
 else fail 'non-root filesystem transfer failed'; fi
 

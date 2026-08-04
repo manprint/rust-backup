@@ -62,6 +62,7 @@ RUST_LOG=info "$RB_E2E_BIN" s3 destination --to "127.0.0.1:$port" --channel "$to
 destination_pid=$!
 wait "$source_pid"
 wait "$destination_pid"
+rb_assert_formal_verification "$work/source.log" "$work/destination.log"
 
 aws s3api get-object --bucket "$RUST_BACKUP_AWS_DEST_BUCKET" --key "$destination_key" \
   "$work/restored.txt" >/dev/null
@@ -69,4 +70,4 @@ cmp "$work/source.txt" "$work/restored.txt"
 after_etag=$(aws s3api head-object --bucket "$RUST_BACKUP_AWS_SOURCE_BUCKET" \
   --key "$source_key" --query ETag --output text)
 [[ "$before_etag" == "$after_etag" ]]
-echo 'PASS: real AWS S3 transfer, byte identity, and source immutability'
+echo 'PASS: real AWS S3 transfer, persisted read-back proof, byte identity, and source immutability'
