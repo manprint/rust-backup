@@ -92,6 +92,62 @@ rb_assert_formal_verification() { # source-log destination-log
   fi
 }
 
+# Validate a combined `run --config` log without relying on grep's locale,
+# binary-file heuristics, or one-event-per-line behaviour.  Parallel targets
+# may write their records in any order, so compare the multisets of formal
+# commitments and require one terminal progress record per peer.
+rb_assert_session_formal_verification() { # combined-log expected-pairs
+  local combined_log=$1 expected_pairs=$2
+  python3 - "$combined_log" "$expected_pairs" <<'PY'
+from collections import Counter
+import re
+import sys
+
+path = sys.argv[1]
+expected = int(sys.argv[2])
+with open(path, "rb") as stream:
+    text = stream.read().decode("utf-8", "replace")
+text = re.sub(r"\x1b\[[0-9;]*[mK]", "", text)
+
+digest = r"([0-9a-f]{64})"
+source = re.findall(
+    r"BACKUP VERIFIED: source unchanged; destination read-back matches"
+    r"[^\r\n]*?blake3=" + digest,
+    text,
+)
+destination = re.findall(
+    r"RESTORE VERIFIED: persisted destination matches source"
+    r"[^\r\n]*?blake3=" + digest,
+    text,
+)
+progress = re.findall(
+    r"\(100\.0%\)[^\r\n]*?target_label=\S+/(Source|Destination)"
+    r"[^\r\n]*?status=\"?verified\"?",
+    text,
+)
+source_progress = progress.count("Source")
+destination_progress = progress.count("Destination")
+
+if (
+    len(source) != expected
+    or len(destination) != expected
+    or Counter(source) != Counter(destination)
+    or source_progress != expected
+    or destination_progress != expected
+):
+    print(
+        "FAIL: incomplete session proof: "
+        f"source_evidence={len(source)}/{expected} "
+        f"destination_evidence={len(destination)}/{expected} "
+        f"source_progress={source_progress}/{expected} "
+        f"destination_progress={destination_progress}/{expected} "
+        f"commitments_match={Counter(source) == Counter(destination)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
 # Stable tree digest: content, type, mode, ownership, mtime, and link topology.
 # Atime is deliberately excluded: callers needing I-IMMUT use rb_atime_manifest.
 rb_tree_digest() {
