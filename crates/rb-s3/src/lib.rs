@@ -492,7 +492,7 @@ impl Source for S3Source {
         hash.update(b"rust-backup/s3-fingerprint/v2\n");
         hash.update(&serde_json::to_vec(&objects).unwrap_or_default());
         hash.update(b"\npolicy:");
-        hash.update(policy.as_deref().unwrap_or("").as_bytes());
+        hash.update(&canonical_policy_bytes(policy.as_deref(), Phase::Analyze)?);
         Ok(hash.finalize().to_hex().to_string())
     }
 }
@@ -565,9 +565,25 @@ fn canonicalize_policy(value: &mut serde_json::Value) {
             for value in values.values_mut() {
                 canonicalize_policy(value);
             }
+            // `serde_json/preserve_order` can be enabled transitively in the
+            // full workspace.  Sort keys explicitly so fingerprint bytes do
+            // not depend on provider or feature-set insertion order.
+            values.sort_keys();
         }
         _ => {}
     }
+}
+
+fn canonical_policy_bytes(policy: Option<&str>, phase: Phase) -> Result<Vec<u8>> {
+    let Some(policy) = policy else {
+        return Ok(Vec::new());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(policy).map_err(|error| {
+        BackupError::phase(phase, format!("source S3 policy is invalid JSON: {error}"))
+    })?;
+    canonicalize_policy(&mut value);
+    serde_json::to_vec(&value)
+        .map_err(|error| BackupError::phase_src(phase, "serialize canonical S3 policy", error))
 }
 
 #[async_trait]
@@ -1181,6 +1197,28 @@ mod tests {
         canonicalize_policy(&mut first);
         canonicalize_policy(&mut second);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn source_fingerprint_canonicalizes_semantically_equal_policies() {
+        let first = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Sid": "b"},
+                {"Action": ["s3:GetObject", "s3:ListBucket"]}
+            ]
+        }"#;
+        let second = r#"{
+            "Statement": [
+                {"Action": ["s3:ListBucket", "s3:GetObject"]},
+                {"Sid": "b"}
+            ],
+            "Version": "2012-10-17"
+        }"#;
+        assert_eq!(
+            canonical_policy_bytes(Some(first), Phase::Analyze).unwrap(),
+            canonical_policy_bytes(Some(second), Phase::Analyze).unwrap()
+        );
     }
     #[test]
     fn destination_prefix_rewrites_only_source_prefix() {
