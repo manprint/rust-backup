@@ -20,8 +20,8 @@ use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT
 use crate::model::{MongoCollection, MongoDatabase, MongoPlanPayload, MongoUser};
 use crate::{MongoConnection, MongoDbParams};
 
-/// System databases never included in a backup.
-const SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
+/// System databases never included in a backup, and never restored into.
+pub(crate) const SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
 
 /// Connect and introspect the whole reachable cluster (read-only).
 pub async fn introspect_cluster(params: &MongoDbParams) -> Result<MongoPlanPayload> {
@@ -30,7 +30,7 @@ pub async fn introspect_cluster(params: &MongoDbParams) -> Result<MongoPlanPaylo
 
     let mut databases = Vec::new();
     for name in db_names {
-        databases.push(introspect_database(&conn, &name).await?);
+        databases.push(introspect_database(&conn, &name, params).await?);
     }
 
     Ok(MongoPlanPayload {
@@ -59,7 +59,11 @@ async fn select_databases(conn: &MongoConnection, params: &MongoDbParams) -> Res
 
 /// Introspect one database: its collections (+ options + indexes + estimates)
 /// and (best-effort) its users.
-async fn introspect_database(conn: &MongoConnection, db_name: &str) -> Result<MongoDatabase> {
+async fn introspect_database(
+    conn: &MongoConnection,
+    db_name: &str,
+    params: &MongoDbParams,
+) -> Result<MongoDatabase> {
     let db = conn.client.database(db_name);
 
     let specs = db
@@ -79,16 +83,41 @@ async fn introspect_database(conn: &MongoConnection, db_name: &str) -> Result<Mo
         })?;
 
     let mut collections = Vec::new();
+    let mut skipped = Vec::new();
     for spec in specs {
         // Only ordinary collections carry restorable document data; views are
         // derived and time-series have a special on-disk shape (out of scope).
+        // Skipping them SILENTLY meant a cluster with views restored without
+        // them and still reported a verified 1:1 copy, so they are refused
+        // unless the operator opts in explicitly.
         if spec.collection_type != CollectionType::Collection {
+            skipped.push(format!(
+                "{}.{} ({:?})",
+                db_name, spec.name, spec.collection_type
+            ));
             continue;
         }
         if spec.name.starts_with("system.") {
             continue;
         }
         collections.push(introspect_collection(&db, db_name, &spec.name, &spec.options).await?);
+    }
+    if !skipped.is_empty() && params.allow_skipped_namespaces {
+        tracing::warn!(
+            namespaces = %skipped.join(", "),
+            "allow_skipped_namespaces is set: this backup is NOT a 1:1 copy"
+        );
+    }
+    if !skipped.is_empty() && !params.allow_skipped_namespaces {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!(
+                "this build does not restore views or time-series collections, and will not \
+                 report a 1:1 copy without them: {}. Exclude those databases, or set \
+                 allow_skipped_namespaces=true to accept a partial copy.",
+                skipped.join(", ")
+            ),
+        ));
     }
 
     let users = introspect_users(&db).await;
@@ -126,6 +155,7 @@ async fn introspect_collection(
         if index_name(&m).as_deref() == Some("_id_") {
             continue;
         }
+        reject_lossy_bson(&m, &format!("index of {db_name}.{coll_name}"))?;
         let v = serde_json::to_value(&m).map_err(|e| {
             BackupError::phase_src(Phase::Analyze, format!("encode index of {coll_name}"), e)
         })?;
@@ -137,6 +167,7 @@ async fn introspect_collection(
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {coll_name}"), e))?;
 
+    reject_lossy_bson(options, &format!("options of {db_name}.{coll_name}"))?;
     Ok(MongoCollection {
         database: db_name.to_string(),
         name: coll_name.to_string(),
@@ -145,6 +176,55 @@ async fn introspect_collection(
         estimated_docs,
         estimated_bytes: coll_size_bytes(db, coll_name).await,
     })
+}
+
+/// Refuse a spec that cannot survive the plan's JSON container.
+///
+/// Index specs and collection options are carried as `serde_json::Value`.
+/// BSON's `Serialize` for a generic `Binary` calls `serialize_bytes`, which
+/// serde_json renders as an array of integers — the destination then rebuilds a
+/// BSON *array*, which MongoDB accepts as a different (and silently wrong)
+/// value, and re-introspection produces the same array so verification agrees.
+/// Rather than ship that silent corruption, such a spec is refused.
+fn reject_lossy_bson<T: serde::Serialize>(value: &T, what: &str) -> Result<()> {
+    let document = mongodb::bson::to_document(value)
+        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("encode {what} as BSON"), e))?;
+    if let Some(path) = find_binary(&mongodb::bson::Bson::Document(document), String::new()) {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!(
+                "{what} contains BSON binary data at {path}, which this plan format cannot carry \
+                 without changing its type; the {what} must be recreated manually"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Path of the first `Bson::Binary` inside `value`, if any.
+fn find_binary(value: &mongodb::bson::Bson, path: String) -> Option<String> {
+    match value {
+        mongodb::bson::Bson::Binary(_) => Some(if path.is_empty() {
+            "<root>".to_string()
+        } else {
+            path
+        }),
+        mongodb::bson::Bson::Document(document) => document.iter().find_map(|(key, nested)| {
+            find_binary(
+                nested,
+                if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                },
+            )
+        }),
+        mongodb::bson::Bson::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(index, nested)| find_binary(nested, format!("{path}[{index}]"))),
+        _ => None,
+    }
 }
 
 /// The index name from an `IndexModel`'s options, if set.
@@ -289,6 +369,42 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mongodb::bson::{doc, spec::BinarySubtype, Binary, Bson};
+
+    /// BSON binary inside an index spec or collection options would be
+    /// re-rendered by serde_json as an array of integers, so the destination
+    /// would silently rebuild a *different* value — and re-introspection would
+    /// produce the same array, so verification would agree with the
+    /// corruption. It must fail analysis instead.
+    #[test]
+    fn binary_in_a_spec_is_refused_rather_than_silently_retyped() {
+        let binary = Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: vec![1, 2, 3],
+        });
+
+        // Plain specs pass.
+        reject_lossy_bson(
+            &doc! { "key": { "email": 1 }, "unique": true },
+            "index of appdb.a",
+        )
+        .expect("a plain index spec carries no binary");
+
+        for (spec, want_path) in [
+            (doc! { "blob": binary.clone() }, "blob"),
+            (
+                doc! { "validator": { "$expr": { "seed": binary.clone() } } },
+                "validator.$expr.seed",
+            ),
+            (doc! { "keys": [1, binary.clone()] }, "keys[1]"),
+        ] {
+            let error =
+                reject_lossy_bson(&spec, "options of appdb.a").expect_err("binary must be refused");
+            let rendered = format!("{error}");
+            assert!(rendered.contains("contains BSON binary data"), "{rendered}");
+            assert!(rendered.contains(want_path), "{rendered}");
+        }
+    }
 
     #[test]
     fn build_plan_one_item_per_collection() {

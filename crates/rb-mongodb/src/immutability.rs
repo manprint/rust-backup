@@ -82,6 +82,13 @@ pub fn compose(snap: &SourceFingerprint) -> String {
 /// the structural hash reflects collections/options/indexes only.
 fn normalize(p: &mut MongoPlanPayload) {
     for db in &mut p.databases {
+        // The user probe is best-effort: `usersInfo` can fail transiently (an
+        // election, a step-down, a momentary auth error) and then yields an
+        // empty list. Hashing it made such a blip look like a source mutation —
+        // the one error class documented as "must never happen" — on a source
+        // nothing had touched. Users are never restored either, so they have no
+        // business in the immutability digest.
+        db.users.clear();
         for c in &mut db.collections {
             c.estimated_docs = 0;
             c.estimated_bytes = 0;

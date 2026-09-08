@@ -59,6 +59,12 @@ pub struct MongoDbParams {
     #[serde(default)]
     pub database: Option<String>,
 
+    /// Accept a partial copy that omits namespaces this build cannot restore
+    /// (views, time-series collections). Off by default: analysis fails instead
+    /// of reporting a verified 1:1 copy of a cluster it did not fully read.
+    #[serde(default)]
+    pub allow_skipped_namespaces: bool,
+
     /// Authentication database (usually `admin`).
     #[serde(default)]
     pub auth_db: Option<String>,
@@ -201,6 +207,7 @@ mod tests {
             database: Some("appdb".into()),
             auth_db: Some("admin".into()),
             overwrite: false,
+            allow_skipped_namespaces: false,
         };
         assert_eq!(p.command_db(), "admin");
         p.auth_db = None;

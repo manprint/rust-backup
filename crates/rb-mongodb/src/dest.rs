@@ -27,6 +27,34 @@ use crate::{MongoConnection, MongoDbParams};
 /// Documents per `insert_many` call during restore.
 const INSERT_BATCH: usize = 1000;
 
+/// MongoDB's own BSON document limit. A length prefix beyond it is a protocol
+/// violation, never something to wait for more bytes on.
+const MAX_BSON_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Refuse a namespace the plan must never name.
+///
+/// The source excludes system databases and `system.*` collections, but the
+/// destination re-derives every name from the received plan — peer-controlled
+/// input. Without this guard a plan naming `admin.system.users` would, under
+/// `--overwrite`, have the restore DROP every account on the destination
+/// cluster.
+pub fn check_namespace(database: &str, collection: &str) -> Result<()> {
+    let bad_db = database.is_empty()
+        || crate::introspect::SYSTEM_DBS.contains(&database)
+        || database.contains(['/', '\\', '.', ' ', '\0', '$', '"']);
+    let bad_collection = collection.is_empty()
+        || collection.starts_with("system.")
+        || collection.contains('\0')
+        || collection.contains('$');
+    if bad_db || bad_collection {
+        return Err(BackupError::phase(
+            Phase::Validate,
+            format!("refusing system or invalid namespace {database:?}.{collection:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Facts gathered from the destination needed to assess the plan.
 #[derive(Debug, Clone, Default)]
 pub struct DestProbe {
@@ -66,6 +94,27 @@ pub fn assess(
             "destination major {} vs source major {} (need destination ≥ source)",
             probe.dest_major, payload.server_major
         ),
+    );
+
+    let namespace_faults: Vec<String> = payload
+        .databases
+        .iter()
+        .flat_map(|db| {
+            db.collections.iter().filter_map(|coll| {
+                check_namespace(&db.name, &coll.name)
+                    .err()
+                    .map(|error| error.to_string())
+            })
+        })
+        .collect();
+    pf = pf.check(
+        "namespaces",
+        namespace_faults.is_empty(),
+        if namespace_faults.is_empty() {
+            "every planned namespace is a restorable user namespace".to_string()
+        } else {
+            namespace_faults.join("; ")
+        },
     );
 
     for db in &payload.databases {
@@ -132,9 +181,12 @@ pub async fn stream_in(
     let conn = MongoConnection::connect(params).await?;
 
     // 1. Create every collection (with its options), dropping first on overwrite.
+    //    The namespace guard is re-applied here: preflight and apply are two
+    //    separate exchanges, and only this one destroys anything.
     for db in &payload.databases {
         let database = conn.client.database(&db.name);
         for coll in &db.collections {
+            check_namespace(&db.name, &coll.name)?;
             create_collection(&database, coll, params.overwrite).await?;
         }
     }
@@ -223,14 +275,30 @@ async fn create_collection(
     overwrite: bool,
 ) -> Result<()> {
     if overwrite {
-        // Best-effort: a NamespaceNotFound on a fresh destination is fine.
-        let _ = db.collection::<Document>(&coll.name).drop().await;
+        // A NamespaceNotFound on a fresh destination is fine; anything else is
+        // a real failure that would otherwise resurface as an opaque
+        // NamespaceExists from the `create` below.
+        if let Err(error) = db.collection::<Document>(&coll.name).drop().await {
+            if !is_namespace_not_found(&error) {
+                return Err(BackupError::phase_src(
+                    Phase::Apply,
+                    format!("drop existing collection {}", coll.name),
+                    error,
+                ));
+            }
+        }
     }
 
     let mut cmd = doc! { "create": &coll.name };
     if let Some(opts) = &coll.options {
-        let opts_doc = mongodb::bson::to_document(opts).map_err(|e| {
-            BackupError::phase_src(Phase::Apply, format!("decode options {}", coll.name), e)
+        // `bson::to_document` SERIALIZES the JSON value, and bson's serializer
+        // has no `$`-key handling: an option containing `{"$date": …}` or
+        // `{"$binary": …}` would be replayed to the server as a literal
+        // sub-document. Deserializing into `Document` goes through bson's
+        // extended-JSON-aware visitor instead, which is also what the index
+        // path already does.
+        let opts_doc: Document = serde_json::from_value(opts.clone()).map_err(|e| {
+            BackupError::phase(Phase::Apply, format!("decode options {}: {e}", coll.name))
         })?;
         cmd.extend(opts_doc);
     }
@@ -238,6 +306,14 @@ async fn create_collection(
         BackupError::phase_src(Phase::Apply, format!("create collection {}", coll.name), e)
     })?;
     Ok(())
+}
+
+/// Whether a driver error is MongoDB's `NamespaceNotFound` (code 26).
+fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+    matches!(
+        &*error.kind,
+        mongodb::error::ErrorKind::Command(command) if command.code == 26
+    )
 }
 
 /// Build the captured (non-`_id_`) indexes for one collection.
@@ -405,7 +481,12 @@ impl CurrentItem {
             .client
             .database(&self.database)
             .collection::<Document>(&self.collection);
-        coll.insert_many(docs).ordered(false).await.map_err(|e| {
+        // Ordered inserts: for a capped collection the insertion (natural)
+        // order IS state — `find()` with no sort, `$natural` and tailable
+        // cursors all read it, and it decides eviction order. An unordered bulk
+        // write may reorder freely. Ordering also gives precise duplicate-key
+        // attribution, which is worth more than the throughput it costs.
+        coll.insert_many(docs).ordered(true).await.map_err(|e| {
             BackupError::phase_src(
                 Phase::Apply,
                 format!("insert_many {}.{}", self.database, self.collection),
@@ -422,13 +503,18 @@ impl CurrentItem {
 fn take_documents(buf: &mut Vec<u8>, out: &mut Vec<Document>) -> Result<()> {
     let mut pos = 0usize;
     while buf.len() - pos >= 4 {
-        let len = i32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        if len < 5 {
+        let declared = i32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
+        // A negative prefix sign-extends through `as usize` into ~2^64, and any
+        // oversized prefix takes the "wait for more bytes" branch forever: the
+        // accumulator then grows to the whole item, which OOMs the destination
+        // and breaks I-NOTEMP. Bound it by MongoDB's own document limit.
+        if declared < 5 || declared as usize > MAX_BSON_DOCUMENT_BYTES {
             return Err(BackupError::phase(
                 Phase::Apply,
-                format!("invalid BSON document length {len}"),
+                format!("invalid BSON document length {declared}"),
             ));
         }
+        let len = declared as usize;
         if buf.len() - pos < len {
             break; // partial document; wait for more bytes.
         }
@@ -567,8 +653,65 @@ mod tests {
 
     #[test]
     fn take_documents_rejects_bogus_length() {
-        let mut buf = vec![1, 0, 0, 0]; // length=1, impossible (< 5)
-        let mut out = Vec::new();
-        assert!(take_documents(&mut buf, &mut out).is_err());
+        // A too-short prefix, a negative one (which sign-extends through
+        // `as usize` into ~2^64) and one past MongoDB's own 16 MiB document
+        // limit must all fail immediately. Taking the "wait for more bytes"
+        // branch instead would buffer the whole item into the accumulator,
+        // OOM the destination and break I-NOTEMP.
+        let bogus: [Vec<u8>; 4] = [
+            vec![1, 0, 0, 0],                      // 1, impossible (< 5)
+            vec![0, 0, 0, 0],                      // 0
+            vec![0xFF; 4],                         // -1
+            0x7FFF_FFFFi32.to_le_bytes().to_vec(), // i32::MAX
+        ];
+        for prefix in bogus {
+            let mut buf = prefix.clone();
+            // Trailing bytes make sure the failure is not merely "too short".
+            buf.extend_from_slice(&[0u8; 8]);
+            let mut out = Vec::new();
+            let error = take_documents(&mut buf, &mut out)
+                .expect_err(&format!("prefix {prefix:?} must be refused"));
+            assert!(
+                format!("{error}").contains("invalid BSON document length"),
+                "{error}"
+            );
+            assert!(out.is_empty());
+        }
+    }
+
+    /// The destination re-derives every namespace from the received plan, which
+    /// is peer-controlled. A plan naming `admin.system.users` under
+    /// `--overwrite` would otherwise DROP every account on the cluster.
+    #[test]
+    fn system_and_malformed_namespaces_are_refused() {
+        for (db, coll) in [
+            ("admin", "system.users"),
+            ("admin", "accounts"),
+            ("local", "oplog.rs"),
+            ("config", "shards"),
+            ("appdb", "system.views"),
+            ("", "accounts"),
+            ("appdb", ""),
+            ("app.db", "accounts"),
+            ("app db", "accounts"),
+            ("app$db", "accounts"),
+            ("app\0db", "accounts"),
+            ("app/db", "accounts"),
+            ("app\\db", "accounts"),
+            ("app\"db", "accounts"),
+            ("appdb", "acc$ounts"),
+            ("appdb", "acc\0unts"),
+        ] {
+            let error =
+                check_namespace(db, coll).expect_err(&format!("{db:?}.{coll:?} must be refused"));
+            assert!(
+                format!("{error}").contains("refusing system or invalid namespace"),
+                "{error}"
+            );
+        }
+        // Dots are legal *inside* a collection name (`a.b.c` sub-collection
+        // naming is idiomatic), so those must still pass.
+        check_namespace("appdb", "accounts").expect("plain namespace");
+        check_namespace("appdb", "events.2026.raw").expect("dotted collection");
     }
 }
