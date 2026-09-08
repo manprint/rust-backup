@@ -49,6 +49,39 @@ hardlink topology, requested ownership and xattrs. It then reopens every regular
 file and reproduces all item and payload BLAKE3 commitments. Extra, missing,
 unreadable, changed or truncated entries fail the run.
 
+## Plan hardening (the destination treats the plan as hostile input)
+
+The plan arrives over the wire, so every path and mode in it is attacker-
+controlled from the destination's point of view. Concretely:
+
+- Every entry path must be a **canonical relative path made only of plain
+  components**. `..`, absolute paths, `.`, `a/./b` and `a//b` are all refused.
+  `.` used to be accepted, which let a plan re-permission and re-own the
+  operator's destination root itself.
+- Entry paths must be **unique**, and `kind` must agree with the presence of a
+  symlink/hardlink target. Two entries for one path let a later entry act on
+  what an earlier one created there.
+- The mode is applied with `open(O_NOFOLLOW)` + `fchmod`, never with
+  `chmod(2)`, which follows symlinks. Payload bytes are written through
+  `O_NOFOLLOW` too. Without this, a plan could plant a symlink and have the
+  restore chmod (setuid included) or overwrite the link's target — anywhere on
+  a host whose restore runs as root, which is exactly how ownership-preserving
+  restores run.
+- A plan that carries extended attributes is refused at preflight, since this
+  build does not restore them.
+- Metadata verification sorts the received entries before comparing, so it does
+  not depend on the peer's ordering.
+
+Names are carried in the plan as UTF-8. A source path or symlink target that is
+not valid UTF-8 fails analysis with the offending on-disk path, rather than
+being silently renamed to contain U+FFFD — which the destination would then
+create, and which verification (comparing mangled against mangled) would
+accept. Modification times are signed, so pre-1970 timestamps round-trip
+instead of being clamped to the epoch.
+
+The source walk is depth-bounded (1024 levels): it recurses, and an
+adversarially deep tree would abort the process rather than return an error.
+
 ## Current limits
 
 - `--follow-symlinks` is rejected. Following a link could escape the declared

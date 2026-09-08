@@ -73,8 +73,9 @@ pub struct FilesystemEntry {
     pub uid: u32,
     #[serde(default)]
     pub gid: u32,
+    /// Signed: pre-1970 modification times are legal and must round-trip.
     #[serde(default)]
-    pub mtime: u64,
+    pub mtime: i64,
     #[serde(default)]
     pub mtime_nsec: u32,
     #[serde(default)]
@@ -314,6 +315,211 @@ mod tests {
             64 * 1024 + 19
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Build a plan whose payload is exactly `entries`, with no data items.
+    fn hostile_plan(root: &Path, entries: Vec<FilesystemEntry>) -> BackupPlan {
+        let payload = FilesystemPlan {
+            root: root.display().to_string(),
+            entries,
+            total_bytes: 0,
+            ownership_note: String::new(),
+        };
+        BackupPlan {
+            format_version: rb_core::plan::PLAN_FORMAT_VERSION,
+            module: "filesystem".into(),
+            mode: rb_core::plan::BackupMode::Copy1to1,
+            created_at: "1970-01-01T00:00:00Z".into(),
+            source_summary: "hostile".into(),
+            items: Vec::new(),
+            estimated_bytes: 0,
+            integrity: rb_core::plan::IntegritySpec::default(),
+            payload: serde_json::to_value(payload).unwrap(),
+        }
+    }
+
+    fn entry(path: &str, kind: &str, mode: u32) -> FilesystemEntry {
+        FilesystemEntry {
+            path: path.into(),
+            kind: kind.into(),
+            size: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            target: None,
+            hardlink_to: None,
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    /// A plan that plants a symlink at a path and then declares a FILE at the
+    /// same path must never reach `chmod`: the mode would be applied to the
+    /// link's target, i.e. to an arbitrary file outside the destination root,
+    /// with setuid bits included, on a restore that runs as root.
+    #[tokio::test]
+    async fn a_plan_cannot_chmod_through_a_planted_symlink() {
+        let destination_root = tempdir("symlink-chmod-destination");
+        let victim_dir = tempdir("symlink-chmod-victim");
+        let victim = victim_dir.join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut link = entry("x", "symlink", 0o120_777);
+        link.target = Some(victim.display().to_string());
+        let plan = hostile_plan(&destination_root, vec![link, entry("x", "file", 0o104_777)]);
+
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        let error = destination
+            .stream_in(&plan, &mut source)
+            .await
+            .expect_err("a duplicate plan path must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate filesystem plan entry"),
+            "unexpected error: {error}"
+        );
+
+        assert_eq!(
+            fs::symlink_metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "the victim's mode must be untouched"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        let _ = fs::remove_dir_all(&destination_root);
+        let _ = fs::remove_dir_all(&victim_dir);
+    }
+
+    /// The mode application itself must be no-follow, independently of the
+    /// plan-level guards above: a symlink at the target path fails the open
+    /// rather than re-permissioning whatever it points at.
+    #[test]
+    fn chmod_never_follows_a_symlink() {
+        let root = tempdir("nofollow");
+        let victim = root.join("victim");
+        fs::write(&victim, b"untouched").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let planted = root.join("planted");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let error = crate::dest::chmod_no_follow(&planted, &entry("planted", "file", 0o104_777))
+            .expect_err("chmod through a symlink must fail");
+        assert!(
+            error.to_string().to_lowercase().contains("symbolic link"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "the victim's mode must be untouched"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
+        // A real file at the path is still chmod'd exactly.
+        let real = root.join("real");
+        fs::write(&real, b"x").unwrap();
+        crate::dest::chmod_no_follow(&real, &entry("real", "file", 0o104_755)).unwrap();
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o7777,
+            0o4755
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The destination refuses to restore into a non-empty root, so a plan can
+    /// never act on state it did not create.
+    #[tokio::test]
+    async fn a_non_empty_destination_is_refused() {
+        let destination_root = tempdir("non-empty-destination");
+        fs::write(destination_root.join("pre-existing"), b"x").unwrap();
+        let plan = hostile_plan(&destination_root, vec![entry("f", "file", 0o100_644)]);
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        let error = destination
+            .stream_in(&plan, &mut source)
+            .await
+            .expect_err("a non-empty destination must be refused");
+        assert!(
+            error.to_string().contains("must be empty"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(&destination_root);
+    }
+
+    /// `"."`, `"a/./b"` and `".."` are all outside the set of restorable paths.
+    #[test]
+    fn only_canonical_plain_relative_paths_are_accepted() {
+        for path in [".", "a/./b", "..", "a/../b", "/abs", "", "a//b", "./a"] {
+            assert!(
+                crate::walk::relative_path(path, Phase::Validate).is_err(),
+                "{path:?} must be refused"
+            );
+        }
+        for path in ["a", "a/b", "a/b/c.txt"] {
+            assert!(
+                crate::walk::relative_path(path, Phase::Validate).is_ok(),
+                "{path:?} must be accepted"
+            );
+        }
+    }
+
+    /// The plan cannot claim extended attributes this build never restores.
+    #[tokio::test]
+    async fn a_plan_carrying_xattrs_is_refused_at_validate() {
+        let destination_root = tempdir("xattr-destination");
+        let mut with_xattr = entry("f", "file", 0o100_644);
+        with_xattr
+            .xattrs
+            .insert("user.thing".into(), b"value".to_vec());
+        let plan = hostile_plan(&destination_root, vec![with_xattr]);
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let preflight = destination.validate(&plan).await;
+        let error = match preflight {
+            Ok(report) => {
+                assert!(!report.ok, "xattrs must fail preflight");
+                let _ = fs::remove_dir_all(&destination_root);
+                return;
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("extended attributes"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(&destination_root);
+    }
+
+    /// A pre-1970 modification time must round-trip instead of being clamped.
+    #[test]
+    fn pre_epoch_mtimes_are_preserved() {
+        let root = tempdir("pre-epoch");
+        let file = root.join("old");
+        fs::write(&file, b"x").unwrap();
+        nix::sys::stat::utimensat(
+            None,
+            &file,
+            &nix::sys::time::TimeSpec::new(-86_400, 0),
+            &nix::sys::time::TimeSpec::new(-86_400, 0),
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )
+        .unwrap();
+        let plan = crate::walk::collect(&root).unwrap();
+        let old = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == "old")
+            .unwrap();
+        assert_eq!(old.mtime, -86_400);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

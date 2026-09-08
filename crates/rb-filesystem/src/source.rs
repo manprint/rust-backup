@@ -73,20 +73,24 @@ pub(crate) async fn stream_out(
 ) -> Result<()> {
     let root = checked_root(params, Phase::Transfer)?;
     let payload = payload(plan, Phase::Transfer)?;
+    // Index once: a linear scan per item is O(items x entries), which at the
+    // core's 100 000-item cap is billions of string comparisons.
+    let files: std::collections::HashMap<&str, &crate::FilesystemEntry> = payload
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "file")
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
     for item in &plan.items {
         if item.kind != "file" {
             continue;
         }
-        let entry = payload
-            .entries
-            .iter()
-            .find(|entry| entry.path == item.name && entry.kind == "file")
-            .ok_or_else(|| {
-                BackupError::phase(
-                    Phase::Transfer,
-                    format!("missing file metadata: {}", item.name),
-                )
-            })?;
+        let entry = *files.get(item.name.as_str()).ok_or_else(|| {
+            BackupError::phase(
+                Phase::Transfer,
+                format!("missing file metadata: {}", item.name),
+            )
+        })?;
         let path = at_root(&root, &entry.path, Phase::Transfer)?;
         let mut reader = NoAtimeReader::open(&path)?;
         let mut offset = 0_u64;

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use nix::fcntl::AtFlags;
@@ -14,7 +14,7 @@ use rb_core::plan::{BackupPlan, Preflight};
 
 use crate::source::payload;
 use crate::walk::{at_root, io_error};
-use crate::{FilesystemParams, FilesystemPlan};
+use crate::{FilesystemEntry, FilesystemParams, FilesystemPlan};
 
 pub(crate) fn validate_destination_params(params: &FilesystemParams) -> Result<()> {
     if params.follow_symlinks || params.preserve_xattr {
@@ -184,7 +184,11 @@ pub(crate) fn verify_metadata(params: &FilesystemParams, plan: &BackupPlan) -> R
             ),
         ));
     }
-    for (source, destination) in expected.entries.iter().zip(&actual.entries) {
+    // `actual` is sorted by the walk; `expected` arrives in whatever order the
+    // peer chose. Compare like against like.
+    let mut expected_entries: Vec<_> = expected.entries.iter().collect();
+    expected_entries.sort_by(|a, b| a.path.cmp(&b.path));
+    for (source, destination) in expected_entries.into_iter().zip(&actual.entries) {
         let ownership_matches = !params.preserve_ownership
             || (source.uid == destination.uid && source.gid == destination.gid);
         if source.path != destination.path
@@ -234,10 +238,13 @@ impl ActiveFile {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| io_error(Phase::Apply, parent, e))?;
         }
+        // O_NOFOLLOW: a plan that planted a symlink at this path must not have
+        // the restore write the item's bytes into the link's target.
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .custom_flags(libc_o_nofollow())
             .open(&path)
             .map_err(|e| io_error(Phase::Apply, &path, e))?;
         Ok(Self {
@@ -338,10 +345,17 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
             // chown(2) clears setuid/setgid on regular files. Apply ownership
             // first and the exact permission bits last, otherwise a successful
             // privileged restore silently turns 04755 into 0755.
-            fs::set_permissions(&path, fs::Permissions::from_mode(entry.mode & 0o7777))
-                .map_err(|e| io_error(Phase::Apply, &path, e))?;
+            //
+            // NEVER `fs::set_permissions` here: that is chmod(2), which FOLLOWS
+            // symlinks. A plan could then plant a symlink at a path and have the
+            // following entry chmod the link's target — arbitrary mode change,
+            // setuid included, anywhere on a host whose restore runs as root
+            // (which is exactly how ownership-preserving restores run). Open the
+            // path with O_NOFOLLOW and fchmod the descriptor, so the kernel, not
+            // a preceding stat, enforces it.
+            chmod_no_follow(&path, entry)?;
         }
-        let mtime = TimeSpec::new(entry.mtime as i64, entry.mtime_nsec as i64);
+        let mtime = TimeSpec::new(entry.mtime, entry.mtime_nsec as i64);
         utimensat(
             None,
             &path,
@@ -355,6 +369,7 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
 }
 
 fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for entry in &plan.entries {
         let _ = crate::walk::relative_path(&entry.path, Phase::Validate)?;
         if !matches!(entry.kind.as_str(), "file" | "dir" | "symlink" | "hardlink") {
@@ -363,8 +378,83 @@ fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
                 format!("unknown filesystem entry kind: {}", entry.kind),
             ));
         }
+        // Two entries for one path let a later entry act on whatever an earlier
+        // entry created there — the symlink-then-chmod pattern above.
+        if !seen.insert(entry.path.as_str()) {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!("duplicate filesystem plan entry: {:?}", entry.path),
+            ));
+        }
+        if (entry.kind == "symlink") != entry.target.is_some() {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!(
+                    "filesystem entry {:?} of kind {} must {}carry a symlink target",
+                    entry.path,
+                    entry.kind,
+                    if entry.kind == "symlink" { "" } else { "not " }
+                ),
+            ));
+        }
+        if (entry.kind == "hardlink") != entry.hardlink_to.is_some() {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!(
+                    "filesystem entry {:?} of kind {} must {}carry a hardlink target",
+                    entry.path,
+                    entry.kind,
+                    if entry.kind == "hardlink" { "" } else { "not " }
+                ),
+            ));
+        }
+        if let Some(target) = &entry.hardlink_to {
+            let _ = crate::walk::relative_path(target, Phase::Validate)?;
+        }
+        // Xattrs are never collected by this build, so a plan carrying them
+        // would only fail much later, in verification.
+        if !entry.xattrs.is_empty() {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!(
+                    "filesystem entry {:?} carries extended attributes, which this build does not restore",
+                    entry.path
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+/// `chmod` a restored path without ever following a symlink.
+///
+/// Linux's `fchmodat` rejects `AT_SYMLINK_NOFOLLOW`, so the no-follow guarantee
+/// comes from opening the path with `O_NOFOLLOW` and calling `fchmod` on the
+/// resulting descriptor: if the path is a symlink the open itself fails.
+pub(crate) fn chmod_no_follow(path: &Path, entry: &FilesystemEntry) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let flags = if entry.kind == "dir" {
+        libc_o_directory() | libc_o_nofollow()
+    } else {
+        libc_o_nofollow()
+    };
+    options.custom_flags(flags);
+    let file = options
+        .open(path)
+        .map_err(|e| io_error(Phase::Apply, path, e))?;
+    // `File::set_permissions` is `fchmod(2)` on the already-open descriptor, so
+    // it cannot be redirected by anything at `path` after the open.
+    file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o7777))
+        .map_err(|e| io_error(Phase::Apply, path, e))
+}
+
+fn libc_o_nofollow() -> i32 {
+    0o400_000 // O_NOFOLLOW on Linux
+}
+
+fn libc_o_directory() -> i32 {
+    0o200_000 // O_DIRECTORY on Linux
 }
 
 fn has_cap_chown() -> bool {
