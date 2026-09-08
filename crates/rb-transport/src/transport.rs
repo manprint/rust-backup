@@ -21,6 +21,8 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use crate::shared::tune_tcp;
+
 pub const CONTROL_PORT: u16 = 7835;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -168,18 +170,25 @@ pub async fn connect(endpoint: &Endpoint, insecure: bool) -> Result<ControlStrea
     let server_name = ServerName::try_from(endpoint.host.as_str())
         .context("invalid server name")?
         .to_owned();
-    let tls_stream = connector
-        .connect(server_name, tcp)
+    // A TCP peer that completes the handshake and then stalls the TLS flight
+    // would otherwise hang the client forever (bore bounds this the same way).
+    let tls_stream = timeout(NETWORK_TIMEOUT, connector.connect(server_name, tcp))
         .await
+        .context("timed out during TLS handshake")?
         .map_err(|e| anyhow::anyhow!("tls handshake failed: {e}"))?;
     Ok(ControlStream::Tls(Box::new(tls_stream)))
 }
 
 pub async fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
-    timeout(NETWORK_TIMEOUT, TcpStream::connect((host, port)))
+    let stream = timeout(NETWORK_TIMEOUT, TcpStream::connect((host, port)))
         .await
         .context("connection timeout")?
-        .context("failed to connect")
+        .context("failed to connect")?;
+    // Every socket is tuned, exactly as on the server's accept path: this TCP
+    // connection carries the whole multiplexed relay data plane, so Nagle
+    // batching and missing keepalive would penalise every substream on it.
+    tune_tcp(&stream);
+    Ok(stream)
 }
 
 fn default_client_config() -> Result<ClientConfig> {

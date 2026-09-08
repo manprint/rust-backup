@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +38,9 @@ const REGISTRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SECRET_CTRL_TIMEOUT: Duration = Duration::from_secs(60);
 /// A peer that stops reading must not pin the control loop forever.
 const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// A relayed substream owes its readiness marker immediately; this read holds a
+/// `max_conns` permit, so it must never block indefinitely.
+const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type Registry = Arc<DashMap<String, Arc<CarrierPool>>>;
 
@@ -422,7 +426,9 @@ async fn handle_conn<S: mux::Transport>(
     };
     let mut control = Delimited::new(ctrl_stream);
 
-    let first = control.recv_client().await?;
+    // A peer that opens the control substream and then goes silent must not pin
+    // this task: the first frame is owed immediately (bore's `recv_timeout`).
+    let first = control.recv_client_timeout().await?;
 
     if let Some(authenticator) = auth {
         authenticator.server_handshake(&mut control).await?;
@@ -473,22 +479,33 @@ async fn serve_provider(
     _peer: SocketAddr,
     _pending_carriers: PendingCarriers,
 ) -> Result<()> {
-    if registry.contains_key(&id) {
-        warn!(%id, "channel id already in use");
-        control
-            .send_server(ServerMsg::Error {
-                reason: "channel already in use".into(),
-            })
-            .await?;
-        return Ok(());
-    }
-
+    // Claim the channel id ATOMICALLY. A `contains_key` probe followed by an
+    // `insert` lets two sources that register at the same moment both pass the
+    // probe; the second then replaces the first's pool in the registry, so the
+    // consumer's relayed substreams are spliced to the wrong source and the
+    // first source's `DropGuard` later removes an entry it no longer owns —
+    // failing an in-flight backup with a confusing "source is no longer
+    // available".
     let pool = Arc::new(CarrierPool::new(opener));
-    registry.insert(id.clone(), Arc::clone(&pool));
+    match registry.entry(id.clone()) {
+        Entry::Occupied(_) => {
+            warn!(%id, "channel id already in use");
+            control
+                .send_server(ServerMsg::Error {
+                    reason: "channel already in use".into(),
+                })
+                .await?;
+            return Ok(());
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(Arc::clone(&pool));
+        }
+    }
     let _guard = DropGuard {
         registry: Arc::clone(&registry),
         udp_registry: Arc::clone(&udp_registry),
         id: id.clone(),
+        pool: Arc::clone(&pool),
     };
 
     control.send_server(ServerMsg::Ok).await?;
@@ -535,6 +552,27 @@ async fn serve_consumer(
             return Ok(());
         }
     }
+
+    // A channel pairs one source with one destination. Refuse a second
+    // destination explicitly instead of letting its relayed substreams
+    // interleave with the first one's on the same provider.
+    let Some(pool) = registry.get(&id).map(|entry| Arc::clone(entry.value())) else {
+        control
+            .send_server(ServerMsg::Error {
+                reason: format!("source for channel '{id}' is no longer available"),
+            })
+            .await?;
+        return Ok(());
+    };
+    let Some(_consumer_claim) = pool.claim_consumer() else {
+        warn!(%id, "channel already has a destination");
+        control
+            .send_server(ServerMsg::Error {
+                reason: format!("channel '{id}' already has a destination connected"),
+            })
+            .await?;
+        return Ok(());
+    };
 
     control.send_server(ServerMsg::Ok).await?;
     info!(%id, "consumer connected");
@@ -587,9 +625,26 @@ async fn accept_relays(
 
 /// Relay one consumer substream to the provider that was present when the
 /// consumer control connection was acknowledged.
-async fn relay(mut consumer: mux::Stream, registry: Registry, id: &str) -> Result<()> {
+async fn relay(consumer: mux::Stream, registry: Registry, id: &str) -> Result<()> {
+    relay_with_timeout(consumer, registry, id, STREAM_READY_TIMEOUT).await
+}
+
+/// As [`relay`], generic over the consumer stream and with the readiness
+/// deadline injected so tests can drive it fast.
+async fn relay_with_timeout<S: mux::Transport>(
+    mut consumer: S,
+    registry: Registry,
+    id: &str,
+    ready_timeout: Duration,
+) -> Result<()> {
+    // The readiness marker is owed as soon as the substream opens. This read runs
+    // while holding a `max_conns` permit, so a consumer that opens substreams and
+    // never writes would otherwise exhaust the relay's real connection bound for
+    // every channel on the server.
     let mut marker = [0u8; 1];
-    consumer.read_exact(&mut marker).await?;
+    timeout(ready_timeout, consumer.read_exact(&mut marker))
+        .await
+        .context("timed out waiting for relay stream readiness marker")??;
 
     let pool = registry
         .get(id)
@@ -608,11 +663,15 @@ struct DropGuard {
     registry: Registry,
     udp_registry: UdpRegistry,
     id: String,
+    pool: Arc<CarrierPool>,
 }
 
 impl Drop for DropGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.id);
+        // Remove only the entry this provider actually installed, so a losing
+        // registration can never evict the live source of the same channel id.
+        self.registry
+            .remove_if(&self.id, |_, pool| Arc::ptr_eq(pool, &self.pool));
         self.udp_registry.remove(&self.id);
     }
 }
@@ -672,6 +731,24 @@ mod tests {
         assert_eq!(
             waiter.await.expect("wait task").expect("wait result"),
             ProviderWait::TimedOut
+        );
+    }
+
+    /// A relayed substream that never sends its readiness marker must release
+    /// the `max_conns` permit it holds instead of pinning it forever.
+    #[tokio::test]
+    async fn relay_without_a_readiness_marker_gives_up() {
+        // A consumer substream that is opened and then held silent.
+        let (_silent_peer, consumer_stream) = duplex(8192);
+
+        let registry: Registry = Arc::new(DashMap::new());
+        let error =
+            relay_with_timeout(consumer_stream, registry, "chan", Duration::from_millis(50))
+                .await
+                .expect_err("a silent substream must not pin the relay");
+        assert!(
+            error.to_string().contains("readiness marker"),
+            "unexpected error: {error}"
         );
     }
 

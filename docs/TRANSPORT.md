@@ -16,6 +16,35 @@ peer from treating an unobserved semantic acknowledgement as success. The old
 evidence-free `CompleteAck` can be decoded for a precise compatibility error but
 is rejected as unsuccessful.
 
+## Control-plane bounds
+
+Every control frame is null-delimited JSON bounded by `MAX_FRAME_LENGTH`
+(8 KiB, bore parity). The bound is enforced while *reading*, so a peer that
+streams bytes without ever sending the delimiter is refused instead of growing
+the server's buffer without limit; it also covers the worst frame the server
+itself emits, a full IPv6 candidate set forwarded as `UdpPunch`.
+
+Frames a peer owes immediately have a deadline: the first `Register`/`Connect`,
+the authentication challenge and its answer all use a bounded read
+(`HANDSHAKE_TIMEOUT`). Long-lived loops — the shared control loop and the client
+keepalive — deliberately stay untimed and rely on the heartbeat plus the
+recv-deadline reaper instead. A relayed substream owes its readiness byte within
+`STREAM_READY_TIMEOUT`; that read holds a `--max-conns` permit, so it must never
+block indefinitely.
+
+A channel pairs exactly **one** source with **one** destination. The channel id
+is claimed atomically, so two sources that register at the same moment cannot
+both believe they own it and the loser can never evict the winner. A second
+destination on a live channel is refused with an explicit reason rather than
+having its relayed substreams interleaved with the first one's on the same
+source. Both slots are released as soon as the owning control connection ends,
+so a retry takes the channel over normally.
+
+The client's control TCP socket is tuned exactly like the server's accepted
+socket (`tune_tcp`: nodelay plus keepalive) because that single connection
+carries the whole multiplexed relay data plane. The TLS handshake on it is
+bounded by the same network deadline as the TCP connect.
+
 `https://host:port` selects TLS for the control connection. The server enables it
 only when both `--tls-cert` and `--tls-key` are provided. Normal certificate
 validation is the default; `--insecure` is test-only. The optional shared secret

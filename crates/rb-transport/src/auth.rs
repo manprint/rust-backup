@@ -44,7 +44,7 @@ impl Authenticator {
         stream
             .send_server(ServerMsg::Challenge { challenge })
             .await?;
-        match stream.recv_client().await? {
+        match stream.recv_client_timeout().await? {
             Some(ClientMsg::Authenticate { tag }) => {
                 if self.validate(&challenge, &tag) {
                     Ok(())
@@ -65,7 +65,7 @@ impl Authenticator {
         &self,
         stream: &mut Delimited<T>,
     ) -> Result<()> {
-        let challenge = match stream.recv_server().await? {
+        let challenge = match stream.recv_server_timeout().await? {
             Some(ServerMsg::Challenge { challenge }) => challenge,
             Some(_) => {
                 anyhow::bail!("expected authentication challenge, but no secret was required")

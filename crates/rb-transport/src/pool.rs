@@ -45,6 +45,20 @@ impl Drop for TokenGuard {
 pub struct CarrierPool {
     carriers: Mutex<Vec<Carrier>>,
     next: AtomicUsize,
+    consumer_claimed: AtomicBool,
+}
+
+/// Holds the single consumer slot of a channel for as long as that destination's
+/// control connection lives. Released on drop so a retried destination can take
+/// the channel over once the first one is gone.
+pub struct ConsumerClaim {
+    pool: Arc<CarrierPool>,
+}
+
+impl Drop for ConsumerClaim {
+    fn drop(&mut self) {
+        self.pool.consumer_claimed.store(false, Ordering::Release);
+    }
 }
 
 impl CarrierPool {
@@ -52,7 +66,26 @@ impl CarrierPool {
         Self {
             carriers: Mutex::new(vec![Carrier::new(first)]),
             next: AtomicUsize::new(0),
+            consumer_claimed: AtomicBool::new(false),
         }
+    }
+
+    /// Claim this channel's one consumer slot, or `None` if a destination
+    /// already holds it.
+    ///
+    /// A channel pairs exactly one source with one destination. A second
+    /// destination on the same channel id would have its relayed substreams
+    /// interleaved with the first one's on the *same* provider, so the source
+    /// would mix two plan exchanges and two sets of data carriers into one
+    /// session. Refusing here turns that into an explicit error on the second
+    /// destination instead of a corrupted or wedged run on the first.
+    pub fn claim_consumer(self: &Arc<Self>) -> Option<ConsumerClaim> {
+        self.consumer_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ConsumerClaim {
+                pool: Arc::clone(self),
+            })
     }
 
     pub fn pick(&self) -> Option<mux::Opener> {
