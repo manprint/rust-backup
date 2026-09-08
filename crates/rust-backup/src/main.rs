@@ -462,20 +462,18 @@ fn exit_code(error: &anyhow::Error) -> i32 {
     }
     // Fallback only for errors that genuinely originate outside rb-core (clap,
     // filesystem config reads, or a transport library before it is phase-wrapped).
-    let text = error.to_string();
-    if text.contains("[Config]")
-        || text.contains("unknown module")
-        || text.contains("--to is required")
-    {
+    // Only the phase tags `BackupError::Phase` really renders (`[{phase:?}]`)
+    // plus the non-rb-core wordings are matched here. The old list also tested
+    // for `[Config]`, `[Preflight]`, `[PlanRejected]` and `[SourceMutated]`,
+    // none of which any `Display` impl can produce — those variants render as
+    // "configuration error:", "preflight failed:", "plan rejected:" and
+    // "SOURCE-IMMUTABILITY VIOLATION:", and all of them reach the typed path
+    // above anyway.
+    let text = format!("{error:#}");
+    if text.contains("unknown module") || text.contains("--to is required") {
         2
-    } else if text.contains("[Preflight]") {
-        3
-    } else if text.contains("[PlanRejected]") || text.contains("rejected by operator") {
-        4
     } else if text.contains("[Verify]") || text.contains("[Apply]") {
         5
-    } else if text.contains("[SourceMutated]") || text.contains("source fingerprint changed") {
-        6
     } else if text.contains("[Connect]") || text.contains("transport:") {
         7
     } else {
@@ -624,17 +622,48 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
         }
     }
     if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{} target(s) failed: {}",
-            errors.len(),
-            errors
-                .into_iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ))
+        return Ok(());
+    }
+    // Preserve a TYPED error. Collapsing the failures into a formatted string
+    // lost both the exit-code classification (`downcast_ref::<BackupError>`
+    // survives `context`, a fresh `anyhow!` does not) and every cause below the
+    // outermost layer, so an immutability violation in a parallel session
+    // reported exit 1 and no reason at all.
+    let total = errors.len();
+    let worst = most_severe(errors);
+    if total == 1 {
+        return Err(worst);
+    }
+    let detail = format!("{worst:#}");
+    Err(worst.context(format!("{total} target(s) failed; most severe: {detail}")))
+}
+
+/// The failure a session should be judged by: the one whose exit code is the
+/// most severe, ties broken by arrival order.
+fn most_severe(errors: Vec<anyhow::Error>) -> anyhow::Error {
+    let mut ranked: Vec<(usize, anyhow::Error)> = errors
+        .into_iter()
+        .map(|error| (severity_rank(exit_code(&error)), error))
+        .collect();
+    ranked.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    ranked
+        .into_iter()
+        .next()
+        .map(|(_, error)| error)
+        .unwrap_or_else(|| anyhow!("session target failed"))
+}
+
+/// Ordering over the shell-facing exit codes, worst first. Source mutation
+/// outranks everything: it is the invariant the tool exists to protect.
+fn severity_rank(code: i32) -> usize {
+    match code {
+        6 => 7, // source mutated
+        5 => 6, // apply/verify/integrity
+        3 => 5, // preflight
+        4 => 4, // plan rejected
+        7 => 3, // connect
+        2 => 2, // config
+        _ => 1,
     }
 }
 
@@ -707,6 +736,26 @@ impl Drop for ProgressReporter {
 }
 
 /// Connect the transport for `role` and drive the session.
+/// Reduce `transport.carriers` to the module's declared maximum, logging once
+/// when that changes the requested value.
+fn clamp_carriers(
+    module: &Arc<dyn rb_core::BackupModule>,
+    transport: &TransportConfig,
+) -> TransportConfig {
+    let capped = transport.carriers.min(module.max_carriers()).max(1);
+    if capped != transport.carriers {
+        tracing::info!(
+            module = module.name(),
+            requested = transport.carriers,
+            carriers = capped,
+            "module supports fewer data carriers than requested"
+        );
+    }
+    let mut transport = transport.clone();
+    transport.carriers = capped;
+    transport
+}
+
 async fn execute(
     module: &Arc<dyn rb_core::BackupModule>,
     role: Role,
@@ -715,6 +764,11 @@ async fn execute(
     auto_accept: bool,
 ) -> anyhow::Result<()> {
     let progress = Progress::default();
+    // Clamp the requested carrier count by what THIS module can restore before
+    // the transport opens anything. The destination also enforces its own cap
+    // during negotiation, but a module's declared capability must be honoured
+    // on the side that owns the module handle instead of being dead metadata.
+    let transport = &clamp_carriers(module, transport);
     let mut reporter =
         ProgressReporter::spawn(progress.clone(), format!("{}/{:?}", module.name(), role));
     let result: anyhow::Result<()> = async {
@@ -805,18 +859,98 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// The shell contract is classified from the TYPED error, over the errors
+    /// the program can really produce — not from literals no `Display` impl
+    /// emits. Each case is built the way the corresponding failure builds it.
     #[test]
-    fn exit_code_maps_phase_classes() {
-        for (message, code) in [
-            ("[Config] bad", 2),
-            ("[Preflight] bad", 3),
-            ("[PlanRejected] bad", 4),
-            ("[Verify] bad", 5),
-            ("[SourceMutated] bad", 6),
-            ("[Connect] bad", 7),
-        ] {
-            assert_eq!(exit_code(&anyhow!(message)), code);
+    fn exit_code_maps_real_error_classes() {
+        use rb_core::BackupError;
+        let cases: Vec<(anyhow::Error, i32)> = vec![
+            (
+                anyhow::Error::new(BackupError::Config("bad params".into())),
+                2,
+            ),
+            (
+                anyhow::Error::new(BackupError::Preflight("no space".into())),
+                3,
+            ),
+            (
+                anyhow::Error::new(BackupError::PlanRejected("rejected by operator".into())),
+                4,
+            ),
+            (
+                anyhow::Error::new(BackupError::phase(rb_core::Phase::Apply, "restore failed")),
+                5,
+            ),
+            (
+                anyhow::Error::new(BackupError::Integrity("digest mismatch".into())),
+                5,
+            ),
+            (
+                anyhow::Error::new(BackupError::SourceMutated("fingerprint changed".into())),
+                6,
+            ),
+            (
+                anyhow::Error::new(BackupError::phase(rb_core::Phase::Connect, "no route")),
+                7,
+            ),
+            (anyhow!("unknown module 'nope'"), 2),
+            (anyhow!("--to is required (or set it in --config)"), 2),
+        ];
+        for (error, code) in cases {
+            assert_eq!(exit_code(&error), code, "for {error:#}");
+            // Wrapping in session/target context must not change the class.
+            let wrapped = error.context("target 3 (s3/Source)");
+            assert_eq!(exit_code(&wrapped), code, "wrapped: {wrapped:#}");
         }
+    }
+
+    /// A parallel session must be judged by its most severe failure and must
+    /// keep that failure's type, so the shell still sees the right code and the
+    /// operator still sees the reason.
+    #[test]
+    fn parallel_session_reports_the_most_severe_typed_failure() {
+        use rb_core::BackupError;
+        let errors = vec![
+            anyhow::Error::new(BackupError::phase(rb_core::Phase::Connect, "no route"))
+                .context("target 1 (filesystem/Destination)"),
+            anyhow::Error::new(BackupError::SourceMutated(
+                "source fingerprint changed during backup".into(),
+            ))
+            .context("target 0 (s3/Source)"),
+        ];
+        let worst = most_severe(errors);
+        assert_eq!(exit_code(&worst), 6);
+        let rendered = format!("{worst:#}");
+        assert!(
+            rendered.contains("SOURCE-IMMUTABILITY VIOLATION"),
+            "the cause must survive: {rendered}"
+        );
+        assert!(rendered.contains("target 0"), "{rendered}");
+    }
+
+    /// A module that can only restore one carrier must not be handed four.
+    #[test]
+    fn requested_carriers_are_clamped_to_the_module_capability() {
+        let mut transport = rb_core::config::TransportConfig {
+            to: "coord:7835".into(),
+            channel: "ch".into(),
+            secret: None,
+            carriers: 4,
+            udp: false,
+            insecure: false,
+            max_rate: None,
+        };
+        let postgres = rb_postgres::module();
+        assert_eq!(postgres.max_carriers(), 1);
+        assert_eq!(clamp_carriers(&postgres, &transport).carriers, 1);
+
+        let filesystem = rb_filesystem::module();
+        assert!(filesystem.max_carriers() >= 4);
+        assert_eq!(clamp_carriers(&filesystem, &transport).carriers, 4);
+
+        transport.carriers = 0;
+        assert_eq!(clamp_carriers(&filesystem, &transport).carriers, 1);
     }
 
     #[test]

@@ -54,14 +54,17 @@ impl Progress {
         self.inner.bytes_done.load(Ordering::Relaxed)
     }
 
-    /// Replace estimates with observed final totals. Backends such as
+    /// Replace the *byte* estimate with the observed total. Backends such as
     /// PostgreSQL plan from on-disk relation sizes while transferring a smaller
     /// logical stream, so an acknowledged success must use actuals to render a
     /// truthful 100% terminal snapshot.
+    ///
+    /// The item total is deliberately NOT rewritten: it comes from the plan and
+    /// is exact. Rewriting it made the terminal line read `items 4/4` for a run
+    /// that had covered 4 of 10 planned items, i.e. the final snapshot could
+    /// never disagree with the plan.
     pub fn complete(&self) {
-        let items = self.inner.items_done.load(Ordering::Relaxed);
         let bytes = self.inner.bytes_done.load(Ordering::Relaxed);
-        self.inner.items_total.store(items, Ordering::Relaxed);
         self.inner.bytes_total.store(bytes, Ordering::Relaxed);
     }
 
@@ -95,15 +98,26 @@ impl Progress {
 mod tests {
     use super::*;
 
+    /// The byte estimate is replaced by the actual; the ITEM total stays at the
+    /// plan value, so a run that covered part of the plan cannot render as a
+    /// complete one.
     #[test]
-    fn completion_replaces_estimates_with_actuals() {
-        let progress = Progress::new(4, 50_000);
-        progress.add_bytes(1000);
-        progress.item_done();
-        progress.complete();
-        let line = progress.line(1.0);
-        assert!(line.contains("items 1/1"), "{line}");
+    fn completion_replaces_the_byte_estimate_but_not_the_plan_item_count() {
+        let short = Progress::new(4, 50_000);
+        short.add_bytes(1000);
+        short.item_done();
+        short.complete();
+        let line = short.line(1.0);
+        assert!(line.contains("items 1/4"), "{line}");
         assert!(line.contains("1000 B/1000 B"), "{line}");
         assert!(line.contains("(100.0%)"), "{line}");
+
+        let full = Progress::new(2, 50_000);
+        full.add_bytes(4096);
+        full.item_done();
+        full.item_done();
+        full.complete();
+        let line = full.line(1.0);
+        assert!(line.contains("items 2/2"), "{line}");
     }
 }

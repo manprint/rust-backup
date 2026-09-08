@@ -16,7 +16,9 @@ targets:
       prefix: production/
       access_key: CHANGE_ME
       secret_key: CHANGE_ME
-      path_style: false
+      # Omit path_style to get the endpoint-appropriate default (path style
+      # whenever a custom endpoint is set, which is what MinIO needs). Set it
+      # explicitly only to override that default.
 
   - module: s3
     role: destination
@@ -28,7 +30,6 @@ targets:
       prefix: recovered/
       access_key: CHANGE_ME
       secret_key: CHANGE_ME
-      path_style: false
       create_bucket: true
       overwrite: false
     auto_accept: true
