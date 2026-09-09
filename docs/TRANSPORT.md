@@ -60,8 +60,11 @@ Heartbeats reap dead rendezvous state.
 Current UDP support includes STUN reflexive candidates, authenticated
 connectivity checks, a bounded learned-address cache and authenticated sibling
 QUIC carriers. Pure NAT-plan classification with symmetric-port prediction,
-PCP/UPnP mapping and the full privileged NAT outcome matrix remain future work;
-direct-path failure during setup must never break the relay path.
+PCP/UPnP mapping and the full privileged NAT outcome matrix remain future work —
+plan V3 rows F6.2, F6.5 and F6.7, scheduled for v0.2 and deliberately outside
+the v0.1 QA exit criteria, so a NAT-traversal gap is not a regression. What is
+not optional is the fallback: direct-path failure during setup must never break
+the relay path.
 
 Loss of an already active QUIC byte stream fails the current transfer closed; it
 does not migrate a delivered prefix to relay. Transparent migration would need
@@ -76,6 +79,15 @@ opening any data stream, and each open/accept is bounded by the plan-exchange
 timeout. Filesystem permits up to 32 carriers. PostgreSQL, MongoDB and S3
 currently negotiate to one because their restore sinks are respectively a COPY
 connection, a batch accumulator and an ordered multipart loop.
+
+Both peers log the agreed count once negotiation settles
+(`negotiated data plane carriers=N separate_data_streams=…`). Requesting
+`--carriers 4` is therefore not the same as observing four: a downgrade is
+legitimate — a module cap, or the peer's own channel — and without the logged
+count neither an operator nor a test can tell a four-carrier run from one that
+quietly fell back to a single stream. `e2e/relay_smoke.sh` asserts the requested
+count at 1 and 4, and `e2e/s3_minio_test.sh` asks for four and asserts the
+module cap brings it back to one.
 
 Current peers also negotiate `separate_data_streams=true`: the plan, abort and
 completion exchange stays on a dedicated control stream even when the negotiated

@@ -38,8 +38,9 @@ The **source** never needs privilege — it only reads (opened read-only, with
 `O_NOATIME` where the platform allows, so the source's access times are not even
 touched, upholding I-IMMUT).
 
-`--preserve-ownership` defaults to `true`; `--no-preserve-ownership` is the
-explicit opt-out.
+Ownership preservation is on by default and has no positive flag of its own:
+`--no-preserve-ownership` is the explicit opt-out. In YAML and `-P` the setting
+keeps its underlying name, `preserve_ownership: true|false`.
 
 ## Completion proof
 

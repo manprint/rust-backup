@@ -142,3 +142,61 @@ comment no longer named, which zizmor's pedantic persona reports.
 When checking such a pin, dereference the tag: `git/ref/tags/<tag>` returns the
 **tag object** for an annotated tag, and pinning that SHA is worse than a stale
 pin — it is not a commit at all.
+
+## Second pass — the fault matrix and what building it exposed
+
+Phases F2.3, F2.5 and F3.4 of
+[RUST_BACKUP_PLAN_V3.md](RUST_BACKUP_PLAN_V3.md) asked for fault injection at
+every layer of every module. Writing those cases was itself an audit: two of
+the four modules could not satisfy the assertion "a failed run leaves no
+half-restored state" until they were changed, and one core race only ever
+appeared under a case that ran the same rejection three times.
+
+| id | Defect |
+|----|--------|
+| PG19 | A restore that died after `CREATE DATABASE` — a killed source, a reset relay, a stopped backend — left the target database present and half-loaded. With `--overwrite` that is strictly worse than absence: the previous contents were already dropped, so the survivor is a database that looks restored and is not. The run now snapshots which targets existed *before* it created any and, on failure, drops exactly the ones it brought into existence; a database it found already there is never touched. The bootstrap admin connection is deliberately held open across the load, because the rollback needs a working session on a database that is not itself being restored |
+| MG9 | The same defect in MongoDB, at collection granularity. The cleanup re-runs `check_namespace` before each drop, so the rollback path itself can never be the thing that drops a system namespace, and tolerates `NamespaceNotFound` |
+| CORE-2 | **Found live, intermittently.** On a plan rejection the destination sent its `PlanAck` and returned immediately, so the frame could still be buffered in the relay when the process exited. The source then read EOF and reported a transport failure (exit 7) instead of a plan rejection (exit 4) — the operator-facing distinction between "the destination said no" and "the network broke". It now waits, bounded, for the peer to consume the frame and close, the same way an apply-time `Abort` waits for its ack. The e2e case repeats the rejection three times for this reason: one attempt passed most of the time |
+| LINT-1 | `rb-core` — the crate every module depends on — did not declare `#![forbid(unsafe_code)]`, which the project documents as universal. Clippy enforces such a lint only where it is declared, so the crate was outside the gate that was supposed to cover it. Added, together with `scripts/crate_invariants.sh`, which asserts both standing lint attributes in every crate root and fails the gate if one goes missing again |
+| DOC-2 | `scripts/help_parity.sh` compared in one direction only (documented ⊆ CLI), so `USAGE.md` could name a flag that does not exist. It did: `--preserve-ownership`, which the CLI never accepted — the real flag is `--no-preserve-ownership`, ownership preservation being on by default. Both directions are checked now |
+| DEAD-2 | Two `#[allow(dead_code)]` on `PostgresSource::params` / `PostgresDestination::params` outlived the code that made them necessary; both fields are read. A stale allow hides the next real one |
+
+### What the matrix now proves
+
+`e2e/fault_matrix.sh` runs 15 live cases across all four modules, each asserting
+the same three-part contract: **(A)** the failing side exits with the phase-tagged
+code the failure deserves, **(B)** the destination is left with no half-restored
+state, and **(C)** the source is byte-identical afterwards. The cases kill the
+source mid-transfer, kill the destination at 10/50/90 % of the payload, reset the
+relay, stop the coordination server before the plan, and stop the backend
+container under postgres, mongodb and s3. Two further cases cover F2.5 from both
+sides: a sibling load on the source data must *not* raise `SourceMutated`, and a
+real mutation must exit 6 with `SOURCE-IMMUTABILITY VIOLATION` and no
+`RESTORE VERIFIED`.
+
+Two traps worth recording, because both produced a green run that proved nothing:
+a case whose credentials were wrong never registered a source, so the destination
+timed out on pairing and assertion B passed on an empty target — every case now
+first requires observed transfer progress; and the S3 helper set both MinIO
+aliases with `&&`, so a deliberately stopped destination endpoint broke even a
+source-only listing and reported a source mutation that never happened.
+
+## Third pass — the review after the plan work
+
+Re-read with the fault matrix in hand, looking for the same vacuity trap in the
+tests that were already green.
+
+| id | Defect |
+|----|--------|
+| OBS-1 | The negotiated carrier count was never logged — only a *downgrade* was, and only on the source. So `--carriers 4` produced a run indistinguishable from a run that fell back to one stream, which means the 4-carrier e2e cases could not prove they had exercised four carriers, and an operator could not tell either. Both peers now log `negotiated data plane carriers=N separate_data_streams=…` once negotiation settles (I-OBSERV), `e2e/relay_smoke.sh` asserts the count it asked for at 1 and 4, and `e2e/s3_minio_test.sh` now asks for four carriers and asserts the module cap brings the negotiation back to one — the first live proof of the per-module cap, QA criterion 13 |
+| DOC-3 | `docs/modules/FILESYSTEM.md` carried the same ghost `--preserve-ownership` flag that `USAGE.md` had. The parity check only ever read `USAGE.md`; its ghost-flag half now scans `README.md`, `docs/QA_GUIDE.md`, `docs/TRANSPORT.md`, `docs/DEPLOYMENT.md` and every `docs/modules/*.md` as well |
+| DOC-4 | `e2e/full_matrix.sh` printed a `SKIP` line for the privileged scripts but silently omitted the PostgreSQL/MongoDB version matrices, so "one command tells QA the whole state of the tree" was untrue in exactly the direction that matters — something not run looked like nothing to run |
+
+Everything else re-read in this pass held: frame and chunk lengths are bounded
+before allocation on both sides, no production path allocates from a peer-
+supplied size, no `unwrap`/`expect`/`panic!` survives outside `#[cfg(test)]`, the
+two remaining `#[allow]` attributes are justified in place, the progress rate and
+percentage guard their divisors, and the rollback paths added in the second pass
+reuse the hardened `DROP DATABASE` sequence (block connections, terminate
+backends, drop) rather than a bare drop that a still-closing session would
+defeat.

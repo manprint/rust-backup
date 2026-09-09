@@ -33,5 +33,38 @@ only exact repository script paths. After that rule was installed:
 | Netem/backpressure/rate cap | `sudo -n "$PWD/e2e/bandwidth_netem.sh"` | **PASS=6 FAIL=0** — final aggregate: 200 MiB/5 Mbit/s: 354 s, 9,908 KiB RSS; 256 KiB/s: 66 s, 10,228 KiB RSS |
 
 Cleanup observation: zero matching processes, network namespaces, mounts and
-loop devices after the privileged runs. Still unobserved: credential-gated real
-AWS and the F3.4 one-vs-four-carrier speed comparison.
+loop devices after the privileged runs. Still unobserved at that point:
+credential-gated real AWS and the F3.4 one-vs-four-carrier comparison — F3.4 is
+closed by the run recorded in the next section; the AWS smoke stays gated on
+credentials this workspace does not hold.
+
+## F2/F3 live runs — 2026-09-09
+
+Same workspace; Docker for the backend groups, and the privileged scripts under
+the exact-path sudoers rule.
+
+| Matrix | Exact command | Result |
+|---|---|---|
+| Rust gates | `bash scripts/gates.sh` | **PASS** — 233 tests passed, 0 ignored |
+| Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=21 PASS=53 FAIL=0**, no `SKIP` — every group ran |
+| Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **PASS=18 FAIL=0** (6 cases × A/B/C) |
+| Fault matrix, immutability (F2.5) | `bash e2e/fault_matrix.sh immutability` | **PASS=2 FAIL=0** — a sibling load raises no false `SourceMutated` and still verifies; a real source write exits 6 with `SOURCE-IMMUTABILITY VIOLATION` and no `RESTORE VERIFIED` |
+| Fault matrix, postgres | `bash e2e/fault_matrix.sh postgres` | **PASS=9 FAIL=0** (source killed, relay reset, destination backend stopped) |
+| Fault matrix, mongodb | `bash e2e/fault_matrix.sh mongodb` | **PASS=9 FAIL=0** |
+| Fault matrix, s3 | `bash e2e/fault_matrix.sh s3` | **PASS=9 FAIL=0** |
+| Fault matrix, exit codes | `bash e2e/fault_matrix.sh exitcodes` | **PASS=5 FAIL=0**, the rejection case repeated 3× |
+| Privileged netem, rate cap and carriers (F3.3 + F3.4) | `sudo -n "$PWD/e2e/bandwidth_netem.sh"` | **PASS=16 FAIL=0** — 200 MiB over a 5 Mbit/s + 80 ms link in 355 s; 16 MiB under a 256 KiB/s cap in 66 s; peak source RSS 10.9 MiB against a 192 MiB ceiling; **1 carrier 43 s vs 4 carriers 44 s (ratio 102 %) on byte-identical restored trees**, with both peers observed negotiating 1 and 4 respectively |
+| Relay smoke, plain, 1 and 4 carriers | `bash e2e/relay_smoke.sh`, `RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh` | **PASS=5 FAIL=0** each, including the negotiated-count assertion |
+| MinIO S3 incl. the per-module carrier cap | `bash e2e/s3_minio_test.sh` | **PASS** — a source asking for 4 carriers negotiates down to the 1 the S3 destination permits |
+
+F3.4 is deliberately a no-regression proof, not a speedup: the link is the
+bottleneck on a shaped path, so four carriers can only be shown not to cost
+anything and to restore the same bytes. The 102 % ratio is one second of
+scheduler noise on a 43-second transfer.
+
+The postgres and mongodb `[B]` assertions were red before the rollback landed:
+reverting the PostgreSQL change makes `pg-relay-reset [B]` fail with *"a
+half-restored database survived (rows=0)"*, which is what the assertion exists
+to catch. The exit-code rejection case was red intermittently until the
+destination learned to wait for its rejection frame to be consumed; it is
+repeated three times per run for that reason.

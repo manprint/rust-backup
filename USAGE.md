@@ -37,10 +37,10 @@ quotes to force a string that would otherwise read as a number or a boolean —
 
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
-| `--to <host:port>` | `RUST_BACKUP_TO` | — | coordination server address |
+| `--to <host:port>` | `RUST_BACKUP_TO` | — | coordination server address; an `https://` prefix is what turns client TLS on (see below) |
 | `--channel <id>` | `RUST_BACKUP_CHANNEL` | — | rendezvous channel id (source & dest must match) |
 | `--secret <s>` / `--secret-file <path>` | `RUST_BACKUP_SECRET` / `RUST_BACKUP_SECRET_FILE` | none | shared HMAC secret; prefer file or environment over argv |
-| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | requested data carriers (1..32); filesystem may use all, PostgreSQL/MongoDB/S3 safely negotiate to 1 |
+| `--carriers <n>` | `RUST_BACKUP_CARRIERS` | 1 | *requested* data carriers (1..32); filesystem may use all, PostgreSQL/MongoDB/S3 safely negotiate to 1. Both peers log the agreed count as `negotiated data plane carriers=N` |
 | `--udp` / `--no-udp` | `RUST_BACKUP_UDP` | on | try the direct UDP/QUIC path (falls back to relay) |
 | `--insecure` | `RUST_BACKUP_INSECURE` | off | skip TLS verification (testing only) |
 | `--max-rate <bytes/s>` | `RUST_BACKUP_MAX_RATE` | unlimited | aggregate source payload rate cap |
@@ -49,9 +49,30 @@ quotes to force a string that would otherwise read as a number or a boolean —
 | `--config <file>` | `RUST_BACKUP_CONFIG` | — | YAML config underlay |
 | `-v` | — | — | increase log verbosity (repeatable) |
 
+**Client TLS is selected by the `--to` value, not by a flag.** `--to
+coordinator:7835` speaks plain TCP; `--to https://coordinator:7835` performs a
+TLS handshake against a coordination server started with `--tls-cert` and
+`--tls-key`, verifying the certificate against the system roots — so the host in
+`--to` must match the certificate's name. `http://` is accepted and means plain.
+A scheme with no port defaults to 443 for `https://` and 80 for `http://`, so
+name the port explicitly. `--insecure` skips certificate verification and is for
+isolated tests only.
+
 `RUST_BACKUP_VERIFY_TIMEOUT` sets the maximum destination read-back verification
 time in seconds (default 86400). It is deliberately separate from transfer time:
 large databases and buckets may require a complete second read.
+
+> **`--overwrite` destroys before it restores, and a restore is not atomic.**
+> Plan a maintenance window on that basis. PostgreSQL drops each target
+> database, MongoDB drops each target collection, and S3 deletes the stale keys
+> in the target prefix — all *before* the first payload byte arrives. So a run
+> that fails midway does not leave the previous contents behind: PostgreSQL and
+> MongoDB additionally remove what the failed run created (see the module docs),
+> which leaves the target absent rather than half-filled, and S3 leaves the
+> objects it had already replaced. Nothing is ever reported as verified in these
+> cases — but if you need the previous contents to survive a failed attempt,
+> take your own snapshot first, or restore into a fresh database, collection or
+> prefix and switch over afterwards.
 
 ## Verified completion
 
@@ -117,9 +138,12 @@ Params: `--uri` OR `--host --port(27017) --user --password` ; `--database --auth
 rust-backup filesystem source --to coord:7835 --channel fs --root /data
 sudo rust-backup filesystem destination --to coord:7835 --channel fs --root /restore --yes
 ```
-Params: `--root --follow-symlinks --preserve-ownership(true) --preserve-xattr`
+Params: `--root --follow-symlinks --no-preserve-ownership --preserve-xattr`
 (`RUST_BACKUP_ROOT`, `RUST_BACKUP_FOLLOW_SYMLINKS`,
 `RUST_BACKUP_NO_PRESERVE_OWNERSHIP`, `RUST_BACKUP_PRESERVE_XATTR`).
+Ownership preservation is on by default and has no positive flag of its own;
+`--no-preserve-ownership` turns it off. In YAML and `-P` the parameter keeps its
+underlying name, `preserve_ownership: true|false`.
 
 > **sudo / ownership.** Restoring arbitrary `uid`/`gid` requires `root` or
 > `CAP_CHOWN`. With ownership preservation enabled (the default), preflight

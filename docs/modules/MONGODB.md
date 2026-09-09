@@ -19,6 +19,23 @@ BLAKE3 commitment. The source also fingerprints all documents before and after
 the run. Empty collections, nested documents, arrays, nulls, compound/partial
 indexes, abort cleanup and overwrite retries are covered by the live matrices.
 
+## A failed restore removes what it created
+
+A restore creates collections and then fills them, so an interrupted run leaves
+collections holding part of the source's documents. Nothing certifies them —
+there is no `RESTORE VERIFIED` — but a half-filled collection is
+indistinguishable from a small one on inspection.
+
+On any failure the destination therefore drops the collections **this run
+created**, named in a `WARN` line, and re-checks the namespace guard first so a
+cleanup path can never be the one that drops a `system.*` namespace. A
+collection the run found already present is never touched: without
+`--overwrite` the run never wrote to it, and with `--overwrite` it was dropped
+before the restore began. A cleanup that itself fails is reported as an `ERROR`
+naming the namespace; the original failure is what the process exits with.
+
+The live proof is `e2e/fault_matrix.sh mongodb`.
+
 ## The plan is treated as hostile input by the destination
 
 Every namespace is re-derived from the received plan, which is peer-controlled.
@@ -58,7 +75,9 @@ The source needs read access to listed databases/collections and catalog command
 such as `listCollections`; user visibility may require `usersInfo` privileges.
 The destination needs permission to create/drop collections and indexes. Use
 `--overwrite` (or `overwrite: true` in YAML) only when replacing existing
-collections is intended.
+collections is intended. The drop happens **before** the first document arrives,
+so a failed run does not leave the previous contents behind — restore into a
+fresh collection name and switch over if they must survive a failed attempt.
 
 ## Limits
 

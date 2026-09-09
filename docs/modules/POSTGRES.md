@@ -26,6 +26,29 @@ whole-payload BLAKE3. Only after this proof and the source's full post-run
 catalog/data fingerprint audit do both commands exit successfully. A database
 that merely accepted DDL or rows cannot produce `RESTORE VERIFIED`.
 
+## A failed restore removes what it created
+
+`CREATE DATABASE` cannot run inside a transaction, so a restore is not one
+atomic unit: a run interrupted mid-load has already created the database, its
+schemas and part of its rows. Nothing certifies such a database — there is no
+`RESTORE VERIFIED` — but on inspection it is indistinguishable from a small
+one, which is exactly the mistake this build refuses to leave available.
+
+So on any failure after creation the destination drops the databases **this run
+created**, named in a `WARN` line. A database the run found already present is
+never touched: without `--overwrite` the run never wrote to it, and with
+`--overwrite` it was dropped before the restore began, so it cannot be mistaken
+for pre-existing state. If the drop itself fails — the usual reason being that
+the server the restore was writing to has gone away — an `ERROR` line names the
+database and the `DROP DATABASE` that finishes the job, and the original
+failure, not the cleanup, is what the process reports and exits with.
+
+The live proof is `e2e/fault_matrix.sh postgres`: with the source or the
+coordination server killed mid-load, the target database is gone afterwards;
+with the destination's own backend stopped mid-apply, nothing can clean up and
+the assertion is instead that the leftover is uncertified and visibly not the
+source.
+
 ## Restore order, and why it is not a fixed list
 
 Object dependencies point in both directions at once: a column default may call
@@ -129,6 +152,12 @@ roles/databases/schemas and applies ownership/grants. `--admin` marks this inten
 `--overwrite` (or `overwrite: true` in YAML) is required when restoring over
 existing target databases. The destination disables new connections, terminates
 existing sessions and recreates each target database from scratch.
+
+That drop happens **before** the first payload byte arrives, so `--overwrite` is
+not a safe retry of a failed window: the previous contents are already gone, and
+the section above then removes what the failed run created. Take your own
+snapshot first, or restore into a fresh database name and switch over, if the
+previous contents must survive a failed attempt.
 
 ## Limits
 

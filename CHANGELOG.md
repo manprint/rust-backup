@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-09-09
+
+First release. The workspace version, the plan/wire `PLAN_FORMAT_VERSION` and
+the QA exit criteria in `docs/plans/RUST_BACKUP_PLAN_V3.md` are all frozen at
+this point; `docs/plans/RESUME.md` records the command that proved each phase.
+
+- A failed restore no longer leaves state that could pass for a copy:
+  PostgreSQL drops the databases the run created, MongoDB drops the collections
+  it created, and both name what they removed. A target the run found already
+  present is never touched. The filesystem module already deleted its active
+  partial file and S3 already aborted its multipart uploads.
+- `e2e/fault_matrix.sh` became the live fault matrix across all four modules —
+  source killed mid-transfer, coordination server killed during the plan
+  exchange and mid-payload, destination SIGKILLed at 10/50/90 % of the bytes,
+  and the destination backend stopped mid-apply — each asserting source
+  immutability, the absence of usable partial state, and a truthful error phase.
+  It also covers immutability under concurrent load in both directions: writes
+  beside the source root are not a false `SourceMutated`, and writes into it
+  exit 6.
+- `e2e/bandwidth_netem.sh` adds the one-vs-four-carrier proof: identical
+  restored trees and no regression on a shaped link, with the measured ratio
+  recorded.
+- A rejected plan now reliably reaches the source as a plan rejection (exit 4)
+  rather than intermittently as a transport failure (exit 7): the destination
+  waits, bounded, for its rejection frame to be consumed before exiting instead
+  of leaving it buffered in the relay.
+- Both peers now log the carrier count they negotiated
+  (`negotiated data plane carriers=N separate_data_streams=…`), not only a
+  downgrade. `--carriers` is a request, and without the agreed number neither an
+  operator nor a test could tell a four-carrier run from a silent fallback to
+  one; `e2e/relay_smoke.sh`, `e2e/bandwidth_netem.sh` and `e2e/s3_minio_test.sh`
+  now assert it — the last of them proves the per-module cap live by asking for
+  four carriers against an S3 destination that permits one.
+- `scripts/crate_invariants.sh` asserts `#![forbid(unsafe_code)]` and the
+  unwrap/expect/panic denial in every crate root — `rb-core` was missing both,
+  so the crate every module depends on sat outside its own lint gate.
+- `scripts/help_parity.sh` now checks both directions, so a flag documented in
+  `USAGE.md` that the CLI does not accept fails the gate. That caught
+  `--preserve-ownership`, which never existed as a flag.
+- Documented that `--overwrite` destroys before it restores and that a restore
+  is not atomic, for all three modules that support it.
 
 - Successful completion now requires backend read-back evidence: filesystem,
   PostgreSQL, MongoDB and S3 re-introspect their restorable metadata/catalog and
