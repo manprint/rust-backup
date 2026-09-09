@@ -1,7 +1,18 @@
 # rust-backup — Usage
 
 Three ways to configure, highest precedence first: **CLI flags > environment
-variables > YAML config**. Every CLI flag has a `RUST_BACKUP_<UPPER_SNAKE>` env var.
+variables > YAML config**. Every CLI flag has a `RUST_BACKUP_<UPPER_SNAKE>` env
+var — `--auth-db` reads `RUST_BACKUP_AUTH_DB`, and so on. The only exceptions
+are `-v/--verbose`, the repeatable `-P/--param`, and `--no-udp` (the negation of
+`--udp`, which reads `RUST_BACKUP_UDP`).
+
+> **Credentials belong in the environment, not in argv.** On Linux
+> `/proc/<pid>/cmdline` is world-readable while `/proc/<pid>/environ` is
+> readable only by the owning account, so `--password`, `--secret-key` and a
+> `--uri` carrying credentials are visible to every local user for as long as
+> the transfer runs. Pass them as `RUST_BACKUP_PASSWORD`,
+> `RUST_BACKUP_SECRET_KEY` and `RUST_BACKUP_URI`; the transport secret also has
+> `--secret-file`.
 
 ## Subcommands
 
@@ -14,7 +25,11 @@ rust-backup plan <module> source [PARAMS]  dry-run: analyze + print the plan, no
 
 Every surface accepts `--help`; the top-level also accepts `--version` and
 `--verbose` (repeatable). Module roles accept `--param` / `-P key=value` for a
-module-specific setting that has no dedicated flag. `run` accepts
+module-specific setting that has no dedicated flag. A `-P` value is typed by its
+shape: `true`/`false` become booleans, a canonical integer becomes a number
+(`-P port=6000`), and everything else stays a string. Wrap a value in double
+quotes to force a string that would otherwise read as a number or a boolean —
+`-P 'password="123456"'`, `-P 'prefix="2026"'`. `run` accepts
 `--parallel-targets` and `--fail-fast`. Filesystem destinations accept
 `--no-preserve-ownership` when restoring without ownership changes.
 
@@ -80,6 +95,9 @@ rust-backup postgres destination --to coord:7835 --channel pg --secret s --host 
 ```
 Params: `--host --port(5432) --user --password --database --sslmode` ; use
 `-P sslrootcert=/path/to/ca.pem` for a private PostgreSQL CA; dest `--admin`.
+Each reads `RUST_BACKUP_HOST`, `RUST_BACKUP_PORT`, `RUST_BACKUP_USER`,
+`RUST_BACKUP_PASSWORD`, `RUST_BACKUP_DATABASE`, `RUST_BACKUP_SSLMODE`,
+`RUST_BACKUP_ADMIN`.
 The plan covers roles, grants, databases, schemas, tables, constraints, indexes,
 sequences, extensions, and ownership.
 
@@ -89,7 +107,9 @@ sequences, extensions, and ownership.
 rust-backup mongodb source --to coord:7835 --channel mg --uri "mongodb://ro@db-a:27017" --database app
 rust-backup mongodb destination --to coord:7835 --channel mg --uri "mongodb://admin@db-b:27017" --yes
 ```
-Params: `--uri` OR `--host --port(27017) --user --password` ; `--database --auth-db`.
+Params: `--uri` OR `--host --port(27017) --user --password` ; `--database --auth-db`
+(`RUST_BACKUP_URI`, `RUST_BACKUP_HOST`, `RUST_BACKUP_PORT`, `RUST_BACKUP_USER`,
+`RUST_BACKUP_PASSWORD`, `RUST_BACKUP_DATABASE`, `RUST_BACKUP_AUTH_DB`).
 
 ### filesystem (POSIX; ownership/permissions preserved on Linux)
 
@@ -97,7 +117,9 @@ Params: `--uri` OR `--host --port(27017) --user --password` ; `--database --auth
 rust-backup filesystem source --to coord:7835 --channel fs --root /data
 sudo rust-backup filesystem destination --to coord:7835 --channel fs --root /restore --yes
 ```
-Params: `--root --follow-symlinks --preserve-ownership(true) --preserve-xattr`.
+Params: `--root --follow-symlinks --preserve-ownership(true) --preserve-xattr`
+(`RUST_BACKUP_ROOT`, `RUST_BACKUP_FOLLOW_SYMLINKS`,
+`RUST_BACKUP_NO_PRESERVE_OWNERSHIP`, `RUST_BACKUP_PRESERVE_XATTR`).
 
 > **sudo / ownership.** Restoring arbitrary `uid`/`gid` requires `root` or
 > `CAP_CHOWN`. With ownership preservation enabled (the default), preflight
@@ -114,7 +136,10 @@ rust-backup s3 source --to coord:7835 --channel s3 --bucket src --region eu-west
 rust-backup s3 destination --to coord:7835 --channel s3 --bucket dst \
   --endpoint http://minio:9000 --path-style --access-key AK --secret-key SK --yes
 ```
-Params: `--endpoint(MinIO) --region --bucket --prefix --access-key --secret-key --path-style`.
+Params: `--endpoint(MinIO) --region --bucket --prefix --access-key --secret-key --path-style`
+(`RUST_BACKUP_ENDPOINT`, `RUST_BACKUP_REGION`, `RUST_BACKUP_BUCKET`,
+`RUST_BACKUP_PREFIX`, `RUST_BACKUP_ACCESS_KEY`, `RUST_BACKUP_SECRET_KEY`,
+`RUST_BACKUP_PATH_STYLE`).
 
 ## Multi-target YAML session
 

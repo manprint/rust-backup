@@ -28,8 +28,22 @@ pub struct TargetParams(pub serde_json::Value);
 impl TargetParams {
     /// Deserialize into a module-defined params type.
     pub fn deserialize<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_value(self.0.clone())
-            .map_err(|e| BackupError::Config(format!("invalid module params: {e}")))
+        serde_json::from_value(self.0.clone()).map_err(|e| {
+            let mut message = format!("invalid module params: {e}");
+            // `-P key=123456` is typed as a number by the CLI escape, so a
+            // digit-only password or bucket name lands here. Name the escape
+            // instead of leaving the operator with a type error they did not
+            // write.
+            if message.contains("invalid type: integer")
+                || message.contains("invalid type: boolean")
+            {
+                message.push_str(
+                    "; a `-P key=value` escape is typed by shape — quote a value that \
+                     must stay a string: -P key='\"value\"'",
+                );
+            }
+            BackupError::Config(message)
+        })
     }
 
     /// Build from any serializable struct (used by the CLI layer).
@@ -99,6 +113,30 @@ pub trait BackupModule: Send + Sync {
 
     /// Open a read-write destination from connection params.
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>>;
+}
+
+#[cfg(test)]
+mod param_tests {
+    use super::TargetParams;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Params {
+        #[allow(dead_code)]
+        password: String,
+    }
+
+    /// A shape-typed `-P` value that the module wants as a string must say how
+    /// to force the string, not just report a type the operator never typed.
+    #[test]
+    fn a_numeric_typed_param_names_the_quoting_escape() {
+        let params = TargetParams(serde_json::json!({ "password": 123456 }));
+        let error = params
+            .deserialize::<Params>()
+            .expect_err("an integer is not a password");
+        let text = error.to_string();
+        assert!(text.contains("invalid type: integer"), "{text}");
+        assert!(text.contains("quote a value"), "{text}");
+    }
 }
 
 /// Registry of available modules, populated at startup by the binary.

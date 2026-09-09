@@ -25,6 +25,16 @@ use rb_core::plan::BackupPlan;
 use rb_core::progress::Progress;
 use rb_core::session;
 
+/// Value parser for every boolean flag that also reads an env var.
+///
+/// clap's default `bool` parser accepts only "true"/"false", so
+/// `RUST_BACKUP_YES=1` — the idiom every unit file and CI job reaches for —
+/// aborted with `invalid value '1' for '--yes'` instead of auto-accepting.
+/// This accepts the usual truthy/falsey spellings (1/0, y/n, on/off, …).
+fn boolish() -> clap::builder::BoolishValueParser {
+    clap::builder::BoolishValueParser::new()
+}
+
 #[derive(Parser)]
 #[command(
     name = "rust-backup",
@@ -49,7 +59,7 @@ enum Cmd {
         config: String,
         #[arg(long, env = "RUST_BACKUP_PARALLEL_TARGETS")]
         parallel_targets: Option<usize>,
-        #[arg(long, env = "RUST_BACKUP_FAIL_FAST")]
+        #[arg(long, env = "RUST_BACKUP_FAIL_FAST", value_parser = boolish())]
         fail_fast: bool,
     },
     /// Dry-run: analyze a source and print its plan; no transport, no transfer.
@@ -92,7 +102,8 @@ struct ServerArgs {
         default_value_t = true,
         action = clap::ArgAction::Set,
         num_args = 0..=1,
-        default_missing_value = "true"
+        default_missing_value = "true",
+        value_parser = boolish()
     )]
     udp: bool,
 }
@@ -133,57 +144,71 @@ impl CliModule {
 }
 
 /// Module connection params, shared by the transfer subcommands and `plan`.
+/// Module connection params.
+///
+/// CREDENTIAL HANDLING: every one of these carries its documented
+/// `RUST_BACKUP_<UPPER_SNAKE>` env var, because `/proc/<pid>/cmdline` is
+/// world-readable on Linux while `/proc/<pid>/environ` is owner-only — a
+/// password, an S3 secret key or a Mongo URI passed as a flag is visible to
+/// every local account for as long as the transfer runs.
 #[derive(Args, Default)]
 struct ModuleParamArgs {
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_HOST")]
     host: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_PORT")]
     port: Option<u16>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_USER")]
     user: Option<String>,
-    #[arg(long)]
+    /// Backend password. Prefer the env var to a flag (see above).
+    #[arg(long, env = "RUST_BACKUP_PASSWORD")]
     password: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_DATABASE")]
     database: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_SSLMODE")]
     sslmode: Option<String>,
-    #[arg(long)]
+    /// mongodb: full connection URI. Prefer the env var to a flag.
+    #[arg(long, env = "RUST_BACKUP_URI")]
     uri: Option<String>,
-    #[arg(long = "auth-db")]
+    #[arg(long = "auth-db", env = "RUST_BACKUP_AUTH_DB")]
     auth_db: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_ROOT")]
     root: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_BUCKET")]
     bucket: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_ENDPOINT")]
     endpoint: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_REGION")]
     region: Option<String>,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_PREFIX")]
     prefix: Option<String>,
-    #[arg(long = "access-key")]
+    #[arg(long = "access-key", env = "RUST_BACKUP_ACCESS_KEY")]
     access_key: Option<String>,
-    #[arg(long = "secret-key")]
+    /// s3: secret key. Prefer the env var to a flag.
+    #[arg(long = "secret-key", env = "RUST_BACKUP_SECRET_KEY")]
     secret_key: Option<String>,
 
     // --- bool module params: only folded when present (flip a default) ---
     /// postgres: connect as admin (destination).
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_ADMIN", value_parser = boolish())]
     admin: bool,
     /// Destination: replace existing databases, collections or objects.
-    #[arg(long, env = "RUST_BACKUP_OVERWRITE")]
+    #[arg(long, env = "RUST_BACKUP_OVERWRITE", value_parser = boolish())]
     overwrite: bool,
     /// s3: use path-style addressing (MinIO).
-    #[arg(long = "path-style")]
+    #[arg(long = "path-style", env = "RUST_BACKUP_PATH_STYLE", value_parser = boolish())]
     path_style: bool,
     /// filesystem: follow symlinks.
-    #[arg(long = "follow-symlinks")]
+    #[arg(long = "follow-symlinks", env = "RUST_BACKUP_FOLLOW_SYMLINKS", value_parser = boolish())]
     follow_symlinks: bool,
     /// filesystem: do NOT preserve ownership (default is to preserve).
-    #[arg(long = "no-preserve-ownership")]
+    #[arg(
+        long = "no-preserve-ownership",
+        env = "RUST_BACKUP_NO_PRESERVE_OWNERSHIP",
+        value_parser = boolish()
+    )]
     no_preserve_ownership: bool,
     /// filesystem: preserve xattrs.
-    #[arg(long = "preserve-xattr")]
+    #[arg(long = "preserve-xattr", env = "RUST_BACKUP_PRESERVE_XATTR", value_parser = boolish())]
     preserve_xattr: bool,
 
     /// Extra module params as key=value (repeatable); overrides typed flags.
@@ -212,16 +237,26 @@ struct TargetArgs {
     secret_file: Option<String>,
     #[arg(long, env = "RUST_BACKUP_CARRIERS")]
     carriers: Option<u32>,
-    /// Disable the direct UDP/QUIC path (relay only).
+    /// Try the direct UDP/QUIC path (`--udp=false` forces relay-only).
+    #[arg(
+        long,
+        env = "RUST_BACKUP_UDP",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = boolish()
+    )]
+    udp: Option<bool>,
+    /// Disable the direct UDP/QUIC path (relay only). Wins over `--udp`.
     #[arg(long = "no-udp")]
     no_udp: bool,
-    #[arg(long)]
+    #[arg(long, env = "RUST_BACKUP_INSECURE", value_parser = boolish())]
     insecure: bool,
     /// Aggregate payload limit in bytes/second (0/unset means unlimited).
     #[arg(long, env = "RUST_BACKUP_MAX_RATE")]
     max_rate: Option<u64>,
     /// Auto-accept the plan (destination only).
-    #[arg(long = "yes")]
+    #[arg(long = "yes", env = "RUST_BACKUP_YES", value_parser = boolish())]
     yes: bool,
 
     #[command(flatten)]
@@ -351,6 +386,12 @@ fn resolve_target(
     if let Some(carriers) = a.carriers {
         transport.carriers = carriers;
     }
+    // `--udp[=BOOL]`/`RUST_BACKUP_UDP` is the documented switch; `--no-udp` is
+    // its explicit negation and wins, so a unit file can set the env var and a
+    // one-off invocation can still force relay-only.
+    if let Some(udp) = a.udp {
+        transport.udp = udp;
+    }
     if a.no_udp {
         transport.udp = false;
     }
@@ -379,18 +420,34 @@ fn resolve_target(
     Ok((transport, params, auto_accept))
 }
 
+/// Type a `-P key=value` escape.
+///
+/// The integer coercion exists for numeric module params (`port`), but it used
+/// to swallow every digit-only string: `-P password=123456` reached the module
+/// as a JSON number and failed with "invalid type: integer, expected a
+/// string", and `-P database=007` was silently rewritten to `7`. So:
+///
+/// * a value in double quotes is always a string (the explicit escape),
+/// * a bare integer is a number only when it round-trips exactly,
+/// * everything else stays a string.
 fn parse_scalar(v: &str) -> serde_json::Value {
     use serde_json::Value;
+    if let Some(quoted) = v
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|_| v.len() >= 2)
+    {
+        return Value::String(quoted.to_string());
+    }
     match v {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
-        _ => {
-            if let Ok(n) = v.parse::<i64>() {
-                Value::Number(n.into())
-            } else {
-                Value::String(v.to_string())
-            }
-        }
+        _ => match v.parse::<i64>() {
+            // `"007".parse()` succeeds as 7 and `"+7"` as 7; neither renders
+            // back to what the operator typed, so neither is a number here.
+            Ok(n) if n.to_string() == v => Value::Number(n.into()),
+            _ => Value::String(v.to_string()),
+        },
     }
 }
 
@@ -1196,6 +1253,172 @@ targets:
         assert_eq!(a.module.name(), "filesystem");
         let overlay = a.params.overlay().expect("overlay");
         assert_eq!(overlay["root"], "/srv/data");
+    }
+
+    /// USAGE.md promises `RUST_BACKUP_<UPPER_SNAKE>` for every flag, and a unit
+    /// file that sets one must actually get it. `RUST_BACKUP_YES` silently did
+    /// nothing, so an unattended destination sat on the interactive prompt
+    /// forever, and every credential flag had to travel through a
+    /// world-readable `/proc/<pid>/cmdline`.
+    ///
+    /// Documented exceptions: `-P/--param` is repeatable, `--no-udp` is the
+    /// negation of `--udp`, and `-v/--verbose` is listed with no env var.
+    #[test]
+    fn every_target_flag_carries_its_documented_env_var() {
+        use clap::CommandFactory;
+        const EXCEPTIONS: &[&str] = &["param", "no-udp", "verbose", "help", "version"];
+        let command = Cli::command();
+        let mut checked = 0;
+        for name in ["postgres", "mongodb", "filesystem", "s3", "server", "run"] {
+            let sub = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("{name} subcommand"));
+            for arg in sub.get_arguments() {
+                let Some(long) = arg.get_long() else { continue };
+                if EXCEPTIONS.contains(&long) {
+                    continue;
+                }
+                let expected = format!("RUST_BACKUP_{}", long.replace('-', "_").to_uppercase());
+                let actual = arg.get_env().and_then(|e| e.to_str());
+                assert_eq!(
+                    actual,
+                    Some(expected.as_str()),
+                    "{name} --{long} must read {expected}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "only {checked} flags inspected");
+    }
+
+    /// Boolean flags are configured from unit files and CI jobs as `=1`, `=yes`
+    /// or `=off`; clap's default `bool` parser accepted only "true"/"false" and
+    /// aborted the process on anything else.
+    #[test]
+    fn boolean_flags_accept_the_usual_env_spellings() {
+        use clap::CommandFactory;
+        const BOOL_FLAGS: &[(&str, &str)] = &[
+            ("postgres", "yes"),
+            ("postgres", "insecure"),
+            ("postgres", "admin"),
+            ("postgres", "overwrite"),
+            ("postgres", "udp"),
+            ("mongodb", "yes"),
+            ("s3", "path-style"),
+            ("filesystem", "follow-symlinks"),
+            ("filesystem", "no-preserve-ownership"),
+            ("filesystem", "preserve-xattr"),
+            ("server", "udp"),
+            ("run", "fail-fast"),
+        ];
+        use clap::builder::TypedValueParser;
+        let command = Cli::command();
+        // The shared parser really does accept every spelling…
+        for value in [
+            "1", "0", "y", "n", "yes", "no", "on", "off", "true", "false",
+        ] {
+            boolish()
+                .parse_ref(&command, None, std::ffi::OsStr::new(value))
+                .unwrap_or_else(|error| panic!("boolish must accept {value}: {error}"));
+        }
+        // …and every boolean flag that reads an env var uses it instead of
+        // clap's strict bool parser (compared against a probe argument so the
+        // check does not depend on how clap renders a parser).
+        let strict = format!(
+            "{:?}",
+            clap::Arg::new("probe")
+                .action(clap::ArgAction::SetTrue)
+                .get_value_parser()
+        );
+        for (name, long) in BOOL_FLAGS {
+            let sub = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("{name} subcommand"));
+            let arg = sub
+                .get_arguments()
+                .find(|arg| arg.get_long() == Some(long))
+                .unwrap_or_else(|| panic!("{name} --{long}"));
+            let parser = format!("{:?}", arg.get_value_parser());
+            assert_ne!(
+                parser, strict,
+                "{name} --{long} keeps clap's strict bool parser, which rejects `=1`"
+            );
+        }
+    }
+
+    /// `--udp=false` and `--no-udp` both force relay-only, and the explicit
+    /// negation wins over the env-supplied value.
+    #[test]
+    fn udp_is_a_tri_state_and_no_udp_wins() {
+        let base = [
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+        ];
+        let resolve = |extra: &[&str]| {
+            let args: Vec<&str> = base.iter().copied().chain(extra.iter().copied()).collect();
+            let Cmd::Filesystem(a) = parse(&args).cmd else {
+                panic!("expected filesystem subcommand")
+            };
+            resolve_target(&a, "filesystem", Role::Source)
+                .expect("resolve")
+                .0
+                .udp
+        };
+        assert!(resolve(&[]), "the direct path is attempted by default");
+        assert!(resolve(&["--udp"]));
+        assert!(!resolve(&["--udp=false"]));
+        assert!(!resolve(&["--no-udp"]));
+        assert!(!resolve(&["--udp=true", "--no-udp"]));
+    }
+
+    /// A digit-only password is a string, not an integer: coercing it made the
+    /// module reject its own params with "invalid type: integer".
+    #[test]
+    fn param_escape_types_values_without_eating_numeric_strings() {
+        use serde_json::Value;
+        assert_eq!(parse_scalar("6000"), Value::Number(6000.into()));
+        assert_eq!(parse_scalar("-1"), Value::Number((-1).into()));
+        assert_eq!(parse_scalar("true"), Value::Bool(true));
+        assert_eq!(parse_scalar("false"), Value::Bool(false));
+        // Non-canonical integers keep the operator's exact text.
+        for text in ["007", "+7", "1_000", "12345678901234567890123", " 7"] {
+            assert_eq!(
+                parse_scalar(text),
+                Value::String(text.to_string()),
+                "{text}"
+            );
+        }
+        // Explicit quoting is the escape for a value that IS canonical.
+        assert_eq!(
+            parse_scalar("\"123456\""),
+            Value::String("123456".to_string())
+        );
+        assert_eq!(parse_scalar("\"\""), Value::String(String::new()));
+        assert_eq!(parse_scalar("\""), Value::String("\"".to_string()));
+
+        let cli = parse(&[
+            "rust-backup",
+            "plan",
+            "postgres",
+            "-P",
+            "password=\"123456\"",
+            "-P",
+            "database=007",
+            "-P",
+            "port=6000",
+        ]);
+        let Cmd::Plan(a) = cli.cmd else {
+            panic!("expected plan subcommand")
+        };
+        let overlay = a.params.overlay().expect("overlay");
+        assert_eq!(overlay["password"], "123456");
+        assert_eq!(overlay["database"], "007");
+        assert_eq!(overlay["port"], 6000);
     }
 
     /// Every registered module is reachable by name (I-MODULAR at the CLI).
