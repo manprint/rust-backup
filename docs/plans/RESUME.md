@@ -64,11 +64,12 @@ Re-read against the code on 2026-09-09, after the F2/F3 work of this session.
   `#[cfg(test)]` in any crate. Every crate root now declares
   `#![forbid(unsafe_code)]` plus the unwrap/expect/panic denial, and
   `scripts/crate_invariants.sh` fails the gate if one goes missing — `rb-core`
-  had lost `forbid(unsafe_code)` entirely. Exactly two `#[allow]` attributes
-  remain in non-test code, each with a one-line justification above it
-  (`clippy::too_many_arguments` on the accept-boundary handler, `dead_code` on a
-  test-only deserialization field); the two stale ones on
-  `Postgres{Source,Destination}::params` were removed.
+  had lost `forbid(unsafe_code)` entirely. The workspace is now down to a single
+  `#[allow]` in the whole of `crates/`, and it is inside a `#[cfg(test)]` module
+  with its justification above it (a deserialization field the test never
+  reads). The two stale ones on `Postgres{Source,Destination}::params` were
+  removed, and `clippy::too_many_arguments` on the accept-boundary handler
+  disappeared with the unused carrier-registration parameter it was tolerating.
 - **I-MODULAR.** `max_carriers` is a defaulted trait method on both
   `BackupModule` and `Destination`, so a new module opts in without a core
   change. This session's product fixes are confined to `rb-postgres` and

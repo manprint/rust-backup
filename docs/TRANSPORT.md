@@ -58,8 +58,12 @@ Heartbeats reap dead rendezvous state.
 `--no-udp` forces the relay, which is the CI baseline.
 
 Current UDP support includes STUN reflexive candidates, authenticated
-connectivity checks, a bounded learned-address cache and authenticated sibling
-QUIC carriers. Pure NAT-plan classification with symmetric-port prediction,
+connectivity checks, a bounded learned-address cache (128 entries, advisory:
+it reorders probes and never changes candidate membership or relay fallback) and
+authenticated sibling QUIC carriers. The mapping class is classified from real
+observations and shared with the peer, but punch pacing and the check window do
+not yet adapt to it: `adaptive_nat::plan_for` is implemented and unit-tested and
+nothing consumes it, which is precisely what plan row F6.2 leaves open. Pure NAT-plan classification with symmetric-port prediction,
 PCP/UPnP mapping and the full privileged NAT outcome matrix remain future work —
 plan V3 rows F6.2, F6.5 and F6.7, scheduled for v0.2 and deliberately outside
 the v0.1 QA exit criteria, so a NAT-traversal gap is not a regression. What is

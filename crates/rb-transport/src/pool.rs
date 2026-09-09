@@ -1,11 +1,15 @@
 //! Carrier pool for round-robin substream opening.
 //! Vendored from bore with minimal adaptation.
+//!
+//! A provider registers once and every data carrier is a substream on that one
+//! mux, so a pool here holds exactly one live carrier today. bore's
+//! registration channel for *additional* provider connections
+//! (`PendingCarriers`/`TokenGuard`) was carried over unused — allocated per
+//! server, threaded through three handlers and then ignored — and is gone: an
+//! unused mechanism reads as a supported one.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-use dashmap::DashMap;
-use tokio::sync::mpsc;
 
 use crate::mux;
 
@@ -20,25 +24,6 @@ impl Carrier {
             opener,
             alive: Arc::new(AtomicBool::new(true)),
         }
-    }
-}
-
-pub type PendingCarriers = Arc<DashMap<String, mpsc::UnboundedSender<Carrier>>>;
-
-pub struct TokenGuard {
-    registry: PendingCarriers,
-    token: String,
-}
-
-impl TokenGuard {
-    pub fn new(registry: PendingCarriers, token: String) -> Self {
-        Self { registry, token }
-    }
-}
-
-impl Drop for TokenGuard {
-    fn drop(&mut self) {
-        self.registry.remove(&self.token);
     }
 }
 

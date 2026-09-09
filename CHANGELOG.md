@@ -40,7 +40,10 @@ this point; `docs/plans/RESUME.md` records the command that proved each phase.
   evicted. It stays advisory — an eviction costs a probe, never a connection.
 - Dropped `CheckConfig::role`, which the caller set from the direct-path role
   and the connectivity probe never read: both peers run the same symmetric
-  exchange.
+  exchange. Removed bore's unused registration channel for additional provider
+  connections (`PendingCarriers`/`TokenGuard`) along with the parameter that
+  threaded it through three handlers — a provider registers once here and every
+  carrier is a substream on that one mux.
 - `scripts/crate_invariants.sh` asserts `#![forbid(unsafe_code)]` and the
   unwrap/expect/panic denial in every crate root — `rb-core` was missing both,
   so the crate every module depends on sat outside its own lint gate.

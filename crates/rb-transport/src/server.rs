@@ -18,7 +18,7 @@ use rb_core::config::ServerConfig;
 
 use crate::auth::Authenticator;
 use crate::mux;
-use crate::pool::{CarrierPool, PendingCarriers};
+use crate::pool::CarrierPool;
 use crate::proto::{ClientMsg, Delimited, ServerMsg, UdpCandidate};
 use crate::shared::{proxy_buffer_size, tune_tcp};
 use crate::transport::load_server_tls;
@@ -319,7 +319,6 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
 
     let registry = Arc::new(DashMap::new());
     let max_conns = Arc::new(Semaphore::new(cfg.max_conns));
-    let pending_carriers = Arc::new(DashMap::new());
     let udp_registry = Arc::new(DashMap::new());
     let auth = cfg.secret.as_deref().map(Authenticator::new).transpose()?;
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
@@ -334,7 +333,6 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                 tune_tcp(&socket);
                 let registry = Arc::clone(&registry);
                 let max_conns = Arc::clone(&max_conns);
-                let pending_carriers = Arc::clone(&pending_carriers);
                 let udp_registry = Arc::clone(&udp_registry);
                 let auth_opt = auth.clone();
                 let tls = tls.clone();
@@ -346,7 +344,6 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                             peer,
                             registry,
                             max_conns,
-                            pending_carriers,
                             udp_registry,
                             auth_opt,
                         )
@@ -367,40 +364,20 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
 
 // Connection state is assembled at the accept boundary; grouping it would make
 // TLS/plain dispatch less explicit, so this handler keeps the boundary visible.
-#[allow(clippy::too_many_arguments)]
 async fn handle_accepted_conn(
     socket: TcpStream,
     tls: Option<TlsAcceptor>,
     peer: SocketAddr,
     registry: Registry,
     max_conns: Arc<Semaphore>,
-    pending_carriers: PendingCarriers,
     udp_registry: UdpRegistry,
     auth: Option<Authenticator>,
 ) -> Result<()> {
     if let Some(tls) = tls {
         let stream = tls.accept(socket).await.context("TLS handshake failed")?;
-        handle_conn(
-            stream,
-            peer,
-            registry,
-            max_conns,
-            pending_carriers,
-            udp_registry,
-            auth,
-        )
-        .await
+        handle_conn(stream, peer, registry, max_conns, udp_registry, auth).await
     } else {
-        handle_conn(
-            socket,
-            peer,
-            registry,
-            max_conns,
-            pending_carriers,
-            udp_registry,
-            auth,
-        )
-        .await
+        handle_conn(socket, peer, registry, max_conns, udp_registry, auth).await
     }
 }
 
@@ -409,7 +386,6 @@ async fn handle_conn<S: mux::Transport>(
     peer: SocketAddr,
     registry: Registry,
     max_conns: Arc<Semaphore>,
-    pending_carriers: PendingCarriers,
     udp_registry: UdpRegistry,
     auth: Option<Authenticator>,
 ) -> Result<()> {
@@ -436,16 +412,7 @@ async fn handle_conn<S: mux::Transport>(
 
     match first {
         Some(ClientMsg::Register { channel }) => {
-            serve_provider(
-                control,
-                opener,
-                registry,
-                udp_registry,
-                channel,
-                peer,
-                pending_carriers,
-            )
-            .await
+            serve_provider(control, opener, registry, udp_registry, channel, peer).await
         }
         Some(ClientMsg::Connect { channel }) => {
             serve_consumer(
@@ -477,7 +444,6 @@ async fn serve_provider(
     udp_registry: UdpRegistry,
     id: String,
     _peer: SocketAddr,
-    _pending_carriers: PendingCarriers,
 ) -> Result<()> {
     // Claim the channel id ATOMICALLY. A `contains_key` probe followed by an
     // `insert` lets two sources that register at the same moment both pass the
