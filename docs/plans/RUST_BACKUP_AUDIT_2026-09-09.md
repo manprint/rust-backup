@@ -112,10 +112,13 @@ per-item digests are compared against independently accumulated values.
 
 ## Test and CI coverage added
 
-* 4 integration tests spawning the real binary for the environment contract
-  (env-only run, boolean spellings, a misspelling still refused, flag beats env).
-* Unit tests: 16 in rb-postgres, 2 in rb-mongodb, 5 in rb-s3, 6 in
-  rb-filesystem, 8 in rb-transport, 4 in the CLI, 1 in rb-core.
+* Every fix above carries a test that fails against the previous code. The
+  suite now stands at 229 passing tests: rb-postgres 61, rb-transport 53,
+  rb-core 42, rb-mongodb 29, rust-backup 22, rb-s3 12, rb-filesystem 10.
+* 4 of those spawn the real binary to pin the environment contract (an
+  env-only run, every boolean spelling, a misspelling still refused, and a flag
+  beating its env var), because `Cli::parse` reads the process environment and
+  one in-process test would leak its variables into every other.
 * `e2e/fault_matrix.sh` asserts the process exit contract end to end (2, 3, 4
   and 7); nothing asserted a process status before.
 * `e2e/postgres_matrix.sh`: 12 assertions per case (was 7) — cross-major
