@@ -27,7 +27,7 @@ command that ran is not done — that rule is the whole point of the table.
 | F2.3 live fault matrix, all four modules | `bash e2e/fault_matrix.sh` | **CASES=22 PASS=54 FAIL=0**, no `SKIP` |
 | F2.4 real ext4 ENOSPC | `sudo -n "$PWD/e2e/filesystem_disk_full.sh"` | PASS=5 FAIL=0 |
 | F2.5 immutability under concurrent load | `bash e2e/fault_matrix.sh immutability` | PASS=2 FAIL=0 (both directions) |
-| F3.1 filesystem ownership in a netns | `sudo -n "$PWD/e2e/filesystem_netns_test.sh"` | PASS=4 FAIL=0 |
+| F3.1 filesystem ownership in a netns | `sudo -n "$PWD/e2e/filesystem_netns_test.sh"` | PASS=5 FAIL=0 |
 | F3.2 direct, fallback, active loss | `sudo -n "$PWD/e2e/transport_netns_test.sh"` | PASS=9 FAIL=0 |
 | F3.3 netem, backpressure, rate cap, RSS ceiling | `sudo -n "$PWD/e2e/bandwidth_netem.sh"` | **PASS=16 FAIL=0** — 200 MiB at 5 Mbit/s + 80 ms in 355 s, 16 MiB under a 256 KiB/s cap in 66 s, peak source RSS 10.9 MiB against a 192 MiB ceiling |
 | F3.4 one-vs-four-carrier speed proof | `sudo -n "$PWD/e2e/bandwidth_netem.sh"` (final section) | 4 carriers 44 s vs 1 carrier 43 s (ratio 102 %), byte-identical restored trees, and 4 carriers observed negotiated |
