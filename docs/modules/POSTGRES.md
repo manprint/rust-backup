@@ -106,6 +106,17 @@ inheritance child whose inherited column is locally `NOT NULL`, or a `reg*`
 column — whose binary `COPY` representation is a raw OID that names a different
 object on the destination.
 
+On a **PostgreSQL 18 or newer source** the same applies to a `NOT NULL`
+constraint that is named or `NOT VALID`. PostgreSQL 18 catalogues every not-null
+constraint in `pg_constraint` (`contype = 'n'`), which makes two things
+expressible that this build reads as a plain `attnotnull` and would silently
+rebuild as a *default-named, validated* constraint: an operator-chosen
+constraint name, and a `NOT VALID` not-null constraint, which does not actually
+forbid the rows already in the table. Constraints carrying the server's own
+default name are copied as before, so an ordinary cluster is unaffected — and
+because a partition's not-null constraint is inherited from its parent, its name
+on the destination is the same one PostgreSQL would pick natively.
+
 The error names every offender. `allow_unsupported_objects=true`
 (`-P allow_unsupported_objects=true`) accepts a knowingly partial copy; the run
 then logs exactly what it leaves behind.

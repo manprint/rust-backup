@@ -203,10 +203,38 @@ data_checksum() { # container db
     done
 }
 
-schema_dump() { # container db [strip-view-bodies]
+schema_dump() { # container db [cross-major]
   docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
     | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict |^CREATE EXTENSION IF NOT EXISTS plpgsql |^COMMENT ON EXTENSION plpgsql ' \
-    | if [[ "${3:-}" == "strip-view-bodies" ]]; then strip_view_bodies; else cat; fi
+    | if [[ "${3:-}" == "cross-major" ]]; then
+        strip_view_bodies | float_partition_attach | strip_not_null_names
+      else cat; fi
+}
+
+# PostgreSQL 18 catalogues every NOT NULL constraint, so pg_dump 18 renders a
+# partition's inherited one as `CONSTRAINT events_id_not_null NOT NULL` while
+# pg_dump 17 and older write a bare `NOT NULL` for the identical column. The
+# names are the server's own defaults (rb-postgres refuses a source that has
+# named or NOT VALID not-null constraints), so only the rendering differs.
+strip_not_null_names() {
+  sed -E 's/ CONSTRAINT [A-Za-z0-9_]+ NOT NULL/ NOT NULL/g'
+}
+
+# pg_dump 13 moved `ALTER TABLE ONLY … ATTACH PARTITION` out of the partition's
+# own section into a later one, so a 12:16 pair dumps the very same schema with
+# those statements in different positions. Their position is not the property
+# under test — the restore itself, the partition index validity check and the
+# fidelity probe cover attachment — so they are collected and re-emitted,
+# sorted, at the end of both dumps.
+float_partition_attach() {
+  awk '
+    /^ALTER TABLE ONLY .* ATTACH PARTITION / { attach[n++] = $0; next }
+    { print }
+    END {
+      for (i = 0; i < n; i++) { print attach[i] | "sort" }
+      close("sort")
+    }
+  '
 }
 
 # `pg_get_viewdef` — and hence pg_dump — renders the same view differently
@@ -339,7 +367,7 @@ for CASE in "${CASES[@]}"; do
 
   # 5) Destination schema matches source.
   SCHEMA_MODE=""
-  if (( SOURCE_MAJOR != DESTINATION_MAJOR )); then SCHEMA_MODE="strip-view-bodies"; fi
+  if (( SOURCE_MAJOR != DESTINATION_MAJOR )); then SCHEMA_MODE="cross-major"; fi
   if diff <(schema_dump "$SRC" appdb "$SCHEMA_MODE") \
           <(schema_dump "$DST" appdb "$SCHEMA_MODE") >/tmp/rb-schema.diff; then
     echo "PASS: destination schema matches source"; PASS=$((PASS+1))

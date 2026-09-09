@@ -875,6 +875,18 @@ async fn find_unsupported_objects(
                    '^reg(class|proc|procedure|type|namespace|role|oper|operator|config|dictionary|collation)(\\[\\])?$'",
         ),
     ];
+    // PostgreSQL 18 catalogues every NOT NULL constraint in `pg_constraint`
+    // (contype 'n'), which makes two new things expressible that this build
+    // reads as a plain `attnotnull` and would therefore rebuild as a *default
+    // named, validated* constraint without the read-back noticing: an
+    // operator-chosen constraint name, and a NOT VALID not-null constraint
+    // (which does not actually forbid existing NULLs).
+    if major >= 18 {
+        probes.push((
+            "NOT NULL constraints that are named or NOT VALID (PostgreSQL 18+)",
+            "SELECT (n.nspname || '.' || c.relname || '.' || co.conname                      || CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END)::text              FROM pg_catalog.pg_constraint co              JOIN pg_catalog.pg_class c ON c.oid = co.conrelid              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace              WHERE co.contype = 'n' AND co.conislocal                AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'                AND (NOT co.convalidated OR co.conname !~ '_not_null$')",
+        ));
+    }
     // `prokind` is PostgreSQL 11+; on 10 the same split lives in two booleans.
     if major < 11 {
         for probe in &mut probes {
