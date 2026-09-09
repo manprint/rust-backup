@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::auth::Authenticator;
 use crate::channel::{PairedChannel, CTRL_CLIENT_HEARTBEAT};
 #[cfg(feature = "udp")]
-use crate::connectivity::{derive_check_key, run_connectivity_checks, CheckConfig, CheckRole};
+use crate::connectivity::{derive_check_key, run_connectivity_checks, CheckConfig};
 use crate::mux;
 use crate::proto::{
     ClientMsg, Delimited, ServerMsg, UdpCandidate, UdpCandidateKind, MAX_V2_OFFER_CANDIDATES,
@@ -295,17 +295,12 @@ async fn setup_direct_inner(
     }
     // Both sides derive the same token from the shared secret + channel id.
     let token = derive_token(secret, channel_id.as_bytes())?;
-    let check_role = match role {
-        DirectRole::Provider => CheckRole::Listener,
-        DirectRole::Consumer => CheckRole::Dialer,
-    };
     let checks = run_connectivity_checks(
         &socket,
         &peer_addrs,
         &CheckConfig {
             key: derive_check_key(&token),
             generation: 0,
-            role: check_role,
             window: Duration::from_millis(500),
         },
     )

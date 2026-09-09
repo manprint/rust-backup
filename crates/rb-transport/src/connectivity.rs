@@ -15,17 +15,14 @@ const REQUEST: u8 = 1;
 const RESPONSE: u8 = 2;
 const PACKET_LEN: usize = 4 + 1 + 4 + 8 + 32;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckRole {
-    Listener,
-    Dialer,
-}
-
+/// Both peers run the same symmetric exchange — each sends its request to every
+/// candidate and answers whatever arrives — so there is deliberately no role
+/// here. An earlier `CheckRole` field was set by the caller and never read,
+/// which advertised an asymmetry the code does not have.
 #[derive(Clone, Debug)]
 pub struct CheckConfig {
     pub key: [u8; 32],
     pub generation: u32,
-    pub role: CheckRole,
     pub window: Duration,
 }
 
@@ -146,13 +143,9 @@ mod tests {
         let cfg = CheckConfig {
             key,
             generation: 4,
-            role: CheckRole::Dialer,
             window: Duration::from_millis(100),
         };
-        let other = CheckConfig {
-            role: CheckRole::Listener,
-            ..cfg.clone()
-        };
+        let other = cfg.clone();
         let left_addr = left.local_addr().unwrap();
         let right_addr = right.local_addr().unwrap();
         let left_peers = [right_addr];

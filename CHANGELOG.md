@@ -35,6 +35,12 @@ this point; `docs/plans/RESUME.md` records the command that proved each phase.
   one; `e2e/relay_smoke.sh`, `e2e/bandwidth_netem.sh` and `e2e/s3_minio_test.sh`
   now assert it — the last of them proves the per-module cap live by asking for
   four carriers against an S3 destination that permits one.
+- The learned direct-peer cache is now bounded in fact as well as in its
+  description: 128 entries, expiry swept on insert, least recently learned
+  evicted. It stays advisory — an eviction costs a probe, never a connection.
+- Dropped `CheckConfig::role`, which the caller set from the direct-path role
+  and the connectivity probe never read: both peers run the same symmetric
+  exchange.
 - `scripts/crate_invariants.sh` asserts `#![forbid(unsafe_code)]` and the
   unwrap/expect/panic denial in every crate root — `rb-core` was missing both,
   so the crate every module depends on sat outside its own lint gate.

@@ -59,6 +59,7 @@ the exact-path sudoers rule.
 | MongoDB 7 regression spot-check after the rollback change | `bash e2e/mongodb_matrix.sh 7` | **PASS=5 FAIL=0 SKIPPED=0** |
 | MongoDB 8 on this host | `bash e2e/mongodb_matrix.sh 8` | **SKIP (exit 77)** — `mongo:8` refuses Linux 7.0.0 (SERVER-121912); the major is covered by CI, whose runners are on 6.x |
 | Two-target YAML session incl. `--fail-fast` | `bash e2e/session_two_targets.sh` | **PASS** |
+| Direct, relay fallback and active loss, after the transport cleanups | `sudo -n "$PWD/e2e/transport_netns_test.sh"` | **PASS=9 FAIL=0** |
 | MinIO S3 incl. the per-module carrier cap | `bash e2e/s3_minio_test.sh` | **PASS** — a source asking for 4 carriers negotiates down to the 1 the S3 destination permits |
 
 F3.4 is deliberately a no-regression proof, not a speedup: the link is the
