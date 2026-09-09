@@ -135,6 +135,10 @@ per-item digests are compared against independently accumulated values.
 ## Dependency health
 
 `h2` (RUSTSEC-2026-0258), `chacha20` (yanked) and `lru` (RUSTSEC-2026-0253,
-reached through `aws-sdk-s3`) were updated; `mongodb` moved to 3.9. Three
-workflow action pins whose SHA no longer matched their version comment were
-repinned to the commit their tag names today.
+reached through `aws-sdk-s3`) were updated; `mongodb` moved to 3.9.
+`docker/setup-buildx-action` (three call sites) was pinned to a commit its `v4`
+comment no longer named, which zizmor's pedantic persona reports.
+
+When checking such a pin, dereference the tag: `git/ref/tags/<tag>` returns the
+**tag object** for an annotated tag, and pinning that SHA is worse than a stale
+pin — it is not a commit at all.
