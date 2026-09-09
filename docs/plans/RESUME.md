@@ -20,7 +20,7 @@ command that ran is not done — that rule is the whole point of the table.
 |---|---|---|
 | F1.1 ordered demux, item-pinned carriers | `cargo test --all-features` + `RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh` | PASS |
 | F1.2 carrier negotiation, plain + TLS | `bash e2e/relay_smoke.sh`, then the same with `RUST_BACKUP_E2E_TLS=1`, each at 1 and 4 carriers | PASS=5 FAIL=0 per run; each asserts the *negotiated* count, not the requested one |
-| F1.3–F1.4 abort handshake, verification handshake | `cargo test --all-features` (rb-core + rb-transport banks) | 233 passed, 0 ignored |
+| F1.3–F1.4 abort handshake, verification handshake | `cargo test --all-features` (rb-core + rb-transport banks) | 234 passed, 0 ignored |
 | F1.5 per-module carrier caps | `cargo test --all-features -- clamp_carriers` and the CLI bank, plus the live cap proof in `e2e/s3_minio_test.sh` | PASS |
 | F1.6 direct/relay fallback | `sudo -n "$PWD/e2e/transport_netns_test.sh"` | PASS=9 FAIL=0 |
 | F2.1–F2.2 in-process fault banks | `bash e2e/fault_matrix.sh protocol` (26-case core bank) | PASS |

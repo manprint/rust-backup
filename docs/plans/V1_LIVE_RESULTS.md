@@ -45,7 +45,7 @@ the exact-path sudoers rule.
 
 | Matrix | Exact command | Result |
 |---|---|---|
-| Rust gates | `bash scripts/gates.sh` | **PASS** — 233 tests passed, 0 ignored |
+| Rust gates | `bash scripts/gates.sh` | **PASS** — 234 tests passed, 0 ignored |
 | Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=22 PASS=54 FAIL=0**, no `SKIP` — every group ran |
 | Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **CASES=7 PASS=19 FAIL=0** — 6 fault cases × A/B/C, plus the refusal of a destination a killed run left partial |
 | Fault matrix, immutability (F2.5) | `bash e2e/fault_matrix.sh immutability` | **PASS=2 FAIL=0** — a sibling load raises no false `SourceMutated` and still verifies; a real source write exits 6 with `SOURCE-IMMUTABILITY VIOLATION` and no `RESTORE VERIFIED` |
