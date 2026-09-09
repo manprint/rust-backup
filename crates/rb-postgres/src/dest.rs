@@ -193,9 +193,35 @@ pub async fn stream_in(
             drop_database_for_overwrite(&boot.client, &database.name).await?;
         }
     }
-    run_statements(&boot.client, &ddl.databases).await?;
-    drop(boot);
 
+    // Snapshot which target databases exist *before* this run creates any, so a
+    // later failure removes exactly what this run brought into existence and
+    // never a database it found already there. The bootstrap connection is held
+    // open across the load for this reason alone: the rollback needs a working
+    // admin session on a database that is not itself being restored, and
+    // reconnecting is precisely what a dying destination cannot do.
+    let preexisting = existing_target_databases(&boot.client, &payload).await?;
+    let outcome = async {
+        run_statements(&boot.client, &ddl.databases).await?;
+        restore_databases(params, &ddl, plan, src).await
+    }
+    .await;
+    if let Err(error) = outcome {
+        remove_partially_restored(&boot.client, &payload, &preexisting).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Steps 2–4 of the restore. Split out of [`stream_in`] so every `?` funnels
+/// through one error path — and so `conns` is dropped before the caller tries to
+/// `DROP DATABASE` anything, which PostgreSQL refuses while a session is open.
+async fn restore_databases(
+    params: &PostgresParams,
+    ddl: &crate::ddl::ClusterDdl,
+    plan: &BackupPlan,
+    src: &mut dyn ChunkSource,
+) -> Result<()> {
     // 2. Per-database structure; keep each connection for the data load.
     let mut conns: HashMap<String, PgConnection> = HashMap::new();
     for dbddl in &ddl.per_database {
@@ -216,6 +242,79 @@ pub async fn stream_in(
         }
     }
     Ok(())
+}
+
+/// Target database names that already exist on the destination.
+async fn existing_target_databases(
+    client: &Client,
+    payload: &PgPlanPayload,
+) -> Result<HashSet<String>> {
+    let mut existing = HashSet::new();
+    for database in &payload.databases {
+        let present: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1)",
+                &[&database.name],
+            )
+            .await
+            .map_err(|error| {
+                BackupError::phase_src(
+                    Phase::Apply,
+                    format!("check existing database {:?}", database.name),
+                    error,
+                )
+            })?
+            .get(0);
+        if present {
+            existing.insert(database.name.clone());
+        }
+    }
+    Ok(existing)
+}
+
+/// Databases a failed restore must remove: the plan's targets that this run
+/// created. A target the run found already present is never touched — without
+/// `--overwrite` the run never wrote to it, and with `--overwrite` it was dropped
+/// before this snapshot was taken, so it cannot appear here.
+fn databases_to_remove<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+    preexisting: &HashSet<String>,
+) -> Vec<&'a str> {
+    targets
+        .into_iter()
+        .filter(|name| !preexisting.contains(*name))
+        .collect()
+}
+
+/// Remove the half-restored databases this run created. A restore that fails
+/// mid-load would otherwise leave a database holding part of the source's rows:
+/// nothing certifies it (there is no `RESTORE VERIFIED`), but it is
+/// indistinguishable from a small database on inspection, and the filesystem
+/// module already deletes its partial file rather than leave one looking
+/// complete. Best-effort by construction — the caller's error is the real
+/// outcome and must not be replaced by a cleanup failure — so every problem here
+/// is logged loudly and names the manual `DROP DATABASE` that finishes the job.
+async fn remove_partially_restored(
+    client: &Client,
+    payload: &PgPlanPayload,
+    preexisting: &HashSet<String>,
+) {
+    let targets = payload.databases.iter().map(|db| db.name.as_str());
+    for name in databases_to_remove(targets, preexisting) {
+        match drop_database_for_overwrite(client, name).await {
+            Ok(()) => tracing::warn!(
+                database = %name,
+                "restore failed; removed the partially restored database this run created"
+            ),
+            Err(error) => tracing::error!(
+                database = %name,
+                %error,
+                "restore failed and the partially restored database could not be removed; \
+                 it holds an incomplete copy and no verification evidence — drop it with \
+                 DROP DATABASE before retrying"
+            ),
+        }
+    }
 }
 
 /// Re-introspect every restored database plus the selected cluster-global
@@ -985,6 +1084,30 @@ mod tests {
         assert!(
             allowed.ok,
             "--overwrite must allow restoring over existing db"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_removes_only_the_databases_it_created() {
+        let mut preexisting = HashSet::new();
+        preexisting.insert("kept".to_string());
+
+        let removed = databases_to_remove(["kept", "created", "also_created"], &preexisting);
+
+        assert_eq!(
+            removed,
+            vec!["created", "also_created"],
+            "a database the run found already present must survive its failure"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_created_nothing_removes_nothing() {
+        let preexisting: HashSet<String> = ["appdb".to_string()].into_iter().collect();
+
+        assert!(
+            databases_to_remove(["appdb"], &preexisting).is_empty(),
+            "nothing was created, so nothing may be dropped"
         );
     }
 }

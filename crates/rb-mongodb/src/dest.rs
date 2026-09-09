@@ -180,6 +180,27 @@ pub async fn stream_in(
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
     let conn = MongoConnection::connect(params).await?;
 
+    // Snapshot which target namespaces exist *before* this run creates any, so a
+    // later failure removes exactly what this run brought into existence and
+    // never a collection it found already there.
+    let preexisting = existing_target_namespaces(&conn, &payload).await?;
+    let outcome = restore_namespaces(params, &conn, &payload, plan, src).await;
+    if let Err(error) = outcome {
+        remove_partially_restored(&conn, &payload, &preexisting).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The restore proper. Split out of [`stream_in`] so every `?` funnels through
+/// one error path that can undo what the run created.
+async fn restore_namespaces(
+    params: &MongoDbParams,
+    conn: &MongoConnection,
+    payload: &MongoPlanPayload,
+    plan: &BackupPlan,
+    src: &mut dyn ChunkSource,
+) -> Result<()> {
     // 1. Create every collection (with its options), dropping first on overwrite.
     //    The namespace guard is re-applied here: preflight and apply are two
     //    separate exchanges, and only this one destroys anything.
@@ -193,7 +214,7 @@ pub async fn stream_in(
 
     // 2. Bulk data: one linear pass over the chunk stream, routed by item id.
     let metas = item_metas(plan);
-    apply_data(&conn, &metas, src).await?;
+    apply_data(conn, &metas, src).await?;
 
     // 3. Indexes (after data load, so building is cheaper).
     for db in &payload.databases {
@@ -203,6 +224,90 @@ pub async fn stream_in(
         }
     }
     Ok(())
+}
+
+/// `db.collection` namespaces from the plan that already exist on the
+/// destination, as `("db", "collection")` pairs.
+async fn existing_target_namespaces(
+    conn: &MongoConnection,
+    payload: &MongoPlanPayload,
+) -> Result<HashSet<(String, String)>> {
+    let mut existing = HashSet::new();
+    for db in &payload.databases {
+        let database = conn.client.database(&db.name);
+        let names = database.list_collection_names().await.map_err(|error| {
+            BackupError::phase_src(
+                Phase::Apply,
+                format!("list existing collections in {}", db.name),
+                error,
+            )
+        })?;
+        let present: HashSet<&String> = names.iter().collect();
+        for coll in &db.collections {
+            if present.contains(&coll.name) {
+                existing.insert((db.name.clone(), coll.name.clone()));
+            }
+        }
+    }
+    Ok(existing)
+}
+
+/// Namespaces a failed restore must remove: the plan's targets that this run
+/// created. A namespace the run found already present is never touched — without
+/// `--overwrite` the run never wrote to it, and with `--overwrite` it was dropped
+/// before this snapshot was taken, so it cannot appear here.
+fn namespaces_to_remove<'a>(
+    targets: impl IntoIterator<Item = (&'a str, &'a str)>,
+    preexisting: &HashSet<(String, String)>,
+) -> Vec<(&'a str, &'a str)> {
+    targets
+        .into_iter()
+        .filter(|(db, coll)| !preexisting.contains(&((*db).to_string(), (*coll).to_string())))
+        .collect()
+}
+
+/// Drop the half-filled collections this run created. A restore that fails
+/// mid-load would otherwise leave collections holding part of the source's
+/// documents: nothing certifies them (there is no `RESTORE VERIFIED`), but they
+/// are indistinguishable from small collections on inspection. Best-effort by
+/// construction — the caller's error is the real outcome and must not be
+/// replaced by a cleanup failure — so every problem here is logged loudly.
+async fn remove_partially_restored(
+    conn: &MongoConnection,
+    payload: &MongoPlanPayload,
+    preexisting: &HashSet<(String, String)>,
+) {
+    let targets = payload.databases.iter().flat_map(|db| {
+        db.collections
+            .iter()
+            .map(move |coll| (db.name.as_str(), coll.name.as_str()))
+    });
+    for (db_name, coll_name) in namespaces_to_remove(targets, preexisting) {
+        // The namespace guard already ran before this collection was created;
+        // re-check it so a cleanup path can never be the one that drops a system
+        // namespace.
+        if check_namespace(db_name, coll_name).is_err() {
+            continue;
+        }
+        let collection = conn
+            .client
+            .database(db_name)
+            .collection::<Document>(coll_name);
+        match collection.drop().await {
+            Ok(()) => tracing::warn!(
+                namespace = %format!("{db_name}.{coll_name}"),
+                "restore failed; dropped the partially restored collection this run created"
+            ),
+            Err(error) if is_namespace_not_found(&error) => {}
+            Err(error) => tracing::error!(
+                namespace = %format!("{db_name}.{coll_name}"),
+                %error,
+                "restore failed and the partially restored collection could not be dropped; \
+                 it holds an incomplete copy and no verification evidence — drop it before \
+                 retrying"
+            ),
+        }
+    }
 }
 
 /// Re-introspect each restored database and compare collection options and
@@ -713,5 +818,43 @@ mod tests {
         // naming is idiomatic), so those must still pass.
         check_namespace("appdb", "accounts").expect("plain namespace");
         check_namespace("appdb", "events.2026.raw").expect("dotted collection");
+    }
+
+    #[test]
+    fn a_failed_restore_removes_only_the_namespaces_it_created() {
+        let preexisting: HashSet<(String, String)> = [("appdb".to_string(), "kept".to_string())]
+            .into_iter()
+            .collect();
+
+        let removed = namespaces_to_remove(
+            [
+                ("appdb", "kept"),
+                ("appdb", "created"),
+                ("other", "created"),
+            ],
+            &preexisting,
+        );
+
+        assert_eq!(
+            removed,
+            vec![("appdb", "created"), ("other", "created")],
+            "a collection the run found already present must survive its failure"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_created_nothing_removes_nothing() {
+        let preexisting: HashSet<(String, String)> = [
+            ("appdb".to_string(), "accounts".to_string()),
+            ("appdb".to_string(), "orders".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(
+            namespaces_to_remove([("appdb", "accounts"), ("appdb", "orders")], &preexisting)
+                .is_empty(),
+            "nothing was created, so nothing may be dropped"
+        );
     }
 }
