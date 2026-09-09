@@ -89,16 +89,41 @@ expect_exit() { # code description -- command...
 expect_exit 2 'unknown module' -- "$RB_E2E_BIN" nosuchmodule source --to 127.0.0.1:1 --channel x
 # 2 = configuration: a target without --to.
 expect_exit 2 'missing --to' -- "$RB_E2E_BIN" filesystem source --channel x --root "$src"
-# 3 = preflight: the filesystem destination refuses a root that is not empty.
-mkdir -p "$work/occupied" && : >"$work/occupied/pre-existing"
-expect_exit 3 'non-empty filesystem destination' -- \
-  "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" --channel exit-preflight \
-  --no-udp --insecure --yes --root "$work/occupied"
 # 7 = transport: nothing is listening on a closed port.
 closed=$(rb_free_port)
 expect_exit 7 'unreachable coordination server' -- \
   "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$closed" --channel exit-transport \
   --no-udp --insecure --root "$src"
+
+# 3 = preflight (destination) and 4 = plan rejected (source): the filesystem
+# destination refuses a root that is not empty, and the source must learn that
+# as a rejection rather than as a generic failure. Needs a real pair, because
+# preflight runs on the received plan.
+mkdir -p "$work/small" "$work/occupied"
+printf 'x' >"$work/small/only-file"
+: >"$work/occupied/pre-existing"
+RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$port" --channel exit-preflight \
+  --no-udp --insecure --root "$work/small" >"$work/reject-source.log" 2>&1 &
+reject_source_pid=$!
+sleep .2
+set +e
+RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" --channel exit-preflight \
+  --no-udp --insecure --yes --root "$work/occupied" >"$work/reject-destination.log" 2>&1
+reject_destination_rc=$?
+wait "$reject_source_pid"; reject_source_rc=$?
+set -e
+if (( reject_destination_rc == 3 )); then
+  pass 'exit code 3: destination preflight rejection'
+else
+  fail "destination preflight rejection exited $reject_destination_rc, expected 3"
+  sed -n '1,10p' "$work/reject-destination.log" >&2
+fi
+if (( reject_source_rc == 4 )); then
+  pass 'exit code 4: source sees the rejection as a plan rejection'
+else
+  fail "rejected source exited $reject_source_rc, expected 4"
+  sed -n '1,10p' "$work/reject-source.log" >&2
+fi
 
 printf 'T-FAULT summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

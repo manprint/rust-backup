@@ -414,6 +414,11 @@ pub fn set_column_default(t: &PgTable, c: &PgColumn) -> Option<String> {
 /// semantics, so they travel with it rather than being lost.
 pub fn add_identity(t: &PgTable, c: &PgColumn, seq: Option<&PgSequence>) -> Option<String> {
     let kind = c.identity.as_ref()?;
+    if t.partition_of.is_some() {
+        // An identity generator belongs to the partitioned parent; PostgreSQL
+        // refuses to add one to a partition.
+        return None;
+    }
     let when = if kind == "a" { "ALWAYS" } else { "BY DEFAULT" };
     let mut options = Vec::new();
     if let Some(seq) = seq {
@@ -1356,6 +1361,19 @@ mod tests {
              MINVALUE 1 MAXVALUE 1000000 CACHE 20 CYCLE);"
         );
         assert_eq!(add_identity(&t, &t.columns[1], None), None);
+
+        // A partition never carries the generator itself.
+        let partition = PgTable {
+            partition_of: Some(PgPartitionOf {
+                parent: "app.parent".into(),
+                bound: "DEFAULT".into(),
+            }),
+            ..t.clone()
+        };
+        assert_eq!(
+            add_identity(&partition, &partition.columns[0], Some(&seq)),
+            None
+        );
     }
 
     /// GUC values reach the destination inside a peer-supplied plan and are
