@@ -254,34 +254,40 @@ reported by preflight (normally cluster administration, role and database
 creation). Existing target databases are rejected unless `--overwrite` (or the
 equivalent `overwrite: true` YAML parameter) is explicitly configured.
 
+Pass credentials in the environment, not on the command line:
+`/proc/<pid>/cmdline` is world-readable on Linux, so a `--password` flag is
+visible to every local account for as long as the transfer runs, while
+`/proc/<pid>/environ` is readable only by the owning user. Every flag has a
+`RUST_BACKUP_<UPPER_SNAKE>` equivalent (`USAGE.md`).
+
 ```bash
 # Source
-rust-backup postgres source \
-  --to coordinator.example:7835 --channel pg-prod --secret "$RB_SECRET" \
+RUST_BACKUP_PASSWORD="$SOURCE_PG_PASSWORD" rust-backup postgres source \
+  --to coordinator.example:7835 --channel pg-prod --secret-file /run/secrets/rb \
   --host pg-source.internal --port 5432 --user backup_readonly \
-  --password "$SOURCE_PG_PASSWORD" --database app --sslmode require
+  --database app --sslmode require
 
 # Destination
-rust-backup postgres destination \
-  --to coordinator.example:7835 --channel pg-prod --secret "$RB_SECRET" \
+RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
+  --to coordinator.example:7835 --channel pg-prod --secret-file /run/secrets/rb \
   --host pg-destination.internal --port 5432 --user postgres \
-  --password "$DEST_PG_PASSWORD" --database postgres --sslmode require --admin --yes
+  --database postgres --sslmode require --admin --yes
 ```
 
 Containerized clients use the same arguments:
 
 ```bash
 docker run --rm --network host \
+  -e RUST_BACKUP_PASSWORD="$SOURCE_PG_PASSWORD" \
   ghcr.io/manprint/rust-backup:latest postgres source \
   --to 127.0.0.1:7835 --channel pg-prod --secret "$RB_SECRET" \
-  --host 127.0.0.1 --port 5432 --user backup_readonly \
-  --password "$SOURCE_PG_PASSWORD" --database app
+  --host 127.0.0.1 --port 5432 --user backup_readonly --database app
 
 docker run --rm --network host \
+  -e RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" \
   ghcr.io/manprint/rust-backup:latest postgres destination \
   --to 127.0.0.1:7835 --channel pg-prod --secret "$RB_SECRET" \
-  --host 127.0.0.1 --port 55432 --user postgres \
-  --password "$DEST_PG_PASSWORD" --admin --yes
+  --host 127.0.0.1 --port 55432 --user postgres --admin --yes
 ```
 
 Use `-P sslrootcert=/run/secrets/postgres-ca.pem` for a private CA. See
@@ -293,28 +299,33 @@ Omit `--database` to copy all non-system databases. The source user needs read
 access and metadata visibility; the destination user needs database/user/index
 administration appropriate to the plan.
 
+A URI carries its own credentials, so pass it as `RUST_BACKUP_URI` rather than
+as a flag (see the note under PostgreSQL backup).
+
 ```bash
+RUST_BACKUP_URI="mongodb://backup_readonly:${MONGO_SOURCE_PASSWORD}@mongo-source.internal:27017/?authSource=admin" \
 rust-backup mongodb source \
   --to coordinator.example:7835 --channel mongo-prod --secret "$RB_SECRET" \
-  --uri "mongodb://backup_readonly:${MONGO_SOURCE_PASSWORD}@mongo-source.internal:27017/?authSource=admin" \
   --database app --auth-db admin
 
+RUST_BACKUP_URI="mongodb://root:${MONGO_DEST_PASSWORD}@mongo-destination.internal:27017/?authSource=admin" \
 rust-backup mongodb destination \
   --to coordinator.example:7835 --channel mongo-prod --secret "$RB_SECRET" \
-  --uri "mongodb://root:${MONGO_DEST_PASSWORD}@mongo-destination.internal:27017/?authSource=admin" \
   --database app --auth-db admin --yes
 ```
 
 Docker example:
 
 ```bash
-docker run --rm --network host ghcr.io/manprint/rust-backup:latest \
-  mongodb source --to 127.0.0.1:7835 --channel mongo-prod --secret "$RB_SECRET" \
-  --uri "mongodb://backup_readonly:${MONGO_SOURCE_PASSWORD}@127.0.0.1:27017/?authSource=admin" --database app
+docker run --rm --network host \
+  -e RUST_BACKUP_URI="mongodb://backup_readonly:${MONGO_SOURCE_PASSWORD}@127.0.0.1:27017/?authSource=admin" \
+  ghcr.io/manprint/rust-backup:latest \
+  mongodb source --to 127.0.0.1:7835 --channel mongo-prod --secret "$RB_SECRET" --database app
 
-docker run --rm --network host ghcr.io/manprint/rust-backup:latest \
-  mongodb destination --to 127.0.0.1:7835 --channel mongo-prod --secret "$RB_SECRET" \
-  --uri "mongodb://root:${MONGO_DEST_PASSWORD}@127.0.0.1:37017/?authSource=admin" --database app --yes
+docker run --rm --network host \
+  -e RUST_BACKUP_URI="mongodb://root:${MONGO_DEST_PASSWORD}@127.0.0.1:37017/?authSource=admin" \
+  ghcr.io/manprint/rust-backup:latest \
+  mongodb destination --to 127.0.0.1:7835 --channel mongo-prod --secret "$RB_SECRET" --database app --yes
 ```
 
 See [MongoDB fidelity details](docs/modules/MONGODB.md).
@@ -327,30 +338,32 @@ list/get and metadata/policy visibility; the destination key needs bucket/object
 write and multipart permissions.
 
 ```bash
+RUST_BACKUP_ACCESS_KEY="$SRC_ACCESS_KEY" RUST_BACKUP_SECRET_KEY="$SRC_SECRET_KEY" \
 rust-backup s3 source \
   --to coordinator.example:7835 --channel s3-prod --secret "$RB_SECRET" \
-  --region eu-south-1 --bucket source-bucket --prefix production/ \
-  --access-key "$SRC_ACCESS_KEY" --secret-key "$SRC_SECRET_KEY"
+  --region eu-south-1 --bucket source-bucket --prefix production/
 
+RUST_BACKUP_ACCESS_KEY="$DST_ACCESS_KEY" RUST_BACKUP_SECRET_KEY="$DST_SECRET_KEY" \
 rust-backup s3 destination \
   --to coordinator.example:7835 --channel s3-prod --secret "$RB_SECRET" \
   --region eu-south-1 --bucket restored-bucket --prefix recovered/ \
-  --access-key "$DST_ACCESS_KEY" --secret-key "$DST_SECRET_KEY" \
   -P create_bucket=true --yes
 ```
 
 For MinIO or another custom endpoint, add `--endpoint` and `--path-style`:
 
 ```bash
-docker run --rm --network host ghcr.io/manprint/rust-backup:latest \
+docker run --rm --network host \
+  -e RUST_BACKUP_ACCESS_KEY=minioadmin -e RUST_BACKUP_SECRET_KEY="$MINIO_PASSWORD" \
+  ghcr.io/manprint/rust-backup:latest \
   s3 source --to 127.0.0.1:7835 --channel minio --secret "$RB_SECRET" \
-  --endpoint http://127.0.0.1:9000 --region us-east-1 --path-style \
-  --bucket source --access-key minioadmin --secret-key "$MINIO_PASSWORD"
+  --endpoint http://127.0.0.1:9000 --region us-east-1 --path-style --bucket source
 
-docker run --rm --network host ghcr.io/manprint/rust-backup:latest \
+docker run --rm --network host \
+  -e RUST_BACKUP_ACCESS_KEY=minioadmin -e RUST_BACKUP_SECRET_KEY="$MINIO_PASSWORD" \
+  ghcr.io/manprint/rust-backup:latest \
   s3 destination --to 127.0.0.1:7835 --channel minio --secret "$RB_SECRET" \
-  --endpoint http://127.0.0.1:9000 --region us-east-1 --path-style \
-  --bucket destination --access-key minioadmin --secret-key "$MINIO_PASSWORD" \
+  --endpoint http://127.0.0.1:9000 --region us-east-1 --path-style --bucket destination \
   -P create_bucket=true --yes
 ```
 

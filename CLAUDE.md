@@ -118,6 +118,10 @@ cargo test --all-features
 bash scripts/gates.sh               # the full gate
 ```
 
-Skeleton status: `rb-core` complete + tested; `rb-transport` relay path; module
-stubs return `not-implemented` phase errors with full type scaffolding. See the
-plan for what each phase fills in.
+Status: all four modules are implemented and exercised against live backends by
+`e2e/` (PostgreSQL 10..=18 incl. cross-major pairs, MongoDB 4..=8, MinIO/AWS S3,
+POSIX filesystem); `rb-transport` carries both the relay and the direct
+UDP/QUIC path with automatic fallback. The only deliberate gaps are recorded in
+`docs/modules/*.md` ("Limits") — a module refuses what it cannot reproduce
+rather than certifying a partial copy. See `docs/plans/RUST_BACKUP_PLAN_V3.md`
+for the remaining roadmap.
