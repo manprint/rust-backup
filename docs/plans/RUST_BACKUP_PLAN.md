@@ -207,8 +207,8 @@ against an in-memory channel.
 | What | bore source (anchor) | rust-backup target | Notes |
 |------|----------------------|--------------------|-------|
 | yamux mux | `mux.rs` `client/server`, `Opener::open`, `Acceptor::accept`, `STREAM_READY=0`, `write/read_stream_ready` | `rb-transport/src/mux.rs` | copy ~verbatim; one stream = one task |
-| prefix replay | `prefixed.rs` `Prefixed::new` | `rb-transport/src/prefixed.rs` | verbatim |
-| carrier pool | `pool.rs` `CarrierPool::{new,push,pick}` | `rb-transport/src/pool.rs` | verbatim |
+| prefix replay | `prefixed.rs` `Prefixed::new` | *not ported* | ported verbatim, then removed on 2026-09-09: bore replays a peeked prefix to tell HTTP from bore on one port, and this server never sniffs, so it had no caller. `vendored-from-bore/prefixed.rs` still holds it |
+| carrier pool | `pool.rs` `CarrierPool::{new,push,pick}` | `rb-transport/src/pool.rs` | pool kept; bore's registration channel for additional provider connections (`PendingCarriers`/`TokenGuard`) removed on 2026-09-09 — a provider registers once here and every carrier is a substream on that mux |
 | TCP/TLS control | `transport.rs` `Endpoint::parse`, `connect`, `client_config`, `server_tls_from_pem` | `rb-transport/src/transport.rs` | trim to control channel |
 | HMAC auth | `auth.rs` `Authenticator::{new,server_handshake,client_handshake}` | `rb-transport/src/auth.rs` | retarget to new proto |
 | framed codec | `shared.rs` `Delimited` (null-JSON, `MAX_FRAME_LENGTH`), `tune_tcp`, `NETWORK_TIMEOUT` | `rb-transport/src/proto.rs` + `rb-core/src/wire.rs` | new minimal `Msg` enums |
