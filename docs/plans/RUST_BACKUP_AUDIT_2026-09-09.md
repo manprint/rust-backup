@@ -22,6 +22,7 @@ now either reproduced or refused up front.
 | T5 | No consumer exclusivity per channel: a second destination interleaved its substreams into the first one's session |
 | T6 | `tune_tcp` was missing on the client control socket (a lost bore invariant) |
 | T7 | The TLS handshake had no deadline (a lost bore invariant) |
+| T8 | A provider teardown removed the channel's UDP matchmaker unconditionally, so a stale provider could delete a *newer* registration's matchmaker: the two peers then registered on separate matchmakers, never matched, and the whole channel fell back to the relay after the broker timeout. Ownership-checked, like the registry entry next to it |
 
 ## rb-filesystem — `7046cca`
 

@@ -501,25 +501,27 @@ async fn serve_provider(
             vacant.insert(Arc::clone(&pool));
         }
     }
+    // UDP hole-punch brokering + control-plane liveness run in the shared control
+    // loop. The matchmaker is shared with the consumer task via the registry
+    // (created by whichever side arrives first); the relay path is unaffected.
+    // It is taken before the guard so the guard can remove exactly the one this
+    // provider used.
+    let matchmaker = udp_registry
+        .entry(id.clone())
+        .or_insert_with(|| Arc::new(UdpMatchmaker::default()))
+        .clone();
+    // When this returns, `_guard` drops and removes the registry entries — so a
+    // reaped/disconnected provider releases its channel id.
     let _guard = DropGuard {
         registry: Arc::clone(&registry),
         udp_registry: Arc::clone(&udp_registry),
         id: id.clone(),
         pool: Arc::clone(&pool),
+        matchmaker: Arc::clone(&matchmaker),
     };
 
     control.send_server(ServerMsg::Ok).await?;
     info!(%id, "provider registered");
-
-    // UDP hole-punch brokering + control-plane liveness run in the shared control
-    // loop. The matchmaker is shared with the consumer task via the registry
-    // (created by whichever side arrives first); the relay path is unaffected.
-    // When this returns, `_guard` drops and removes the registry entries — so a
-    // reaped/disconnected provider releases its channel id.
-    let matchmaker = udp_registry
-        .entry(id.clone())
-        .or_insert_with(|| Arc::new(UdpMatchmaker::default()))
-        .clone();
 
     serve_control(
         &mut control,
@@ -664,15 +666,21 @@ struct DropGuard {
     udp_registry: UdpRegistry,
     id: String,
     pool: Arc<CarrierPool>,
+    matchmaker: Arc<UdpMatchmaker>,
 }
 
 impl Drop for DropGuard {
     fn drop(&mut self) {
-        // Remove only the entry this provider actually installed, so a losing
-        // registration can never evict the live source of the same channel id.
+        // Remove only the entries this provider actually installed, so a losing
+        // or already-replaced registration can never evict the live source of
+        // the same channel id — nor its matchmaker, whose loss would silently
+        // split the two peers onto separate matchmakers and drop the whole
+        // channel to the relay after the broker timeout.
         self.registry
             .remove_if(&self.id, |_, pool| Arc::ptr_eq(pool, &self.pool));
-        self.udp_registry.remove(&self.id);
+        self.udp_registry.remove_if(&self.id, |_, matchmaker| {
+            Arc::ptr_eq(matchmaker, &self.matchmaker)
+        });
     }
 }
 
@@ -732,6 +740,48 @@ mod tests {
             waiter.await.expect("wait task").expect("wait result"),
             ProviderWait::TimedOut
         );
+    }
+
+    /// A provider teardown must not take a *newer* channel's UDP matchmaker with
+    /// it. Losing it does not corrupt anything, but the two peers then register
+    /// on separate matchmakers, never match, and the whole channel drops to the
+    /// relay after the broker timeout.
+    #[tokio::test]
+    async fn a_stale_provider_teardown_keeps_the_live_channel_state() {
+        let registry: Registry = Arc::new(DashMap::new());
+        let udp_registry: UdpRegistry = Arc::new(DashMap::new());
+        let id = "reused-channel";
+
+        let (stale_side, _stale_peer) = duplex(1024);
+        let (stale_opener, _stale_acceptor) = mux::server(stale_side);
+        let stale_pool = Arc::new(CarrierPool::new(stale_opener));
+        let stale_matchmaker = Arc::new(UdpMatchmaker::default());
+        registry.insert(id.to_string(), Arc::clone(&stale_pool));
+        udp_registry.insert(id.to_string(), Arc::clone(&stale_matchmaker));
+        let stale_guard = DropGuard {
+            registry: Arc::clone(&registry),
+            udp_registry: Arc::clone(&udp_registry),
+            id: id.to_string(),
+            pool: stale_pool,
+            matchmaker: stale_matchmaker,
+        };
+
+        // A new provider takes the same channel id over with its own state.
+        let (live_side, _live_peer) = duplex(1024);
+        let (live_opener, _live_acceptor) = mux::server(live_side);
+        let live_pool = Arc::new(CarrierPool::new(live_opener));
+        let live_matchmaker = Arc::new(UdpMatchmaker::default());
+        registry.insert(id.to_string(), Arc::clone(&live_pool));
+        udp_registry.insert(id.to_string(), Arc::clone(&live_matchmaker));
+
+        drop(stale_guard);
+
+        let pool = registry.get(id).expect("the live pool must survive");
+        assert!(Arc::ptr_eq(pool.value(), &live_pool));
+        let matchmaker = udp_registry
+            .get(id)
+            .expect("the live matchmaker must survive");
+        assert!(Arc::ptr_eq(matchmaker.value(), &live_matchmaker));
     }
 
     /// A relayed substream that never sends its readiness marker must release
