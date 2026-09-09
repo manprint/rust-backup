@@ -92,6 +92,31 @@ rb_assert_formal_verification() { # source-log destination-log
   fi
 }
 
+# Both peers must agree on the carrier count they actually used. Requesting
+# `--carriers 4` is not proof: negotiation legitimately downgrades (a module cap,
+# the peer's own channel), and a silent fallback to one carrier would let a
+# multi-carrier case pass while exercising a single stream. The session logs the
+# agreed count on both sides for exactly this reason.
+rb_assert_carriers() { # want source-log destination-log
+  local want=$1 log agreed
+  shift
+  for log in "$@"; do
+    # Anchored on the negotiation message, not on any `carriers=` in the log:
+    # a plan render or a future field of the same name must not be able to
+    # satisfy this assertion.
+    agreed=$(rb_strip_ansi <"$log" | grep 'negotiated data plane' | tail -n1 \
+      | grep -oE 'carriers=[0-9]+' | cut -d= -f2)
+    if [[ -z ${agreed:-} ]]; then
+      echo "FAIL: no negotiated carrier count logged: $log" >&2
+      return 1
+    fi
+    if [[ $agreed != "$want" ]]; then
+      echo "FAIL: negotiated carriers=$agreed, expected $want: $log" >&2
+      return 1
+    fi
+  done
+}
+
 # Validate a combined `run --config` log without relying on grep's locale,
 # binary-file heuristics, or one-event-per-line behaviour.  Parallel targets
 # may write their records in any order, so compare the multisets of formal

@@ -80,7 +80,7 @@ cd "$root"
 "$RB_E2E_BIN" server --bind-addr 127.0.0.1 --control-port 7840 >"$work/server.log" 2>&1 &
 server_pid=$!
 sleep 1
-"$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-e2e --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/source.log" 2>&1 &
+"$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-e2e --no-udp --carriers 4 --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --access-key minioadmin --secret-key minioadmin --path-style >"$work/source.log" 2>&1 &
 source_pid=$!
 sleep 1
 "$RB_E2E_BIN" s3 destination --to 127.0.0.1:7840 --channel minio-e2e --no-udp --yes --bucket destination --prefix out/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style -P create_bucket=true >"$work/destination.log" 2>&1 &
@@ -91,6 +91,11 @@ printf 'Source finished\n' >&2
 wait "$dst_pid"
 printf 'Destination finished\n' >&2
 rb_assert_formal_verification "$work/source.log" "$work/destination.log"
+# The source above deliberately asks for four carriers. S3 restores from one, and
+# the destination is what enforces that, so the negotiated count must come back as
+# 1: any other value means the per-module cap stopped being applied — and a
+# mismatch that deadlocked instead of downgrading would never reach this line.
+rb_assert_carriers 1 "$work/source.log" "$work/destination.log"
 after=$(mc ls --recursive --json src/source | sort)
 [[ "$before" == "$after" ]]
 mc diff --quiet src/source/in/ dst/destination/out/

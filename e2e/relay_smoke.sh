@@ -67,6 +67,11 @@ if (( FAIL == 0 )); then
      rb_assert_formal_verification "$work/source.log" "$work/destination.log"; then
     pass 'relay transfer completed with persisted read-back proof'
   else fail 'relay transfer or formal verification failed'; fi
+  # The filesystem module allows every requested carrier, so the run must have
+  # used the number this case asked for — not a silent fallback to one.
+  if rb_assert_carriers "$carriers" "$work/source.log" "$work/destination.log"; then
+    pass "both peers negotiated carriers=$carriers"
+  else fail "carrier negotiation did not reach carriers=$carriers"; fi
 fi
 
 if (( FAIL == 0 )) && [[ "$(rb_tree_digest "$src")" == "$(rb_tree_digest "$dst")" ]]; then

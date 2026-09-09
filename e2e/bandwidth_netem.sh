@@ -61,17 +61,23 @@ ip netns exec "$coord" env RUST_LOG=info "$RB_E2E_BIN" server --bind-addr 0.0.0.
 PIDS+=("$!")
 sleep .5
 
-run_case() { # label bytes max-rate-or-empty
-  local label=$1 bytes=$2 max_rate=$3 src="$work/$1-source" dst="$work/$1-destination"
-  mkdir -p "$src" "$dst"; rb_seed_filesystem_fixture "$src" "$bytes"
+run_case() { # label bytes max-rate-or-empty [carriers] [shared-source-dir]
+  local label=$1 bytes=$2 max_rate=$3
+  local case_carriers=${4:-$carriers}
+  local src=${5:-"$work/$1-source"} dst="$work/$1-destination"
+  mkdir -p "$src" "$dst"
+  # A shared source is seeded by its owner so two cases can compare like with
+  # like: the fixture payload is random, so re-seeding would give the two runs
+  # different bytes and make their digests incomparable by construction.
+  [[ -n "${5:-}" ]] || rb_seed_filesystem_fixture "$src" "$bytes"
   local before elapsed started spid dpid monitor max_rss=0 rc=0
   before=$(rb_tree_digest "$src"); started=$(date +%s)
   local rate_args=()
   [[ -n "$max_rate" ]] && rate_args=(--max-rate "$max_rate")
-  ip netns exec "$src_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "10.81.0.1:$port" --channel "$label" --no-udp --insecure --carriers "$carriers" "${rate_args[@]}" --root "$src" >"$work/$label-source.log" 2>&1 &
+  ip netns exec "$src_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "10.81.0.1:$port" --channel "$label" --no-udp --insecure --carriers "$case_carriers" "${rate_args[@]}" --root "$src" >"$work/$label-source.log" 2>&1 &
   spid=$!; PIDS+=("$spid")
   sleep .3
-  ip netns exec "$dst_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "10.82.0.1:$port" --channel "$label" --no-udp --insecure --carriers "$carriers" --yes --root "$dst" >"$work/$label-destination.log" 2>&1 &
+  ip netns exec "$dst_ns" env RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "10.82.0.1:$port" --channel "$label" --no-udp --insecure --carriers "$case_carriers" --yes --root "$dst" >"$work/$label-destination.log" 2>&1 &
   dpid=$!; PIDS+=("$dpid")
   ( while kill -0 "$spid" >/dev/null 2>&1; do awk '/VmRSS:/ {print $2}' "/proc/$spid/status" 2>/dev/null || true; sleep 1; done ) >"$work/$label-rss.log" &
   monitor=$!
@@ -84,9 +90,20 @@ run_case() { # label bytes max-rate-or-empty
   else
     fail "$label: transfer or formal verification"
   fi
+  # The filesystem module allows every requested carrier, so a case asking for
+  # four must be observed to have used four: a silent downgrade to one would
+  # turn the carrier comparison below into a comparison of one carrier with
+  # itself, which is exactly the shape of test that passes and proves nothing.
+  if rb_assert_carriers "$case_carriers" "$work/$label-source.log" \
+      "$work/$label-destination.log"; then
+    pass "$label: both peers negotiated carriers=$case_carriers"
+  else
+    fail "$label: carrier negotiation did not reach carriers=$case_carriers"
+  fi
   if (( max_rss <= RSS_LIMIT_KIB )); then pass "$label: source RSS ${max_rss} KiB <= ${RSS_LIMIT_KIB} KiB"; else fail "$label: source RSS ${max_rss} KiB exceeds cap"; fi
   CASE_ELAPSED=$elapsed
   CASE_BYTES=$bytes
+  CASE_DIGEST=$(rb_tree_digest "$dst")
 }
 
 run_case T-BW-NETEM "$PAYLOAD_BYTES" ''
@@ -99,6 +116,33 @@ run_case T-BW-MAX-RATE "$RATE_TEST_BYTES" 262144
 capped_elapsed=$CASE_ELAPSED; capped_bytes=$CASE_BYTES
 rate_minimum=$(( capped_bytes * 70 / 262144 / 100 ))
 if (( capped_elapsed >= rate_minimum )); then pass "T-BW-MAX-RATE: ${capped_elapsed}s visibly honors 256 KiB/s cap"; else fail "T-BW-MAX-RATE: ${capped_elapsed}s bypassed cap"; fi
+
+# F3.4: the multi-carrier proof. Deliberately NOT a speedup assertion — on a
+# shaped link the bottleneck is the link, so the claim is only that carriers do
+# not make it *slower* and that the restored tree is byte-identical either way.
+# Both runs read the same seeded source, because the fixture payload is random.
+CARRIER_PROOF_BYTES=${RUST_BACKUP_CARRIER_PROOF_BYTES:-$((24 * 1024 * 1024))}
+carrier_src="$work/carrier-proof-source"
+mkdir -p "$carrier_src"; rb_seed_filesystem_fixture "$carrier_src" "$CARRIER_PROOF_BYTES"
+
+run_case T-BW-CARRIERS-1 "$CARRIER_PROOF_BYTES" '' 1 "$carrier_src"
+one_elapsed=$CASE_ELAPSED; one_digest=$CASE_DIGEST
+run_case T-BW-CARRIERS-4 "$CARRIER_PROOF_BYTES" '' 4 "$carrier_src"
+four_elapsed=$CASE_ELAPSED; four_digest=$CASE_DIGEST
+
+if [[ "$one_digest" == "$four_digest" ]]; then
+  pass "T-BW-CARRIERS: one and four carriers restore an identical tree"
+else
+  fail 'T-BW-CARRIERS: four carriers restored a different tree than one carrier'
+fi
+# 30 % slack plus a second absorbs scheduler and qdisc burst noise; the number
+# itself is the deliverable and is recorded in docs/plans/V1_LIVE_RESULTS.md.
+carrier_ceiling=$(( one_elapsed * 130 / 100 + 1 ))
+if (( four_elapsed <= carrier_ceiling )); then
+  pass "T-BW-CARRIERS: 4 carriers ${four_elapsed}s vs 1 carrier ${one_elapsed}s (ratio $(( four_elapsed * 100 / (one_elapsed > 0 ? one_elapsed : 1) ))%), no regression"
+else
+  fail "T-BW-CARRIERS: 4 carriers ${four_elapsed}s regressed against 1 carrier ${one_elapsed}s"
+fi
 
 printf 'T-BW summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

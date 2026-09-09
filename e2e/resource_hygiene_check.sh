@@ -23,6 +23,11 @@ for script in e2e/postgres_matrix.sh e2e/mongodb_matrix.sh; do
   grep -Eq 'leaked container' "$script"
 done
 
+# The fault matrix starts its own postgres/mongodb/MinIO pairs.
+grep -Eq '^CONTAINERS=\(\)' e2e/fault_matrix.sh
+grep -Eq 'CONTAINERS\+=\("\$1"\)' e2e/fault_matrix.sh
+grep -Eq 'leaked container' e2e/fault_matrix.sh
+
 grep -Eq '^containers=\(\)' e2e/s3_minio_test.sh
 grep -Eq 'containers\+=\("\$1"\)' e2e/s3_minio_test.sh
 grep -Eq 'leaked container' e2e/s3_minio_test.sh
