@@ -19,6 +19,9 @@ cargo build --no-default-features
 echo "==> cargo test --all-features"
 cargo test --all-features
 
+echo "==> crate lint invariants"
+bash scripts/crate_invariants.sh
+
 echo "==> help/USAGE parity"
 bash scripts/help_parity.sh
 

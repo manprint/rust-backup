@@ -135,7 +135,6 @@ impl BackupModule for Module {
 
 /// PostgreSQL source (read-only).
 struct PostgresSource {
-    #[allow(dead_code)]
     params: PostgresParams,
 }
 
@@ -157,7 +156,6 @@ impl Source for PostgresSource {
 
 /// PostgreSQL destination (restore).
 struct PostgresDestination {
-    #[allow(dead_code)]
     params: PostgresParams,
 }
 

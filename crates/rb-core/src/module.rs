@@ -121,6 +121,7 @@ mod param_tests {
 
     #[derive(Debug, serde::Deserialize)]
     struct Params {
+        // Only the deserialization outcome is under test; the value is never read.
         #[allow(dead_code)]
         password: String,
     }
