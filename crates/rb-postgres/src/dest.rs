@@ -236,6 +236,7 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
         .collect();
 
     let mut actual = PgPlanPayload::default();
+    let mut destination_major = expected.server_major;
     for (index, expected_db) in expected.databases.iter().enumerate() {
         let mut scoped = params.clone();
         scoped.database = Some(expected_db.name.clone());
@@ -249,6 +250,7 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
                 )
             })?;
         if index == 0 {
+            destination_major = observed.server_major;
             actual.server_version = expected.server_version.clone();
             actual.server_major = expected.server_major;
             actual.roles = observed
@@ -281,6 +283,12 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
         actual.databases.push(database);
     }
 
+    let source_major = expected.server_major;
+    if destination_major != source_major {
+        restate_view_definitions(params, &mut expected, destination_major).await?;
+        strip_privileges_newer_than(&mut expected, source_major);
+        strip_privileges_newer_than(&mut actual, source_major);
+    }
     normalize_catalog(&mut expected);
     normalize_catalog(&mut actual);
     if actual != expected {
@@ -291,6 +299,154 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Privilege letters that exist only from the named PostgreSQL major onwards.
+/// `m` is `MAINTAIN`, added in PostgreSQL 17.
+const PRIVILEGE_SINCE: &[(char, u32)] = &[('m', 17)];
+
+/// Drop privilege letters the source major cannot express from every `aclitem`.
+///
+/// Granting on a newer destination materialises that server's *own* owner
+/// defaults, which legitimately include privileges the source cluster never had:
+/// a PostgreSQL 10 table owner holds `arwdDxt`, the same owner on 18 holds
+/// `arwdDxtm`. Restoring the source's grants is correct, and revoking the
+/// destination's native default from its owner would not be — so the comparison
+/// ignores letters that did not exist on the source.
+fn strip_privileges_newer_than(payload: &mut PgPlanPayload, source_major: u32) {
+    let dropped: Vec<char> = PRIVILEGE_SINCE
+        .iter()
+        .filter(|(_, since)| *since > source_major)
+        .map(|(letter, _)| *letter)
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+    let strip = |acl: &mut Vec<String>| {
+        for item in acl.iter_mut() {
+            *item = strip_privilege_letters(item, &dropped);
+        }
+    };
+    for database in &mut payload.databases {
+        strip(&mut database.acl);
+        for schema in &mut database.schemas {
+            strip(&mut schema.acl);
+            for table in &mut schema.tables {
+                strip(&mut table.acl);
+            }
+            for sequence in &mut schema.sequences {
+                strip(&mut sequence.acl);
+            }
+            for view in &mut schema.views {
+                strip(&mut view.acl);
+            }
+            for function in &mut schema.functions {
+                strip(&mut function.acl);
+            }
+        }
+    }
+}
+
+/// Remove `dropped` privilege letters (and any `*` grant-option marker that
+/// follows them) from one `grantee=privs/grantor` aclitem.
+fn strip_privilege_letters(item: &str, dropped: &[char]) -> String {
+    let Some((grantee, rest)) = item.split_once('=') else {
+        return item.to_string();
+    };
+    let (privs, grantor) = match rest.split_once('/') {
+        Some((privs, grantor)) => (privs, Some(grantor)),
+        None => (rest, None),
+    };
+    let letters: Vec<char> = privs.chars().collect();
+    let mut kept = String::with_capacity(privs.len());
+    let mut index = 0;
+    while index < letters.len() {
+        let letter = letters[index];
+        let grantable = letters.get(index + 1) == Some(&'*');
+        if !dropped.contains(&letter) {
+            kept.push(letter);
+            if grantable {
+                kept.push('*');
+            }
+        }
+        index += if grantable { 2 } else { 1 };
+    }
+    match grantor {
+        Some(grantor) => format!("{grantee}={kept}/{grantor}"),
+        None => format!("{grantee}={kept}"),
+    }
+}
+
+/// Re-render every expected view definition through the *destination's* own
+/// deparser, so a cross-major comparison is between two databases rather than
+/// between two versions of `pg_get_viewdef`.
+///
+/// `pg_get_viewdef` output is version-dependent — PostgreSQL 10 renders
+/// `SELECT * FROM app.zombies` as `SELECT zombies.id, zombies.email`, 12+ as
+/// `SELECT id, email` — so comparing the source's text with the destination's
+/// re-read text failed for *any* view on *any* cross-major restore, however
+/// faithful the restore was. The probe creates a temporary view (session-local,
+/// invisible to other sessions, gone at disconnect) from the source text and
+/// asks the destination to render that; the result is what the destination would
+/// report for a correctly restored view, and comparing it stays exact.
+///
+/// A definition the probe cannot handle keeps its original text, so the
+/// comparison still fails closed.
+async fn restate_view_definitions(
+    params: &PostgresParams,
+    expected: &mut PgPlanPayload,
+    destination_major: u32,
+) -> Result<()> {
+    for database in &mut expected.databases {
+        let has_views = database.schemas.iter().any(|s| !s.views.is_empty());
+        if !has_views {
+            continue;
+        }
+        let conn = PgConnection::connect(params, &database.name).await?;
+        for schema in &mut database.schemas {
+            for view in &mut schema.views {
+                match render_view_definition(&conn.client, &view.definition).await {
+                    Ok(rendered) => view.definition = rendered,
+                    Err(error) => tracing::warn!(
+                        view = %format!("{}.{}", view.schema, view.name),
+                        %error,
+                        destination_major,
+                        "could not re-render the view definition on the destination; \
+                         comparing the source text verbatim"
+                    ),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The destination's own rendering of `definition`, via a temporary view.
+async fn render_view_definition(client: &Client, definition: &str) -> Result<String> {
+    const PROBE: &str = "__rb_viewdef_probe";
+    let body = definition.trim_end();
+    let body = body.strip_suffix(';').unwrap_or(body);
+    client
+        .batch_execute(&format!("DROP VIEW IF EXISTS pg_temp.{PROBE}"))
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Verify, "drop view definition probe", e))?;
+    client
+        .batch_execute(&format!("CREATE TEMP VIEW {PROBE} AS {body}"))
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Verify, "create view definition probe", e))?;
+    let row = client
+        .query_one(
+            &format!("SELECT pg_catalog.pg_get_viewdef('pg_temp.{PROBE}'::regclass, true)::text"),
+            &[],
+        )
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Verify, "render view definition probe", e))?;
+    let rendered: String = row.get(0);
+    client
+        .batch_execute(&format!("DROP VIEW pg_temp.{PROBE}"))
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Verify, "drop view definition probe", e))?;
+    Ok(rendered)
 }
 
 fn first_catalog_difference(expected: &PgPlanPayload, actual: &PgPlanPayload) -> String {
@@ -434,9 +590,7 @@ async fn drop_database_for_overwrite(client: &Client, name: &str) -> Result<()> 
     let rows = match terminated {
         Ok(rows) => rows,
         Err(error) => {
-            let _ = client
-                .batch_execute(&alter_database_connections(name, true))
-                .await;
+            reallow_connections(client, name).await;
             return Err(BackupError::phase_src(
                 Phase::Apply,
                 format!("terminate sessions before overwriting database {name:?}"),
@@ -445,9 +599,7 @@ async fn drop_database_for_overwrite(client: &Client, name: &str) -> Result<()> 
         }
     };
     if rows.iter().any(|row| !row.get::<_, bool>(0)) {
-        let _ = client
-            .batch_execute(&alter_database_connections(name, true))
-            .await;
+        reallow_connections(client, name).await;
         return Err(BackupError::phase(
             Phase::Apply,
             format!("not permitted to terminate every session on database {name:?}"),
@@ -456,9 +608,7 @@ async fn drop_database_for_overwrite(client: &Client, name: &str) -> Result<()> 
 
     let drop_sql = drop_database_sql(name);
     if let Err(error) = client.batch_execute(&drop_sql).await {
-        let _ = client
-            .batch_execute(&alter_database_connections(name, true))
-            .await;
+        reallow_connections(client, name).await;
         return Err(BackupError::phase_src(
             Phase::Apply,
             format!("drop database {name:?} for overwrite"),
@@ -466,6 +616,26 @@ async fn drop_database_for_overwrite(client: &Client, name: &str) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Undo the connection block taken before an overwrite attempt that then
+/// failed. A failure *here* leaves a pre-existing production database that
+/// nobody can connect to, so it must be reported rather than dropped: the
+/// caller's error is about the overwrite, and said nothing about connections
+/// still being disabled.
+async fn reallow_connections(client: &Client, name: &str) {
+    if let Err(error) = client
+        .batch_execute(&alter_database_connections(name, true))
+        .await
+    {
+        tracing::error!(
+            database = %name,
+            %error,
+            "could not re-enable connections after a failed overwrite; the database is \
+             unreachable until an administrator runs \
+             ALTER DATABASE ... WITH ALLOW_CONNECTIONS = true"
+        );
+    }
 }
 
 /// Map `item.id` → its COPY descriptor (table-kind items only).
@@ -615,6 +785,7 @@ mod tests {
 
     fn params(database: Option<&str>) -> PostgresParams {
         PostgresParams {
+            allow_unsupported_objects: false,
             host: "localhost".into(),
             port: 5432,
             user: "postgres".into(),
@@ -717,6 +888,50 @@ mod tests {
             .any(|c| c.name == "privileges" && c.passed));
     }
 
+    /// PostgreSQL 17 added MAINTAIN, so a PostgreSQL 10 source's owner ACL
+    /// (`arwdDxt`) legitimately reads `arwdDxtm` once restored onto 18.
+    #[test]
+    fn privileges_newer_than_the_source_are_ignored_when_comparing() {
+        assert_eq!(
+            strip_privilege_letters("postgres=arwdDxtm/postgres", &['m']),
+            "postgres=arwdDxt/postgres"
+        );
+        // The grant-option marker travels with its letter.
+        assert_eq!(strip_privilege_letters("u=rm*w/o", &['m']), "u=rw/o");
+        assert_eq!(strip_privilege_letters("u=rm*w/o", &[]), "u=rm*w/o");
+        // PUBLIC has an empty grantee, and a missing grantor stays missing.
+        assert_eq!(strip_privilege_letters("=rm/o", &['m']), "=r/o");
+        assert_eq!(strip_privilege_letters("u=rm", &['m']), "u=r");
+        // Not an aclitem at all: left alone rather than mangled.
+        assert_eq!(strip_privilege_letters("nonsense", &['m']), "nonsense");
+
+        let mut payload = PgPlanPayload {
+            server_major: 10,
+            databases: vec![crate::model::PgDatabase {
+                acl: vec!["postgres=CTcm/postgres".to_string()],
+                schemas: vec![crate::model::PgSchema {
+                    tables: vec![crate::model::PgTable {
+                        acl: vec!["postgres=arwdDxtm/postgres".to_string()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        strip_privileges_newer_than(&mut payload, 10);
+        assert_eq!(payload.databases[0].acl, vec!["postgres=CTc/postgres"]);
+        assert_eq!(
+            payload.databases[0].schemas[0].tables[0].acl,
+            vec!["postgres=arwdDxt/postgres"]
+        );
+        // A source that already knows MAINTAIN keeps it.
+        let mut modern = payload.clone();
+        strip_privileges_newer_than(&mut modern, 17);
+        assert_eq!(modern.databases[0].acl, vec!["postgres=CTc/postgres"]);
+    }
+
     #[test]
     fn copy_in_sql_mirrors_copy_out() {
         let m = ItemMeta {
@@ -724,6 +939,7 @@ mod tests {
             schema: "app".into(),
             table: "accounts".into(),
             columns: vec!["id".into(), "email".into()],
+            only: false,
         };
         assert_eq!(
             copy_in_sql(&m),

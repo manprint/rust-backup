@@ -68,5 +68,37 @@ else
   fail 'live fault mutated source tree'
 fi
 
+# Documented exit codes (docs/QA_GUIDE.md): a caller scripting rust-backup
+# branches on them, so each class must actually reach the process status. They
+# used to be collapsed to 1 for every target of a parallel session.
+expect_exit() { # code description -- command...
+  local want="$1" description="$2"; shift 3
+  set +e
+  "$@" >"$work/exit.log" 2>&1
+  local got=$?
+  set -e
+  if (( got == want )); then
+    pass "exit code $want: $description"
+  else
+    fail "exit code for $description was $got, expected $want"
+    sed -n '1,10p' "$work/exit.log" >&2
+  fi
+}
+
+# 2 = configuration: an unknown module never reaches a transport.
+expect_exit 2 'unknown module' -- "$RB_E2E_BIN" nosuchmodule source --to 127.0.0.1:1 --channel x
+# 2 = configuration: a target without --to.
+expect_exit 2 'missing --to' -- "$RB_E2E_BIN" filesystem source --channel x --root "$src"
+# 3 = preflight: the filesystem destination refuses a root that is not empty.
+mkdir -p "$work/occupied" && : >"$work/occupied/pre-existing"
+expect_exit 3 'non-empty filesystem destination' -- \
+  "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" --channel exit-preflight \
+  --no-udp --insecure --yes --root "$work/occupied"
+# 7 = transport: nothing is listening on a closed port.
+closed=$(rb_free_port)
+expect_exit 7 'unreachable coordination server' -- \
+  "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$closed" --channel exit-transport \
+  --no-udp --insecure --root "$src"
+
 printf 'T-FAULT summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

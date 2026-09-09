@@ -10,6 +10,7 @@ use rb_postgres::{PgConnection, PostgresParams, MIN_PG_MAJOR};
 fn params_from_env() -> Option<PostgresParams> {
     let host = std::env::var("RUST_BACKUP_PG_HOST").ok()?;
     Some(PostgresParams {
+        allow_unsupported_objects: false,
         host,
         port: std::env::var("RUST_BACKUP_PG_PORT")
             .ok()

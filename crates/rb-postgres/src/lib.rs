@@ -69,6 +69,21 @@ pub struct PostgresParams {
     /// Without it, preflight fails when a target database is present.
     #[serde(default)]
     pub overwrite: bool,
+
+    /// Source-only: proceed even though the cluster holds object classes this
+    /// build cannot reproduce (triggers, row-level security policies,
+    /// user-defined types, aggregates, foreign tables, large objects, column
+    /// or default ACLs, view options, `reg*` column values).
+    ///
+    /// Analysis refuses such a cluster by default: the objects are absent from
+    /// the plan model, so the destination cannot restore them AND the catalog
+    /// read-back — which compares the same model on both sides — cannot see
+    /// their absence. The run would report a verified 1:1 copy of a cluster
+    /// that had silently lost, for instance, every RLS policy. Setting this
+    /// accepts a knowingly partial copy; the run then logs exactly what it
+    /// leaves behind.
+    #[serde(default)]
+    pub allow_unsupported_objects: bool,
 }
 
 fn default_pg_port() -> u16 {

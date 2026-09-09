@@ -56,16 +56,26 @@ start_pg() { # name port major -> starts container, waits ready
   echo "FAIL: $name not ready"; return 1
 }
 
-seed_source() { # container
-  docker exec -i "$1" psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+seed_source() { # container major
+  local container="$1" major="$2"
+  docker exec -i "$container" psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE app_owner LOGIN PASSWORD 'x';
 CREATE ROLE readers;
 GRANT readers TO app_owner;
+-- Role/database GUC values travel inside the plan and are applied by the
+-- destination administrator through the simple query protocol, which executes
+-- every ';'-separated statement in the string. Any unprivileged user can put
+-- arbitrary text in their own custom (placeholder) GUC, so the value below must
+-- survive as data and never as a second statement. `5min` additionally used to
+-- be emitted unquoted, which is a syntax error that aborted the restore.
+ALTER ROLE app_owner SET "myapp.k" = '1; ALTER ROLE app_owner SUPERUSER';
+ALTER ROLE app_owner SET statement_timeout = '5min';
 -- Deliberately differs from the UTF8 template1 in the official image. Restore
 -- must select template0 automatically or CREATE DATABASE is rejected before
 -- any schema/data is applied.
 CREATE DATABASE appdb OWNER app_owner TEMPLATE template0
   ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C';
+ALTER DATABASE appdb SET work_mem = '4MB';
 \connect appdb
 CREATE SCHEMA app AUTHORIZATION app_owner;
 CREATE TABLE app.accounts (
@@ -82,7 +92,102 @@ CREATE INDEX orders_acct_idx ON app.orders (acct);
 INSERT INTO app.accounts (email) SELECT 'u'||g||'@x' FROM generate_series(1,500) g;
 INSERT INTO app.orders (acct, total)
   SELECT (random()*499)::int + 1, (random()*1000)::numeric(12,2) FROM generate_series(1,2000);
+
+-- Classic inheritance. The parent and the child both hold rows, and a plain
+-- SELECT on the parent expands into the child: a parent streamed without ONLY
+-- carries the child's rows too, and the child is its own item, so the
+-- destination ends up holding them twice.
+CREATE TABLE app.log (id int, msg text);
+CREATE TABLE app.log_2025 () INHERITS (app.log);
+INSERT INTO app.log SELECT g, 'parent-'||g FROM generate_series(1,10) g;
+INSERT INTO app.log_2025 SELECT g, 'child-'||g FROM generate_series(1,90) g;
+
+-- A sequence not owned by any column, a function reading it, and a column
+-- default calling that function: the default cannot be inlined in CREATE TABLE
+-- unless functions are created first.
+CREATE SEQUENCE app.code_seq;
+SELECT nextval('app.code_seq');
+CREATE FUNCTION app.next_code() RETURNS text LANGUAGE sql
+  AS $fn$ SELECT 'c'||nextval('app.code_seq') $fn$;
+CREATE TABLE app.doc (id int, code text DEFAULT app.next_code());
+INSERT INTO app.doc (id) SELECT g FROM generate_series(1,5) g;
+
+-- A function returning a table's row type: it must be created AFTER that table,
+-- which is the opposite dependency direction from the default above.
+CREATE FUNCTION app.all_accounts() RETURNS SETOF app.accounts LANGUAGE sql
+  AS $fn$ SELECT * FROM app.accounts $fn$;
+
+-- A view reading another view, named so that catalog (name) order is exactly
+-- the wrong creation order.
+CREATE VIEW app.zombies AS SELECT id, email FROM app.accounts WHERE status <> 'active';
+CREATE VIEW app.active AS SELECT * FROM app.zombies;
+
+-- A populated materialized view: its query must run only after the data load.
+CREATE MATERIALIZED VIEW app.account_totals AS
+  SELECT a.id, count(o.id) AS orders
+  FROM app.accounts a LEFT JOIN app.orders o ON o.acct = a.id
+  GROUP BY a.id;
+CREATE UNIQUE INDEX account_totals_id_idx ON app.account_totals (id);
 SQL
+  # Partitioned tables exist on 10, but a primary key or an index on the
+  # partitioned parent needs 11+.
+  if (( major >= 11 )); then
+    docker exec -i "$container" psql -U postgres -v ON_ERROR_STOP=1 -d appdb <<'SQL'
+-- A partitioned parent whose PK and index cascade to every partition: the
+-- partitions' own catalog rows must not be re-emitted (duplicate primary key /
+-- relation already exists), and the parent's index stays invalid until each
+-- child index is attached to it.
+CREATE TABLE app.events (id bigint, ts date NOT NULL, PRIMARY KEY (id, ts))
+  PARTITION BY RANGE (ts);
+CREATE TABLE app.events_2026 PARTITION OF app.events
+  FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+CREATE TABLE app.events_2027 PARTITION OF app.events
+  FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');
+CREATE INDEX events_ts_idx ON app.events (ts);
+INSERT INTO app.events SELECT g, '2026-03-04'::date FROM generate_series(1,50) g;
+INSERT INTO app.events SELECT g, '2027-03-04'::date FROM generate_series(51,120) g;
+SQL
+  fi
+}
+
+# Restored state that the per-table checksums and the schema dump cannot see:
+# inheritance scope, materialized view contents, view-on-view, sequence values
+# and the validity of a partitioned parent's index.
+# `major` is the SOURCE major for both containers: it decides which fixture
+# objects exist, so a cross-major case must probe the same set on both sides.
+fidelity_probe() { # container db major
+  local container="$1" database="$2" major="$3"
+  docker exec "$container" psql -U postgres -d "$database" -At -F'|' -c "
+    SELECT 'inherit-only', (SELECT count(*)::text FROM ONLY app.log)
+    UNION ALL SELECT 'inherit-all', (SELECT count(*)::text FROM app.log)
+    UNION ALL SELECT 'inherit-child', (SELECT count(*)::text FROM app.log_2025)
+    UNION ALL SELECT 'matview-rows', (SELECT count(*)::text FROM app.account_totals)
+    UNION ALL SELECT 'matview-sum', (SELECT coalesce(sum(orders),0)::text FROM app.account_totals)
+    UNION ALL SELECT 'view-on-view', (SELECT count(*)::text FROM app.active)
+    UNION ALL SELECT 'doc-codes', (SELECT count(DISTINCT code)::text FROM app.doc)
+    ORDER BY 1"
+  docker exec "$container" psql -U postgres -d "$database" -At -F'|' -c "
+    SELECT 'sequence:'||sequencename, coalesce(last_value::text, 'never-called')
+    FROM pg_sequences WHERE schemaname = 'app' ORDER BY 1"
+  docker exec "$container" psql -U postgres -d "$database" -At -F'|' -c "
+    SELECT 'index:'||ic.relname, i.indisvalid::text
+    FROM pg_index i
+    JOIN pg_class ic ON ic.oid = i.indexrelid
+    JOIN pg_namespace n ON n.oid = ic.relnamespace
+    WHERE n.nspname = 'app' ORDER BY 1"
+  # A view's body is deparsed differently by different majors, so its shape is
+  # what a cross-major comparison can assert: the columns it exposes.
+  docker exec "$container" psql -U postgres -d "$database" -At -F'|' -c "
+    SELECT 'viewcol:'||c.relname||'.'||a.attname,
+           pg_catalog.format_type(a.atttypid, a.atttypmod)
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    WHERE n.nspname = 'app' AND c.relkind IN ('v', 'm') ORDER BY 1"
+  if (( major >= 11 )); then
+    docker exec "$container" psql -U postgres -d "$database" -At -F'|' -c "
+      SELECT 'partitioned-rows', count(*)::text FROM app.events"
+  fi
 }
 
 # Per-table data checksum (order-independent within a table).
@@ -98,9 +203,27 @@ data_checksum() { # container db
     done
 }
 
-schema_dump() { # container db
+schema_dump() { # container db [strip-view-bodies]
   docker exec "$1" pg_dump -U postgres -d "$2" --schema-only --no-owner --no-privileges \
-    | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict |^CREATE EXTENSION IF NOT EXISTS plpgsql |^COMMENT ON EXTENSION plpgsql '
+    | grep -vE '^--|^$|^SET |^SELECT pg_catalog|^\\(un)?restrict |^CREATE EXTENSION IF NOT EXISTS plpgsql |^COMMENT ON EXTENSION plpgsql ' \
+    | if [[ "${3:-}" == "strip-view-bodies" ]]; then strip_view_bodies; else cat; fi
+}
+
+# `pg_get_viewdef` — and hence pg_dump — renders the same view differently
+# across majors: PostgreSQL 10 writes `SELECT accounts.id`, 12+ writes
+# `SELECT id`. Each side of a cross-major case is dumped by its own pg_dump, so
+# the bodies cannot be compared textually; the view columns are compared instead
+# (see fidelity_probe), and the header line still proves the view exists.
+strip_view_bodies() {
+  awk '
+    /^CREATE (OR REPLACE )?(MATERIALIZED )?VIEW / {
+      print
+      if ($0 !~ /;[[:space:]]*$/) { inview = 1 }
+      next
+    }
+    inview { if ($0 ~ /;[[:space:]]*$/) { inview = 0 } ; next }
+    { print }
+  '
 }
 
 # Immutable database properties, with catalog columns normalized across 10..18.
@@ -178,7 +301,7 @@ for CASE in "${CASES[@]}"; do
 
   start_pg "$SRC" "$SRC_PORT" "$SOURCE_MAJOR"
   start_pg "$DST" "$DST_PORT" "$DESTINATION_MAJOR"
-  seed_source "$SRC"
+  seed_source "$SRC" "$SOURCE_MAJOR"
 
   # Source fingerprint before any transfer (external immutability baseline).
   fp_before=$(data_checksum "$SRC" appdb)
@@ -215,7 +338,10 @@ for CASE in "${CASES[@]}"; do
   fi
 
   # 5) Destination schema matches source.
-  if diff <(schema_dump "$SRC" appdb) <(schema_dump "$DST" appdb) >/tmp/rb-schema.diff; then
+  SCHEMA_MODE=""
+  if (( SOURCE_MAJOR != DESTINATION_MAJOR )); then SCHEMA_MODE="strip-view-bodies"; fi
+  if diff <(schema_dump "$SRC" appdb "$SCHEMA_MODE") \
+          <(schema_dump "$DST" appdb "$SCHEMA_MODE") >/tmp/rb-schema.diff; then
     echo "PASS: destination schema matches source"; PASS=$((PASS+1))
   else
     echo "FAIL: schema differs (see /tmp/rb-schema.diff)"; FAIL=$((FAIL+1))
@@ -233,7 +359,82 @@ for CASE in "${CASES[@]}"; do
     FAIL=$((FAIL+1))
   fi
 
-  # 7) Regression: the typed --overwrite flag must pass preflight, disconnect
+  # 7) Fidelity of the state that checksums and the schema dump cannot see.
+  if diff <(fidelity_probe "$SRC" appdb "$SOURCE_MAJOR") \
+          <(fidelity_probe "$DST" appdb "$SOURCE_MAJOR") >/tmp/rb-fidelity.diff; then
+    echo "PASS: inheritance scope, matview contents, sequence values and index validity match"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL: restored state differs (see /tmp/rb-fidelity.diff)"; FAIL=$((FAIL+1))
+    cat /tmp/rb-fidelity.diff
+  fi
+
+  # 8) A partitioned parent's index must be valid, not left ON ONLY.
+  if (( SOURCE_MAJOR >= 11 )); then
+    valid=$(docker exec "$DST" psql -U postgres -d appdb -At -c \
+      "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = 'events_ts_idx'")
+    if [[ "$valid" == "t" ]]; then
+      echo "PASS: the partitioned parent's index is valid"; PASS=$((PASS+1))
+    else
+      echo "FAIL: events_ts_idx on the restored parent is invalid (indisvalid=${valid:-missing})"
+      FAIL=$((FAIL+1))
+    fi
+  fi
+
+  # 9) A read-only source role must not be able to silently produce a plan whose
+  # sequence values are all unreadable: `pg_sequences.last_value` is NULL both
+  # for "never called" and for "no privilege", and taking the second for the
+  # first reset every restored sequence to its start value.
+  docker exec -i "$SRC" psql -U postgres -d appdb -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE ROLE backup_ro LOGIN PASSWORD 'ro';
+GRANT CONNECT ON DATABASE appdb TO backup_ro;
+GRANT USAGE ON SCHEMA app TO backup_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA app TO backup_ro;
+SQL
+  plan_ro() {
+    "$BIN" plan postgres --host 127.0.0.1 --port "$SRC_PORT"       --user backup_ro --password ro --database appdb --sslmode disable
+  }
+  if plan_ro >/tmp/rb-plan-ro.log 2>&1; then
+    echo "FAIL: a source role without sequence privileges produced a plan anyway"
+    FAIL=$((FAIL+1))
+  elif grep -q "cannot read the current value of sequence" /tmp/rb-plan-ro.log; then
+    echo "PASS: an unreadable sequence value is refused, naming the missing grant"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL: plan failed for the wrong reason (see /tmp/rb-plan-ro.log)"; FAIL=$((FAIL+1))
+    tail -5 /tmp/rb-plan-ro.log
+  fi
+  docker exec "$SRC" psql -U postgres -d appdb -v ON_ERROR_STOP=1 >/dev/null -c \
+    "GRANT SELECT ON ALL SEQUENCES IN SCHEMA app TO backup_ro"
+  if plan_ro >/tmp/rb-plan-ro2.log 2>&1; then
+    echo "PASS: the same role plans successfully once sequences are readable"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL: a read-only role with sequence SELECT still cannot plan"; FAIL=$((FAIL+1))
+    tail -5 /tmp/rb-plan-ro2.log
+  fi
+
+  # 10) Role and database settings must round-trip as data, never as SQL.
+  role_settings() { # container
+    docker exec "$1" psql -U postgres -At -F'|' -c \
+      "SELECT rolname, rolsuper::text, array_to_string(rolconfig, '@@')
+         FROM pg_roles WHERE rolname = 'app_owner'"
+    docker exec "$1" psql -U postgres -At -c \
+      "SELECT array_to_string(s.setconfig, '@@')
+         FROM pg_db_role_setting s JOIN pg_database d ON d.oid = s.setdatabase
+        WHERE d.datname = 'appdb' AND s.setrole = 0"
+  }
+  if [[ "$(role_settings "$SRC")" == "$(role_settings "$DST")" ]] && \
+     [[ "$(docker exec "$DST" psql -U postgres -At -c \
+            "SELECT rolsuper FROM pg_roles WHERE rolname='app_owner'")" == "f" ]]; then
+    echo "PASS: role/database settings round-trip without executing as SQL"; PASS=$((PASS+1))
+  else
+    echo "FAIL: role/database settings differ or were executed"; FAIL=$((FAIL+1))
+    diff <(role_settings "$SRC") <(role_settings "$DST") || true
+  fi
+
+  # 11) Regression: the typed --overwrite flag must pass preflight, disconnect
   # users, drop the existing database and restore it from scratch.
   docker exec "$DST" psql -U postgres -d appdb -v ON_ERROR_STOP=1 -c \
     "INSERT INTO app.accounts (email) VALUES ('destination-only@x')" >/dev/null

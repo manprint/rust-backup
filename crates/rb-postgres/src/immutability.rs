@@ -50,13 +50,24 @@ pub async fn fingerprint(params: &PostgresParams) -> Result<String> {
     let mut tables = Vec::new();
     for db in &payload.databases {
         let conn = PgConnection::connect_read_only(params, &db.name).await?;
+        // Classic inheritance children hold their own rows and are counted as
+        // their own tables, so the parent is measured with `ONLY` — exactly the
+        // scope its plan item streams.
+        let inheritance_parents: std::collections::HashSet<&str> = db
+            .schemas
+            .iter()
+            .flat_map(|s| s.tables.iter())
+            .flat_map(|t| t.inherits.iter().map(|p| p.as_str()))
+            .collect();
         for schema in &db.schemas {
             for t in &schema.tables {
                 // Child partitions are covered by the parent's COUNT/checksum.
                 if t.partition_of.is_some() {
                     continue;
                 }
-                let stat = table_stat(&conn.client, &db.name, &t.schema, &t.name).await?;
+                let qual = format!("{}.{}", t.schema, t.name);
+                let only = t.kind != "p" && inheritance_parents.contains(qual.as_str());
+                let stat = table_stat(&conn.client, &db.name, &t.schema, &t.name, only).await?;
                 tables.push(stat);
             }
         }
@@ -105,11 +116,22 @@ fn hash_catalog(p: &PgPlanPayload) -> String {
 }
 
 /// Exact `COUNT(*)` plus a complete streaming checksum for one table.
-async fn table_stat(client: &Client, db: &str, schema: &str, table: &str) -> Result<TableStat> {
+async fn table_stat(
+    client: &Client,
+    db: &str,
+    schema: &str,
+    table: &str,
+    only: bool,
+) -> Result<TableStat> {
     let qual = quote_qualified(schema, table);
+    let scope = if only {
+        format!("ONLY {qual}")
+    } else {
+        qual.clone()
+    };
 
     let count_row = client
-        .query_one(&format!("SELECT count(*)::int8 FROM {qual}"), &[])
+        .query_one(&format!("SELECT count(*)::int8 FROM {scope}"), &[])
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {qual}"), e))?;
     let rows: i64 = count_row.get(0);
@@ -117,7 +139,7 @@ async fn table_stat(client: &Client, db: &str, schema: &str, table: &str) -> Res
     // Stream hashes of all rows instead of aggregating them in server memory.
     // Sorting by row text is order-independent and duplicate rows remain visible.
     let copy_sql = format!(
-        "COPY (SELECT md5(t::text) FROM {qual} t ORDER BY t::text COLLATE \"C\") TO STDOUT"
+        "COPY (SELECT md5(t::text) FROM {scope} t ORDER BY t::text COLLATE \"C\") TO STDOUT"
     );
     let stream = client
         .copy_out(&copy_sql)

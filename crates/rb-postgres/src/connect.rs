@@ -65,11 +65,26 @@ impl PgConnection {
         if let Some(pw) = &params.password {
             cfg.password(pw);
         }
+        // Pin every GUC that changes how a value is *rendered* as text. The
+        // source streams rows ordered by `ROW(cols)::text` and the destination
+        // read-back re-runs that same query on the restored data, so the two
+        // agree only if both sessions render identically. They did not: PG 10
+        // defaults `extra_float_digits` to 0 (which prints
+        // 1.0000000000000002 and 1.0000000000000004 both as `1`, tying the sort
+        // key) while PG 12+ defaults to 1, and a differing `TimeZone` reorders
+        // timestamps across a DST fold — reporting a byte-perfect restore as
+        // corrupt. The same pins make the source fingerprint's `md5(t::text)`
+        // stable.
+        let mut options = String::from(
+            "-c extra_float_digits=3 -c DateStyle=ISO,MDY -c IntervalStyle=postgres \
+             -c TimeZone=UTC -c bytea_output=hex -c lc_monetary=C",
+        );
         if read_only {
             // Startup option: every transaction in this session is read-only, so
             // an accidental write fails at the server (defensive I-IMMUT).
-            cfg.options("-c default_transaction_read_only=on");
+            options.push_str(" -c default_transaction_read_only=on");
         }
+        cfg.options(&options);
 
         let client = connect_client(&mut cfg, params, database).await?;
 

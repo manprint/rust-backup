@@ -107,6 +107,12 @@ pub struct PgDatabase {
     pub comment: Option<String>,
     /// Database-level config (`ALTER DATABASE … SET …`).
     pub config: Vec<String>,
+    /// Raw `datacl` aclitem strings. A database's default ACL grants `CONNECT`
+    /// and `TEMPORARY` to `PUBLIC`, so an empty list here means "the template
+    /// default" and a non-empty one is restored by revoking those defaults
+    /// first. Missing in plans produced before this field existed.
+    #[serde(default)]
+    pub acl: Vec<String>,
     pub extensions: Vec<PgExtension>,
     pub schemas: Vec<PgSchema>,
 }
@@ -157,6 +163,12 @@ pub struct PgTable {
     pub partition_key: Option<String>,
     /// Set when this table is itself a partition.
     pub partition_of: Option<PgPartitionOf>,
+    /// Schema-qualified parents of *classic* (`INHERITS`) inheritance, which is
+    /// a different relationship from partitioning: an inheritance child keeps
+    /// its own rows, and a plain `SELECT` on the parent expands into it. Empty
+    /// for the overwhelmingly common non-inheriting table.
+    #[serde(default)]
+    pub inherits: Vec<String>,
     /// `reltuples` estimate (may be `-1`/stale; refined for progress).
     pub estimated_rows: i64,
     /// `pg_total_relation_size` estimate in bytes.
@@ -173,7 +185,7 @@ pub struct PgPartitionOf {
 }
 
 /// A table column.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PgColumn {
     pub name: String,
     pub ordinal: i32,
@@ -188,7 +200,36 @@ pub struct PgColumn {
     pub generated: Option<String>,
     /// Non-default collation name, if any.
     pub collation: Option<String>,
+    /// `attislocal`: defined on this table rather than only inherited from a
+    /// parent. An inheritance child's `CREATE TABLE` must list *only* its local
+    /// columns — re-listing an inherited one merges it but marks it local, which
+    /// is a different catalog state from the source's.
+    #[serde(default = "yes")]
+    pub local: bool,
     pub comment: Option<String>,
+}
+
+/// `serde` default for [`PgColumn::local`]: a plan produced before the field
+/// existed can only have come from tables whose columns were all local.
+fn yes() -> bool {
+    true
+}
+
+impl Default for PgColumn {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ordinal: 0,
+            type_name: String::new(),
+            not_null: false,
+            default: None,
+            identity: None,
+            generated: None,
+            collation: None,
+            local: true,
+            comment: None,
+        }
+    }
 }
 
 /// A table constraint (`pg_get_constraintdef`-rendered).
@@ -214,6 +255,11 @@ pub struct PgIndex {
     /// Backs a constraint — created by the constraint, so DDL skips a separate
     /// `CREATE INDEX`.
     pub is_constraint: bool,
+    /// Schema-qualified parent index this one is a partition of. A partitioned
+    /// table's index is rendered by `pg_get_indexdef` as `ON ONLY parent`, so it
+    /// stays *invalid* until every child index is attached to it.
+    #[serde(default)]
+    pub attach_to: Option<String>,
     pub comment: Option<String>,
 }
 
@@ -249,6 +295,16 @@ pub struct PgView {
     /// `pg_get_viewdef(oid, true)` — the SELECT body.
     pub definition: String,
     pub materialized: bool,
+    /// Indexes on a materialized view (an ordinary view cannot carry any). A
+    /// unique index here is real restored state, and `REFRESH … CONCURRENTLY`
+    /// requires one.
+    #[serde(default)]
+    pub indexes: Vec<PgIndex>,
+    /// Schema-qualified views/materialized views this one reads. Restore order
+    /// follows these edges: catalog name order does not (`app.active` selecting
+    /// from `app.zombies` sorts first and would fail to resolve).
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     pub acl: Vec<String>,
     pub comment: Option<String>,
 }
@@ -322,6 +378,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                 is_template: false,
                 comment: Some("the app db".to_string()),
                 config: vec!["statement_timeout=0".to_string()],
+                acl: vec![],
                 extensions: vec![PgExtension {
                     name: "pgcrypto".to_string(),
                     version: "1.3".to_string(),
@@ -348,6 +405,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                                 identity: Some("a".to_string()),
                                 generated: None,
                                 collation: None,
+                                local: true,
                                 comment: Some("pk".to_string()),
                             },
                             PgColumn {
@@ -359,6 +417,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                                 identity: None,
                                 generated: None,
                                 collation: Some("C".to_string()),
+                                local: true,
                                 comment: None,
                             },
                         ],
@@ -376,6 +435,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                             is_primary: false,
                             is_unique: true,
                             is_constraint: false,
+                            attach_to: None,
                             comment: None,
                         }],
                         acl: vec!["app_owner=arwdDxt/app_owner".to_string()],
@@ -384,6 +444,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                         tablespace: None,
                         partition_key: None,
                         partition_of: None,
+                        inherits: vec![],
                         estimated_rows: 1000,
                         estimated_bytes: 81920,
                     }],
@@ -410,6 +471,8 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                         owner: "app_owner".to_string(),
                         definition: "SELECT id, email FROM app.accounts;".to_string(),
                         materialized: false,
+                        indexes: vec![],
+                        depends_on: vec![],
                         acl: vec![],
                         comment: None,
                     }],

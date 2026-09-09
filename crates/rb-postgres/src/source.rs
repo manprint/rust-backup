@@ -32,6 +32,13 @@ pub(crate) struct ItemMeta {
     pub(crate) table: String,
     #[serde(default)]
     pub(crate) columns: Vec<String>,
+    /// Read with `FROM ONLY`, set for a table that has classic inheritance
+    /// children. A plain `SELECT` on such a parent expands into its children,
+    /// so the parent's item would carry their rows as well — and, since an
+    /// inheritance child is its own item too, the destination received every
+    /// child row twice.
+    #[serde(default)]
+    pub(crate) only: bool,
 }
 
 /// Stream every data-bearing item of `plan` into `sink`. Does NOT close the sink
@@ -90,12 +97,15 @@ fn copy_out_sql(meta: &ItemMeta) -> String {
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
+        // `ONLY` for an inheritance parent; never for a partitioned one, whose
+        // rows live entirely in its partitions.
+        let only = if meta.only { "ONLY " } else { "" };
         // Heap order is not a database contract. Sort by the C-collated record
         // representation so source streaming and destination read-back produce
         // the same commitment independently of physical row placement. Equal
         // rows have equal COPY bytes, so duplicate ordering is irrelevant.
         format!(
-            "COPY (SELECT {cols} FROM {qual} ORDER BY (ROW({cols})::text) COLLATE \"C\") TO STDOUT (FORMAT binary)"
+            "COPY (SELECT {cols} FROM {only}{qual} ORDER BY (ROW({cols})::text) COLLATE \"C\") TO STDOUT (FORMAT binary)"
         )
     }
 }
@@ -175,6 +185,7 @@ mod tests {
             schema: "app".into(),
             table: "accounts".into(),
             columns: vec!["id".into(), "email".into()],
+            only: false,
         };
         assert_eq!(
             copy_out_sql(&m),
@@ -187,6 +198,23 @@ mod tests {
         assert_eq!(
             copy_out_sql(&m2),
             "COPY \"app\".\"accounts\" TO STDOUT (FORMAT binary)"
+        );
+    }
+
+    /// An inheritance parent must be read with `ONLY`: a plain `SELECT` on it
+    /// expands into its children, whose rows are already their own items.
+    #[test]
+    fn an_inheritance_parent_is_read_with_only() {
+        let m = ItemMeta {
+            database: "d".into(),
+            schema: "app".into(),
+            table: "log".into(),
+            columns: vec!["id".into()],
+            only: true,
+        };
+        assert_eq!(
+            copy_out_sql(&m),
+            "COPY (SELECT \"id\" FROM ONLY \"app\".\"log\" ORDER BY (ROW(\"id\")::text) COLLATE \"C\") TO STDOUT (FORMAT binary)"
         );
     }
 

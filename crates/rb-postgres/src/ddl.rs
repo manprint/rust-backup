@@ -17,6 +17,8 @@
 //! role/database GUC settings and ACL→GRANT rendering for uncommon privilege
 //! letters. Roles are created without passwords (not captured — see `model`).
 
+use std::collections::{HashMap, HashSet};
+
 use crate::model::*;
 use rb_core::error::{BackupError, Phase, Result};
 
@@ -106,13 +108,16 @@ pub fn create_role(r: &PgRole) -> String {
     )
 }
 
-/// `ALTER ROLE … SET k TO v;` for each role GUC (best-effort: splits on first `=`).
-pub fn alter_role_settings(r: &PgRole) -> Vec<String> {
+/// `ALTER ROLE … SET k TO v;` for each role GUC.
+pub fn alter_role_settings(r: &PgRole) -> Result<Vec<String>> {
     r.config
         .iter()
         .map(|kv| {
-            let (k, v) = split_setting(kv);
-            format!("ALTER ROLE {} SET {} TO {};", quote_ident(&r.name), k, v)
+            Ok(format!(
+                "ALTER ROLE {} SET {};",
+                quote_ident(&r.name),
+                set_clause(kv)?
+            ))
         })
         .collect()
 }
@@ -256,18 +261,16 @@ pub fn create_database(d: &PgDatabase, destination_major: u32) -> Result<String>
     Ok(s)
 }
 
-/// `ALTER DATABASE … SET k TO v;` for each database GUC (best-effort).
-pub fn alter_database_settings(d: &PgDatabase) -> Vec<String> {
+/// `ALTER DATABASE … SET k TO v;` for each database GUC.
+pub fn alter_database_settings(d: &PgDatabase) -> Result<Vec<String>> {
     d.config
         .iter()
         .map(|kv| {
-            let (k, v) = split_setting(kv);
-            format!(
-                "ALTER DATABASE {} SET {} TO {};",
+            Ok(format!(
+                "ALTER DATABASE {} SET {};",
                 quote_ident(&d.name),
-                k,
-                v
-            )
+                set_clause(kv)?
+            ))
         })
         .collect()
 }
@@ -320,13 +323,39 @@ pub fn create_table(t: &PgTable) -> String {
             p.bound
         )
     } else {
-        let cols: Vec<String> = t.columns.iter().map(column_clause).collect();
-        format!(
-            "CREATE {unlogged}TABLE {qual} (\n  {}\n)",
-            cols.join(",\n  ")
-        )
+        // An inheritance child lists only its own columns: re-listing an
+        // inherited one merges it but marks it local, which is a different
+        // catalog state from the source's.
+        let cols: Vec<String> = t
+            .columns
+            .iter()
+            .filter(|c| c.local || t.inherits.is_empty())
+            .map(column_clause)
+            .collect();
+        if cols.is_empty() {
+            // Every column comes from a parent.
+            format!("CREATE {unlogged}TABLE {qual} ()")
+        } else {
+            format!(
+                "CREATE {unlogged}TABLE {qual} (\n  {}\n)",
+                cols.join(",\n  ")
+            )
+        }
     };
 
+    // Classic `INHERITS` is not partitioning: the child keeps its own rows and
+    // a plain `SELECT` on the parent expands into it. Without this clause the
+    // two tables restore unrelated, and because the parent's own `COPY` had
+    // already streamed the child's rows (see `copy_out_sql`), the destination
+    // ended up holding every child row twice.
+    if !t.inherits.is_empty() {
+        let parents: Vec<String> = t
+            .inherits
+            .iter()
+            .map(|p| quote_qualified_dotted(p))
+            .collect();
+        s.push_str(&format!(" INHERITS ({})", parents.join(", ")));
+    }
     if let Some(pk) = &t.partition_key {
         s.push_str(&format!(" PARTITION BY {pk}"));
     }
@@ -341,6 +370,12 @@ pub fn create_table(t: &PgTable) -> String {
 }
 
 /// One column definition for a `CREATE TABLE` list.
+///
+/// Deliberately carries neither `DEFAULT` nor the identity clause: a default may
+/// call a user function, and a function may return a table's row type, so
+/// inlining either creates a dependency cycle that no fixed table/function
+/// order can satisfy. Both are attached afterwards by [`set_column_default`] and
+/// [`add_identity`], which is also how `pg_dump` breaks that cycle.
 fn column_clause(c: &PgColumn) -> String {
     let mut s = format!("{} {}", quote_ident(&c.name), c.type_name);
     if let Some(coll) = &c.collation {
@@ -348,16 +383,63 @@ fn column_clause(c: &PgColumn) -> String {
     }
     if let Some(expr) = &c.generated {
         s.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"));
-    } else if let Some(kind) = &c.identity {
-        let when = if kind == "a" { "ALWAYS" } else { "BY DEFAULT" };
-        s.push_str(&format!(" GENERATED {when} AS IDENTITY"));
-    } else if let Some(def) = &c.default {
-        s.push_str(&format!(" DEFAULT {def}"));
     }
     if c.not_null {
         s.push_str(" NOT NULL");
     }
     s
+}
+
+/// `ALTER TABLE … ALTER COLUMN … SET DEFAULT …;` — emitted after functions
+/// exist, since a default expression may call one.
+pub fn set_column_default(t: &PgTable, c: &PgColumn) -> Option<String> {
+    let def = c.default.as_ref()?;
+    if c.generated.is_some() || c.identity.is_some() {
+        return None;
+    }
+    Some(format!(
+        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {def};",
+        quote_qualified(&t.schema, &t.name),
+        quote_ident(&c.name)
+    ))
+}
+
+/// `ALTER TABLE … ALTER COLUMN … ADD GENERATED … AS IDENTITY (…);`
+///
+/// `seq` is the plan's sequence for this column, when present. Naming it
+/// explicitly matters: PostgreSQL would otherwise invent `<table>_<column>_seq`,
+/// which is *not* the source name once the table has been renamed — and the
+/// `setval` in post_data, which targets the source name, then failed the restore
+/// outright. The sequence parameters are part of the identity generator's
+/// semantics, so they travel with it rather than being lost.
+pub fn add_identity(t: &PgTable, c: &PgColumn, seq: Option<&PgSequence>) -> Option<String> {
+    let kind = c.identity.as_ref()?;
+    let when = if kind == "a" { "ALWAYS" } else { "BY DEFAULT" };
+    let mut options = Vec::new();
+    if let Some(seq) = seq {
+        options.push(format!(
+            "SEQUENCE NAME {}",
+            quote_qualified(&seq.schema, &seq.name)
+        ));
+        options.push(format!("START WITH {}", seq.start));
+        options.push(format!("INCREMENT BY {}", seq.increment));
+        options.push(format!("MINVALUE {}", seq.min_value));
+        options.push(format!("MAXVALUE {}", seq.max_value));
+        options.push(format!("CACHE {}", seq.cache));
+        if seq.cycle {
+            options.push("CYCLE".to_string());
+        }
+    }
+    let clause = if options.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", options.join(" "))
+    };
+    Some(format!(
+        "ALTER TABLE {} ALTER COLUMN {} ADD GENERATED {when} AS IDENTITY{clause};",
+        quote_qualified(&t.schema, &t.name),
+        quote_ident(&c.name)
+    ))
 }
 
 /// `ALTER TABLE … ADD CONSTRAINT … <def>;` (def from `pg_get_constraintdef`).
@@ -426,17 +508,82 @@ pub fn sequence_setval(s: &PgSequence) -> Option<String> {
 }
 
 /// `CREATE [MATERIALIZED] VIEW … AS …;` (definition from `pg_get_viewdef`).
+///
+/// A materialized view is created `WITH NO DATA` and populated by
+/// [`refresh_view`] in post_data. Creating it with data ran its query in
+/// pre_data — against tables that had not been loaded yet — so every
+/// materialized view restored empty, and nothing noticed: the model carries no
+/// content for it and the per-item digests cover table items only.
 pub fn create_view(v: &PgView) -> String {
     let kind = if v.materialized {
         "MATERIALIZED VIEW"
     } else {
         "VIEW"
     };
-    format!(
-        "CREATE {kind} {} AS {}",
-        quote_qualified(&v.schema, &v.name),
-        v.definition.trim_end()
-    )
+    let body = v.definition.trim_end();
+    if v.materialized {
+        let body = body.strip_suffix(';').unwrap_or(body);
+        format!(
+            "CREATE {kind} {} AS {body} WITH NO DATA;",
+            quote_qualified(&v.schema, &v.name)
+        )
+    } else {
+        format!(
+            "CREATE {kind} {} AS {body}",
+            quote_qualified(&v.schema, &v.name)
+        )
+    }
+}
+
+/// `REFRESH MATERIALIZED VIEW …;` for a materialized view, `None` otherwise.
+pub fn refresh_view(v: &PgView) -> Option<String> {
+    v.materialized.then(|| {
+        format!(
+            "REFRESH MATERIALIZED VIEW {};",
+            quote_qualified(&v.schema, &v.name)
+        )
+    })
+}
+
+/// `ALTER INDEX <parent> ATTACH PARTITION <child>;`
+///
+/// `pg_get_indexdef` renders a partitioned table's index as `ON ONLY parent`,
+/// which leaves it **invalid** until every child index is attached — so the
+/// index silently does not serve queries.
+pub fn attach_index(t: &PgTable, i: &PgIndex) -> Option<String> {
+    if i.is_constraint {
+        // A constraint on the partitioned parent cascades to its partitions and
+        // attaches their indexes itself.
+        return None;
+    }
+    let parent = i.attach_to.as_ref()?;
+    Some(format!(
+        "ALTER INDEX {} ATTACH PARTITION {};",
+        quote_qualified_dotted(parent),
+        quote_qualified(&t.schema, &i.name)
+    ))
+}
+
+/// `REVOKE ALL … FROM PUBLIC` (and from the owner) before the object's `GRANT`s.
+///
+/// Object classes whose *default* ACL is non-empty — `FUNCTION` grants `EXECUTE`
+/// to `PUBLIC`, `DATABASE` grants `CONNECT`/`TEMPORARY` — cannot be restored by
+/// granting alone: the destination starts from the permissive default, so a
+/// source that had revoked it stayed open, and re-granting the owner's own
+/// entry materialised the defaults into the ACL, which then failed the catalog
+/// read-back. An empty `acl` means "never customised", where the destination
+/// default is already right.
+pub fn revoke_before_grant(objtype: &str, qual: &str, owner: &str, acl: &[String]) -> Vec<String> {
+    if acl.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        format!("REVOKE ALL ON {objtype} {qual} FROM PUBLIC;"),
+        format!(
+            "REVOKE ALL ON {objtype} {qual} FROM {};",
+            quote_ident(owner)
+        ),
+    ]
 }
 
 /// The function's `CREATE OR REPLACE FUNCTION …` from `pg_get_functiondef`,
@@ -520,7 +667,7 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
         roles.push(create_role(r));
     }
     for r in &payload.roles {
-        roles.extend(alter_role_settings(r));
+        roles.extend(alter_role_settings(r)?);
     }
     for m in &payload.memberships {
         roles.push(grant_membership(m));
@@ -532,14 +679,14 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
     let mut databases = Vec::new();
     for d in &payload.databases {
         databases.push(create_database(d, destination_major)?);
-        databases.extend(alter_database_settings(d));
+        databases.extend(alter_database_settings(d)?);
     }
 
     let per_database = payload
         .databases
         .iter()
         .map(|database| build_database_ddl(database, destination_major))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(ClusterDdl {
         roles,
@@ -548,9 +695,15 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
     })
 }
 
-fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
+fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<DatabaseDdl> {
     let mut pre = Vec::new();
     let mut post = Vec::new();
+
+    // pg_dump opens every dump with this. A `LANGUAGE sql`/`plpgsql` body is
+    // name-resolved at creation time by default, so without it a function
+    // reading a view or a table that does not exist yet fails, and no fixed
+    // emission order can satisfy every dependency direction at once.
+    pre.push("SET check_function_bodies = false;".to_string());
 
     for e in &d.extensions {
         pre.push(create_extension(e));
@@ -581,7 +734,13 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
     // PostgreSQL creates an owned sequence itself for every IDENTITY column. Do
     // not create a second sequence before the CREATE TABLE; retain post-data
     // setval/ownership work so the generated sequence receives source state.
-    let identity_owned: Vec<String> = d
+    let identity_sequences: HashMap<&str, &PgSequence> = d
+        .schemas
+        .iter()
+        .flat_map(|schema| schema.sequences.iter())
+        .filter_map(|seq| seq.owned_by.as_deref().map(|owned| (owned, seq)))
+        .collect();
+    let identity_owned: HashSet<String> = d
         .schemas
         .iter()
         .flat_map(|schema| {
@@ -617,18 +776,22 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
             if let Some(v) = sequence_setval(seq) {
                 post.push(v);
             }
-            if !is_identity_sequence {
-                if let Some(c) = &seq.comment {
-                    post.push(comment_on("SEQUENCE", &qual, c));
-                }
-                post.extend(grants_from_acl("SEQUENCE", &qual, &seq.acl));
+            // Comments and privileges apply to an identity sequence too — only
+            // its creation, ownership and column link are PostgreSQL's to
+            // manage. Skipping the grants made any cluster that had run
+            // `GRANT ... ON ALL SEQUENCES` unrestorable: the read-back saw the
+            // destination's empty ACL and failed the run.
+            if let Some(c) = &seq.comment {
+                post.push(comment_on("SEQUENCE", &qual, c));
             }
+            post.extend(grants_from_acl("SEQUENCE", &qual, &seq.acl));
         }
     }
 
-    // Tables: partition parents before children so PARTITION OF resolves.
-    let mut tables: Vec<&PgTable> = d.schemas.iter().flat_map(|s| s.tables.iter()).collect();
-    tables.sort_by_key(|t| t.partition_of.is_some());
+    // Tables: a parent — whether it is partitioned or classically inherited
+    // from — must exist before its children. A two-bucket sort left a partition
+    // that is itself partitioned ordered by name against its own child.
+    let tables: Vec<&PgTable> = topological_tables(d);
     for t in &tables {
         pre.push(create_table(t));
         let qual = quote_qualified(&t.schema, &t.name);
@@ -645,6 +808,54 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
         post.extend(grants_from_acl("TABLE", &qual, &t.acl));
     }
 
+    // Identity generators, named and parameterised exactly as on the source.
+    // Before the data load, because `COPY` supplies the column's values.
+    for t in &tables {
+        for col in &t.columns {
+            let key = format!("{}.{}.{}", t.schema, t.name, col.name);
+            if let Some(stmt) = add_identity(t, col, identity_sequences.get(key.as_str()).copied())
+            {
+                pre.push(stmt);
+            }
+        }
+    }
+
+    // Functions after tables (a function may return a table's row type) and
+    // column defaults after functions (a default may call one).
+    for sc in &d.schemas {
+        for f in &sc.functions {
+            pre.push(create_function(f));
+            // ownership/grants for functions use the FUNCTION form.
+            let fq = format!("{}({})", quote_qualified(&f.schema, &f.name), f.signature);
+            post.push(format!(
+                "ALTER FUNCTION {fq} OWNER TO {};",
+                quote_ident(&f.owner)
+            ));
+            post.extend(revoke_before_grant("FUNCTION", &fq, &f.owner, &f.acl));
+            post.extend(grants_from_acl("FUNCTION", &fq, &f.acl));
+        }
+    }
+    for t in &tables {
+        for col in &t.columns {
+            if let Some(stmt) = set_column_default(t, col) {
+                pre.push(stmt);
+            }
+        }
+    }
+
+    // Views in dependency order: a view selecting from another view must be
+    // created after it, which catalog name order does not guarantee.
+    let views: Vec<&PgView> = topological_views(d);
+    for v in &views {
+        pre.push(create_view(v));
+        let vq = quote_qualified(&v.schema, &v.name);
+        post.push(alter_table_owner(&v.schema, &v.name, &v.owner));
+        if let Some(c) = &v.comment {
+            post.push(comment_on("VIEW", &vq, c));
+        }
+        post.extend(grants_from_acl("TABLE", &vq, &v.acl));
+    }
+
     // Constraints: non-FK (PK/UNIQUE/CHECK/exclusion) before FK, so FK targets
     // already have the keys they reference.
     for t in &tables {
@@ -657,7 +868,8 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
             post.push(add_constraint(t, c));
         }
     }
-    // Indexes that don't back a constraint.
+    // Indexes that don't back a constraint, then the attachments that make a
+    // partitioned parent's index valid.
     for t in &tables {
         for i in &t.indexes {
             if let Some(stmt) = create_index(i) {
@@ -665,47 +877,188 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> DatabaseDdl {
             }
         }
     }
-
-    // Views + functions after tables (they may reference them).
-    for sc in &d.schemas {
-        for f in &sc.functions {
-            pre.push(create_function(f));
-            // ownership/grants for functions use the FUNCTION form.
-            let fq = format!("{}({})", quote_qualified(&f.schema, &f.name), f.signature);
-            post.push(format!(
-                "ALTER FUNCTION {fq} OWNER TO {};",
-                quote_ident(&f.owner)
-            ));
-            post.extend(grants_from_acl("FUNCTION", &fq, &f.acl));
-        }
-    }
-    for sc in &d.schemas {
-        for v in &sc.views {
-            pre.push(create_view(v));
-            let vq = quote_qualified(&v.schema, &v.name);
-            post.push(alter_table_owner(&v.schema, &v.name, &v.owner));
-            if let Some(c) = &v.comment {
-                post.push(comment_on("VIEW", &vq, c));
+    for t in &tables {
+        for i in &t.indexes {
+            if let Some(stmt) = attach_index(t, i) {
+                post.push(stmt);
             }
-            post.extend(grants_from_acl("TABLE", &vq, &v.acl));
         }
     }
 
-    DatabaseDdl {
+    // Materialized views are populated only now that the tables hold their
+    // rows, in the same dependency order, and their indexes follow.
+    for v in &views {
+        if let Some(stmt) = refresh_view(v) {
+            post.push(stmt);
+        }
+    }
+    for v in &views {
+        for i in &v.indexes {
+            if let Some(stmt) = create_index(i) {
+                post.push(stmt);
+            }
+        }
+    }
+
+    // The database's own ACL last: tightening `CONNECT` earlier could lock the
+    // restore (and the read-back that follows it) out of the database it is
+    // still working on.
+    let dq = quote_ident(&d.name);
+    post.extend(revoke_before_grant("DATABASE", &dq, &d.owner, &d.acl));
+    post.extend(grants_from_acl("DATABASE", &dq, &d.acl));
+
+    Ok(DatabaseDdl {
         name: d.name.clone(),
         pre_data: pre,
         post_data: post,
+    })
+}
+
+/// Order tables so every parent precedes its children, for both partitioning
+/// (`PARTITION OF`) and classic inheritance (`INHERITS`). Ties keep catalog
+/// order (schema, name), so the emitted DDL stays stable.
+fn topological_tables(d: &PgDatabase) -> Vec<&PgTable> {
+    let tables: Vec<&PgTable> = d.schemas.iter().flat_map(|s| s.tables.iter()).collect();
+    let parents_of = |t: &PgTable| -> Vec<String> {
+        let mut parents: Vec<String> = t.inherits.clone();
+        if let Some(p) = &t.partition_of {
+            parents.push(p.parent.clone());
+        }
+        parents
+    };
+    let keys: Vec<String> = tables
+        .iter()
+        .map(|t| format!("{}.{}", t.schema, t.name))
+        .collect();
+    let depths = relax_depths(
+        &keys,
+        &tables.iter().map(|t| parents_of(t)).collect::<Vec<_>>(),
+    );
+    let mut ordered: Vec<(usize, usize)> = depths.into_iter().zip(0..).collect();
+    ordered.sort_by_key(|(depth, index)| (*depth, *index));
+    ordered
+        .into_iter()
+        .map(|(_, index)| tables[index])
+        .collect()
+}
+
+/// Order views so every view precedes the ones that read it.
+fn topological_views(d: &PgDatabase) -> Vec<&PgView> {
+    let views: Vec<&PgView> = d.schemas.iter().flat_map(|s| s.views.iter()).collect();
+    let keys: Vec<String> = views
+        .iter()
+        .map(|v| format!("{}.{}", v.schema, v.name))
+        .collect();
+    let parents: Vec<Vec<String>> = views.iter().map(|v| v.depends_on.clone()).collect();
+    let depths = relax_depths(&keys, &parents);
+    let mut ordered: Vec<(usize, usize)> = depths.into_iter().zip(0..).collect();
+    ordered.sort_by_key(|(depth, index)| (*depth, *index));
+    ordered.into_iter().map(|(_, index)| views[index]).collect()
+}
+
+/// Longest-path depth of every node, given each node's parents by key.
+///
+/// Iterative relaxation rather than recursion: the input is a plan received over
+/// the wire, and recursing on it would let a deep (or, with a cycle, endless)
+/// hierarchy abort the process instead of returning. The pass count bounds it;
+/// a cycle — which the catalog cannot produce — simply stops improving.
+fn relax_depths(keys: &[String], parents: &[Vec<String>]) -> Vec<usize> {
+    let position: HashMap<&str, usize> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.as_str(), index))
+        .collect();
+    let mut depths = vec![0usize; keys.len()];
+    for _ in 0..keys.len() {
+        let mut changed = false;
+        for (index, node_parents) in parents.iter().enumerate() {
+            let want = node_parents
+                .iter()
+                .filter_map(|parent| position.get(parent.as_str()))
+                .map(|&parent| depths[parent] + 1)
+                .max()
+                .unwrap_or(0);
+            if want > depths[index] {
+                depths[index] = want;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
+    depths
 }
 
 // --- helpers -----------------------------------------------------------------
 
-/// Split a `name=value` GUC entry into `(name, value)`, best-effort. The value is
-/// returned as-is (already a valid SET value for most settings).
-fn split_setting(kv: &str) -> (String, String) {
-    match kv.split_once('=') {
-        Some((k, v)) => (k.to_string(), v.to_string()),
-        None => (kv.to_string(), "DEFAULT".to_string()),
+/// GUC names whose value is a *list* and therefore must be appended verbatim
+/// rather than as a string literal — pg_dump's `makeAlterConfigCommand` makes
+/// exactly this exception, because the stored form is already a comma-separated
+/// list of individually-quoted identifiers.
+const LIST_VALUED_GUCS: &[&str] = &["search_path", "datestyle"];
+
+/// Render one `name=value` GUC entry (from `pg_roles.rolconfig` /
+/// `pg_db_role_setting.setconfig`) as a `SET` clause: `name TO value`.
+///
+/// Both halves come from a plan the destination received over the wire, and the
+/// statement is executed through the simple query protocol, which runs every
+/// `;`-separated statement in the string. Interpolating them raw was a SQL
+/// injection: any unprivileged user on the source can put arbitrary text in
+/// their own role's custom (placeholder) GUC, e.g.
+/// `ALTER ROLE attacker SET "myapp.k" = '1; ALTER ROLE attacker SUPERUSER'`,
+/// and the destination — restoring as an administrator — would have executed
+/// the second statement. The same defect broke every ordinary value containing
+/// a space (`statement_timeout=5min` → `SET statement_timeout TO 5min` → syntax
+/// error, aborting the restore).
+fn set_clause(kv: &str) -> Result<String> {
+    let (name, value) = match kv.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (kv, None),
+    };
+    if !is_guc_name(name) {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!("refusing to apply a setting with a non-identifier name: {name:?}"),
+        ));
+    }
+    let Some(value) = value else {
+        return Ok(format!("{name} TO DEFAULT"));
+    };
+    if LIST_VALUED_GUCS
+        .iter()
+        .any(|guc| guc.eq_ignore_ascii_case(name))
+    {
+        // The catalog quotes list elements that need it, so a `;` cannot occur
+        // in a well-formed value. Refuse rather than append one verbatim.
+        if value.contains(';') {
+            return Err(BackupError::phase(
+                Phase::Apply,
+                format!("refusing a list-valued setting {name} containing a semicolon"),
+            ));
+        }
+        Ok(format!("{name} TO {value}"))
+    } else {
+        Ok(format!("{name} TO {}", quote_literal(value)))
+    }
+}
+
+/// Whether `name` is a plain GUC name — `word` or `word.word`, ASCII letters,
+/// digits and underscores, not starting with a digit.
+fn is_guc_name(name: &str) -> bool {
+    fn part(p: &str) -> bool {
+        let mut chars = p.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        (first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut parts = name.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(one), None, _) => part(one),
+        (Some(one), Some(two), None) => part(one) && part(two),
+        _ => false,
     }
 }
 
@@ -788,7 +1141,7 @@ mod tests {
              INHERIT NOREPLICATION NOBYPASSRLS VALID UNTIL '2030-01-01 00:00:00+00';"
         );
         assert_eq!(
-            alter_role_settings(&r),
+            alter_role_settings(&r).expect("role settings"),
             vec!["ALTER ROLE \"app_owner\" SET search_path TO app, public;"]
         );
     }
@@ -830,8 +1183,8 @@ mod tests {
              LC_CTYPE = 'en_US.utf8';"
         );
         assert_eq!(
-            alter_database_settings(&d),
-            vec!["ALTER DATABASE \"appdb\" SET statement_timeout TO 0;"]
+            alter_database_settings(&d).expect("database settings"),
+            vec!["ALTER DATABASE \"appdb\" SET statement_timeout TO '0';"]
         );
     }
 
@@ -964,13 +1317,312 @@ mod tests {
             ..Default::default()
         };
         let sql = create_table(&t);
+        // Neither the default nor the identity clause is inline: both would
+        // pin the table's creation to an order that user functions and
+        // table-returning functions cannot both satisfy.
         assert_eq!(
             sql,
             "CREATE TABLE \"app\".\"accounts\" (\n  \
-             \"id\" bigint GENERATED ALWAYS AS IDENTITY NOT NULL,\n  \
+             \"id\" bigint NOT NULL,\n  \
              \"email\" text COLLATE \"C\" NOT NULL,\n  \
-             \"status\" text DEFAULT 'active'::text NOT NULL\n) WITH (fillfactor=80);"
+             \"status\" text NOT NULL\n) WITH (fillfactor=80);"
         );
+        assert_eq!(
+            set_column_default(&t, &t.columns[2]).expect("default statement"),
+            "ALTER TABLE \"app\".\"accounts\" ALTER COLUMN \"status\" SET DEFAULT 'active'::text;"
+        );
+        assert_eq!(set_column_default(&t, &t.columns[1]), None);
+
+        // The identity generator names its sequence explicitly and carries the
+        // source parameters, so a renamed table's sequence keeps its name and
+        // the post_data setval finds it.
+        let seq = PgSequence {
+            schema: "app".into(),
+            name: "accounts_id_seq".into(),
+            data_type: "bigint".into(),
+            start: 1,
+            increment: 2,
+            min_value: 1,
+            max_value: 1_000_000,
+            cache: 20,
+            cycle: true,
+            owned_by: Some("app.accounts.id".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            add_identity(&t, &t.columns[0], Some(&seq)).expect("identity statement"),
+            "ALTER TABLE \"app\".\"accounts\" ALTER COLUMN \"id\" ADD GENERATED ALWAYS AS \
+             IDENTITY (SEQUENCE NAME \"app\".\"accounts_id_seq\" START WITH 1 INCREMENT BY 2 \
+             MINVALUE 1 MAXVALUE 1000000 CACHE 20 CYCLE);"
+        );
+        assert_eq!(add_identity(&t, &t.columns[1], None), None);
+    }
+
+    /// GUC values reach the destination inside a peer-supplied plan and are
+    /// executed through the simple query protocol, which runs every
+    /// `;`-separated statement in the string.
+    #[test]
+    fn role_and_database_settings_cannot_smuggle_a_second_statement() {
+        let attacker = PgRole {
+            name: "attacker".into(),
+            config: vec!["myapp.k=1; ALTER ROLE attacker SUPERUSER".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            alter_role_settings(&attacker).expect("quoted setting"),
+            vec![
+                "ALTER ROLE \"attacker\" SET myapp.k TO '1; ALTER ROLE attacker SUPERUSER';"
+                    .to_string()
+            ]
+        );
+
+        // An ordinary value containing a space used to be a syntax error that
+        // aborted the whole restore.
+        let app = PgRole {
+            name: "app".into(),
+            config: vec!["statement_timeout=5min".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            alter_role_settings(&app).expect("quoted setting"),
+            vec!["ALTER ROLE \"app\" SET statement_timeout TO '5min';".to_string()]
+        );
+
+        // A non-identifier GUC name is refused outright.
+        let bogus = PgRole {
+            name: "bogus".into(),
+            config: vec!["a b; DROP TABLE t=1".into()],
+            ..Default::default()
+        };
+        let error = alter_role_settings(&bogus).expect_err("bad name must be refused");
+        assert!(
+            format!("{error}").contains("non-identifier name"),
+            "{error}"
+        );
+
+        // A list-valued GUC is appended verbatim (pg_dump parity), so a
+        // semicolon inside one is refused instead.
+        let listy = PgDatabase {
+            name: "appdb".into(),
+            config: vec!["search_path=app; DROP TABLE t".into()],
+            ..Default::default()
+        };
+        let error = alter_database_settings(&listy).expect_err("semicolon must be refused");
+        assert!(format!("{error}").contains("semicolon"), "{error}");
+    }
+
+    #[test]
+    fn inheritance_is_emitted_and_lists_only_local_columns() {
+        let child = PgTable {
+            schema: "app".into(),
+            name: "log_2025".into(),
+            kind: "r".into(),
+            columns: vec![
+                PgColumn {
+                    name: "id".into(),
+                    type_name: "integer".into(),
+                    local: false,
+                    ..Default::default()
+                },
+                PgColumn {
+                    name: "note".into(),
+                    type_name: "text".into(),
+                    local: true,
+                    ..Default::default()
+                },
+            ],
+            inherits: vec!["app.log".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            create_table(&child),
+            "CREATE TABLE \"app\".\"log_2025\" (\n  \"note\" text\n) \
+             INHERITS (\"app\".\"log\");"
+        );
+
+        // A child with no columns of its own.
+        let plain = PgTable {
+            columns: vec![PgColumn {
+                name: "id".into(),
+                type_name: "integer".into(),
+                local: false,
+                ..Default::default()
+            }],
+            ..child.clone()
+        };
+        assert_eq!(
+            create_table(&plain),
+            "CREATE TABLE \"app\".\"log_2025\" () INHERITS (\"app\".\"log\");"
+        );
+
+        // Without inheritance, `local` is irrelevant: every column is emitted.
+        let ordinary = PgTable {
+            inherits: vec![],
+            ..child
+        };
+        assert_eq!(
+            create_table(&ordinary),
+            "CREATE TABLE \"app\".\"log_2025\" (\n  \"id\" integer,\n  \"note\" text\n);"
+        );
+    }
+
+    #[test]
+    fn a_materialized_view_is_created_empty_and_refreshed_after_the_data() {
+        let m = PgView {
+            schema: "app".into(),
+            name: "daily".into(),
+            owner: "app_owner".into(),
+            definition: " SELECT day, count(*) FROM app.events GROUP BY day;".into(),
+            materialized: true,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: None,
+        };
+        assert_eq!(
+            create_view(&m),
+            "CREATE MATERIALIZED VIEW \"app\".\"daily\" AS  SELECT day, count(*) \
+             FROM app.events GROUP BY day WITH NO DATA;"
+        );
+        assert_eq!(
+            refresh_view(&m).expect("refresh"),
+            "REFRESH MATERIALIZED VIEW \"app\".\"daily\";"
+        );
+        let v = PgView {
+            materialized: false,
+            ..m
+        };
+        assert_eq!(
+            create_view(&v),
+            "CREATE VIEW \"app\".\"daily\" AS  SELECT day, count(*) FROM app.events \
+             GROUP BY day;"
+        );
+        assert_eq!(refresh_view(&v), None);
+    }
+
+    #[test]
+    fn a_partitioned_parents_index_is_attached_by_its_children() {
+        let child = PgTable {
+            schema: "app".into(),
+            name: "events_2026".into(),
+            ..Default::default()
+        };
+        let index = PgIndex {
+            name: "events_2026_ts_idx".into(),
+            definition: "CREATE INDEX events_2026_ts_idx ON app.events_2026 USING btree (ts)"
+                .into(),
+            is_primary: false,
+            is_unique: false,
+            is_constraint: false,
+            attach_to: Some("app.events_ts_idx".into()),
+            comment: None,
+        };
+        assert_eq!(
+            attach_index(&child, &index).expect("attach"),
+            "ALTER INDEX \"app\".\"events_ts_idx\" ATTACH PARTITION \
+             \"app\".\"events_2026_ts_idx\";"
+        );
+        // A constraint's index is attached by the constraint itself.
+        let backed = PgIndex {
+            is_constraint: true,
+            ..index.clone()
+        };
+        assert_eq!(attach_index(&child, &backed), None);
+        // An ordinary index has nothing to attach to.
+        let plain = PgIndex {
+            attach_to: None,
+            ..index
+        };
+        assert_eq!(attach_index(&child, &plain), None);
+    }
+
+    #[test]
+    fn a_customised_acl_revokes_the_permissive_default_first() {
+        // An empty ACL means "never customised": the destination default is
+        // already correct and a REVOKE would diverge from the source.
+        assert!(revoke_before_grant("FUNCTION", "\"app\".\"f\"()", "app_owner", &[]).is_empty());
+        assert_eq!(
+            revoke_before_grant(
+                "FUNCTION",
+                "\"app\".\"f\"()",
+                "app_owner",
+                &["app_owner=X/app_owner".to_string()]
+            ),
+            vec![
+                "REVOKE ALL ON FUNCTION \"app\".\"f\"() FROM PUBLIC;".to_string(),
+                "REVOKE ALL ON FUNCTION \"app\".\"f\"() FROM \"app_owner\";".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_level_hierarchies_are_created_parents_first() {
+        let table = |name: &str, parent: Option<&str>, inherits: Vec<&str>| PgTable {
+            schema: "app".into(),
+            name: name.into(),
+            kind: "r".into(),
+            partition_of: parent.map(|p| PgPartitionOf {
+                parent: p.into(),
+                bound: "DEFAULT".into(),
+            }),
+            inherits: inherits.into_iter().map(String::from).collect(),
+            ..Default::default()
+        };
+        // Alphabetically `apple` < `north` < `sales`, i.e. exactly reversed.
+        let database = PgDatabase {
+            name: "appdb".into(),
+            schemas: vec![PgSchema {
+                name: "app".into(),
+                tables: vec![
+                    table("apple", Some("app.north"), vec![]),
+                    table("north", Some("app.sales"), vec![]),
+                    table("sales", None, vec![]),
+                    table("log_2025", None, vec!["app.log"]),
+                    table("log", None, vec![]),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let order: Vec<&str> = topological_tables(&database)
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["sales", "log", "north", "log_2025", "apple"],
+            "every parent must precede its children"
+        );
+    }
+
+    #[test]
+    fn views_are_created_in_dependency_order() {
+        let view = |name: &str, depends_on: Vec<&str>| PgView {
+            schema: "app".into(),
+            name: name.into(),
+            owner: "app_owner".into(),
+            definition: "SELECT 1;".into(),
+            materialized: false,
+            indexes: vec![],
+            depends_on: depends_on.into_iter().map(String::from).collect(),
+            acl: vec![],
+            comment: None,
+        };
+        let database = PgDatabase {
+            name: "appdb".into(),
+            schemas: vec![PgSchema {
+                name: "app".into(),
+                // `active` sorts first but reads `zombies`.
+                views: vec![view("active", vec!["app.zombies"]), view("zombies", vec![])],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let order: Vec<&str> = topological_views(&database)
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(order, vec!["zombies", "active"]);
     }
 
     #[test]
@@ -1048,6 +1700,7 @@ mod tests {
             is_primary: false,
             is_unique: true,
             is_constraint: false,
+            attach_to: None,
             comment: None,
         };
         assert_eq!(
@@ -1158,6 +1811,110 @@ mod tests {
         assert!(db.pre_data.iter().all(|s| !s.contains("ADD CONSTRAINT")));
         // setval is post-data.
         assert!(db.post_data.iter().any(|s| s.contains("pg_catalog.setval")));
+
+        // Function bodies are not name-resolved at creation.
+        assert_eq!(db.pre_data[0], "SET check_function_bodies = false;");
+
+        let position = |haystack: &[String], needle: &str| -> usize {
+            haystack
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("missing statement containing {needle:?}"))
+        };
+        // A default may call a user function, so defaults follow functions; the
+        // identity generator precedes the data load that fills its column.
+        let create_function = position(&db.pre_data, "CREATE OR REPLACE FUNCTION app.touch");
+        let add_identity = position(&db.pre_data, "ADD GENERATED ALWAYS AS IDENTITY");
+        let create_table = position(&db.pre_data, "CREATE TABLE \"app\".\"accounts\"");
+        assert!(create_table < add_identity, "identity needs its table");
+        assert!(
+            add_identity < create_function,
+            "identity is applied before the data load, functions come later"
+        );
+        assert!(db
+            .pre_data
+            .iter()
+            .any(|s| s.contains("SEQUENCE NAME \"app\".\"accounts_id_seq\"")));
+    }
+
+    /// PostgreSQL creates and owns an IDENTITY column's sequence, but its
+    /// privileges are still restorable state.
+    #[test]
+    fn an_identity_sequences_privileges_are_restored_but_not_its_creation() {
+        let mut payload = crate::model::test_fixture();
+        let sequence = &mut payload.databases[0].schemas[0].sequences[0];
+        assert_eq!(sequence.owned_by.as_deref(), Some("app.accounts.id"));
+        sequence.acl = vec![
+            "app_owner=rwU/app_owner".to_string(),
+            "readers=r/app_owner".to_string(),
+        ];
+        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        assert!(
+            db.pre_data
+                .iter()
+                .all(|s| !s.starts_with("CREATE SEQUENCE \"app\".\"accounts_id_seq\"")),
+            "the identity column creates its own sequence"
+        );
+        assert!(
+            db.post_data
+                .iter()
+                .all(|s| !s.contains("OWNED BY \"app\".\"accounts\".\"id\"")),
+            "the identity link is PostgreSQL's to manage"
+        );
+        let owner_grant = concat!(
+            "GRANT SELECT, UPDATE, USAGE ON SEQUENCE ",
+            "\"app\".\"accounts_id_seq\" TO \"app_owner\";"
+        );
+        assert!(db.post_data.iter().any(|s| s == owner_grant));
+        assert!(db
+            .post_data
+            .iter()
+            .any(|s| s.contains("TO \"readers\";") && s.contains("accounts_id_seq")));
+    }
+
+    #[test]
+    fn a_materialized_view_is_refreshed_in_post_data_after_its_tables() {
+        let mut payload = crate::model::test_fixture();
+        payload.databases[0].schemas[0].views.push(PgView {
+            schema: "app".into(),
+            name: "daily".into(),
+            owner: "app_owner".into(),
+            definition: "SELECT count(*) FROM app.accounts;".into(),
+            materialized: true,
+            indexes: vec![PgIndex {
+                name: "daily_idx".into(),
+                definition: "CREATE UNIQUE INDEX daily_idx ON app.daily USING btree (count)".into(),
+                is_primary: false,
+                is_unique: true,
+                is_constraint: false,
+                attach_to: None,
+                comment: None,
+            }],
+            depends_on: vec![],
+            acl: vec![],
+            comment: None,
+        });
+        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        assert!(
+            db.pre_data.iter().any(
+                |s| s.starts_with("CREATE MATERIALIZED VIEW \"app\".\"daily\"")
+                    && s.ends_with("WITH NO DATA;")
+            ),
+            "a materialized view must be created empty: pre_data runs before the data load"
+        );
+        let refresh = db
+            .post_data
+            .iter()
+            .position(|s| s == "REFRESH MATERIALIZED VIEW \"app\".\"daily\";")
+            .expect("refresh in post_data");
+        let index = db
+            .post_data
+            .iter()
+            .position(|s| s.contains("daily_idx"))
+            .expect("matview index in post_data");
+        assert!(refresh < index, "populate the matview before indexing it");
     }
 
     #[test]

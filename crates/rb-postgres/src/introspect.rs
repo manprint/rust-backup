@@ -20,7 +20,7 @@
 //! script `e2e/postgres_introspect.sh` (Docker) — it cannot run in a DB-less CI.
 //! The pure pieces (`build_plan`, `now_rfc3339`) have unit tests that always run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tokio_postgres::Client;
 
@@ -53,6 +53,8 @@ pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload
         let conn = PgConnection::connect_read_only(params, &db.name).await?;
         db.extensions = gather_extensions(&conn.client).await?;
         db.schemas = gather_schemas(&conn.client, server_major).await?;
+        let unsupported = find_unsupported_objects(&conn.client, &db.name, server_major).await?;
+        report_unsupported(unsupported, params.allow_unsupported_objects)?;
     }
 
     Ok(PgPlanPayload {
@@ -199,7 +201,8 @@ async fn gather_databases_meta(
                 ts.spcname::text, d.datconnlimit, d.datallowconn, d.datistemplate, \
                 pg_catalog.shobj_description(d.oid, 'pg_database')::text, \
                 (SELECT s.setconfig FROM pg_catalog.pg_db_role_setting s \
-                    WHERE s.setdatabase = d.oid AND s.setrole = 0) \
+                    WHERE s.setdatabase = d.oid AND s.setrole = 0), \
+                d.datacl::text[] \
          FROM pg_catalog.pg_database d \
          LEFT JOIN pg_catalog.pg_tablespace ts \
             ON ts.oid = d.dattablespace AND ts.spcname <> 'pg_default' \
@@ -228,6 +231,7 @@ async fn gather_databases_meta(
                 is_template: r.get(11),
                 comment: r.get(12),
                 config: r.get::<_, Option<Vec<String>>>(13).unwrap_or_default(),
+                acl: r.get::<_, Option<Vec<String>>>(14).unwrap_or_default(),
                 extensions: Vec::new(),
                 schemas: Vec::new(),
             })
@@ -307,7 +311,8 @@ async fn gather_schemas(client: &Client, major: u32) -> Result<Vec<PgSchema>> {
             schemas[i].sequences.push(seq);
         }
     }
-    for (schema_name, view) in gather_views(client).await? {
+    for (oid, schema_name, mut view) in gather_views(client).await? {
+        view.indexes = indexes.remove(&oid).unwrap_or_default();
         if let Some(&i) = index.get(&schema_name) {
             schemas[i].views.push(view);
         }
@@ -337,6 +342,13 @@ async fn gather_tables(client: &Client) -> Result<Vec<(i64, String, PgTable)>> {
                          THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid, true) END, \
                     CASE WHEN c.relispartition THEN ( \
                          SELECT (pn.nspname || '.' || pc.relname)::text \
+                         FROM pg_catalog.pg_inherits i \
+                         JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
+                         JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
+                         WHERE i.inhrelid = c.oid) END, \
+                    CASE WHEN NOT c.relispartition THEN ( \
+                         SELECT array_agg((pn.nspname || '.' || pc.relname)::text \
+                                          ORDER BY pn.nspname, pc.relname) \
                          FROM pg_catalog.pg_inherits i \
                          JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
                          JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
@@ -379,8 +391,9 @@ async fn gather_tables(client: &Client) -> Result<Vec<(i64, String, PgTable)>> {
                 tablespace: r.get(9),
                 partition_key: r.get(10),
                 partition_of,
-                estimated_rows: r.get(14),
-                estimated_bytes: r.get(15),
+                inherits: r.get::<_, Option<Vec<String>>>(14).unwrap_or_default(),
+                estimated_rows: r.get(15),
+                estimated_bytes: r.get(16),
             };
             (oid, schema, table)
         })
@@ -407,6 +420,7 @@ async fn gather_columns(client: &Client, major: u32) -> Result<HashMap<i64, Vec<
                 CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation \
                      THEN (SELECT co.collname::text FROM pg_catalog.pg_collation co \
                               WHERE co.oid = a.attcollation) END, \
+                a.attislocal, \
                 pg_catalog.col_description(a.attrelid, a.attnum)::text \
          FROM pg_catalog.pg_attribute a \
          JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
@@ -433,7 +447,8 @@ async fn gather_columns(client: &Client, major: u32) -> Result<HashMap<i64, Vec<
             identity: r.get(6),
             generated: r.get(7),
             collation: r.get(8),
-            comment: r.get(9),
+            local: r.get(9),
+            comment: r.get(10),
         });
     }
     Ok(map)
@@ -451,6 +466,7 @@ const CONSTRAINTS_QUERY: &str = "SELECT con.conrelid::int8, con.conname::text, c
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      WHERE c.relkind IN ('r', 'p') \
        AND con.contype IN ('p', 'u', 'f', 'c', 'x') \
+       AND con.conislocal \
        AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
      ORDER BY con.conrelid, con.conname";
 
@@ -478,13 +494,18 @@ async fn gather_indexes(client: &Client) -> Result<HashMap<i64, Vec<PgIndex>>> {
             "SELECT i.indrelid::int8, ic.relname::text, \
                     pg_catalog.pg_get_indexdef(i.indexrelid, 0, true)::text, \
                     i.indisprimary, i.indisunique, (con.oid IS NOT NULL), \
-                    pg_catalog.obj_description(i.indexrelid, 'pg_class')::text \
+                    pg_catalog.obj_description(i.indexrelid, 'pg_class')::text, \
+                    (SELECT (pin.nspname || '.' || pic.relname)::text \
+                     FROM pg_catalog.pg_inherits ii \
+                     JOIN pg_catalog.pg_class pic ON pic.oid = ii.inhparent \
+                     JOIN pg_catalog.pg_namespace pin ON pin.oid = pic.relnamespace \
+                     WHERE ii.inhrelid = i.indexrelid) \
              FROM pg_catalog.pg_index i \
              JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
              JOIN pg_catalog.pg_class c ON c.oid = i.indrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              LEFT JOIN pg_catalog.pg_constraint con ON con.conindid = i.indexrelid \
-             WHERE c.relkind IN ('r', 'p') \
+             WHERE c.relkind IN ('r', 'p', 'm') \
                AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
              ORDER BY i.indrelid, ic.relname",
             &[],
@@ -501,6 +522,7 @@ async fn gather_indexes(client: &Client) -> Result<HashMap<i64, Vec<PgIndex>>> {
             is_unique: r.get(4),
             is_constraint: r.get(5),
             comment: r.get(6),
+            attach_to: r.get(7),
         });
     }
     Ok(map)
@@ -523,7 +545,10 @@ async fn gather_sequences(client: &Client) -> Result<Vec<(String, PgSequence)>> 
                           ON da.attrelid = d.refobjid AND da.attnum = d.refobjsubid \
                         WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass \
                           AND d.refclassid = 'pg_class'::regclass \
-                          AND d.deptype IN ('a', 'i') AND d.refobjsubid > 0 LIMIT 1) \
+                          AND d.deptype IN ('a', 'i') AND d.refobjsubid > 0 LIMIT 1), \
+                    (pg_catalog.pg_has_role(c.relowner, 'USAGE') \
+                     OR pg_catalog.has_sequence_privilege(c.oid, 'SELECT,USAGE')), \
+                    pg_catalog.has_sequence_privilege(c.oid, 'SELECT') \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_catalog.pg_sequence s ON s.seqrelid = c.oid \
@@ -538,41 +563,85 @@ async fn gather_sequences(client: &Client) -> Result<Vec<(String, PgSequence)>> 
         )
         .await
         .map_err(|e| analyze_err("sequences", e))?;
-    Ok(rows
-        .iter()
-        .map(|r| {
-            let schema: String = r.get(0);
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let schema: String = r.get(0);
+        let name: String = r.get(1);
+        let mut seq = PgSequence {
+            schema: schema.clone(),
+            name: name.clone(),
+            owner: r.get(2),
+            data_type: r.get(3),
+            start: r.get(4),
+            increment: r.get(5),
+            min_value: r.get(6),
+            max_value: r.get(7),
+            cache: r.get(8),
+            cycle: r.get(9),
+            last_value: None,
+            is_called: false,
+            acl: r.get::<_, Option<Vec<String>>>(11).unwrap_or_default(),
+            comment: r.get(12),
+            owned_by: r.get(13),
+        };
+        let readable: bool = r.get(14);
+        let selectable: bool = r.get(15);
+        // `pg_sequences.last_value` is NULL both for a sequence that was never
+        // called AND for one this role may not read, and the recommended
+        // read-only source role holds no sequence privilege at all. Silently
+        // taking the second case for the first restored every sequence to its
+        // START value — and the destination read-back, equally unable to tell,
+        // agreed. Refuse instead of guessing.
+        if !readable {
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "cannot read the current value of sequence {schema}.{name}: the source role                      holds neither SELECT nor USAGE on it. Without it every restored sequence                      would silently reset to its start value. Grant it, e.g.                      `GRANT SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO <source role>;`"
+                ),
+            ));
+        }
+        if selectable {
+            // The sequence relation itself carries `is_called` separately from
+            // `last_value`, which `pg_sequences` folds into one nullable column:
+            // `setval(seq, 50, false)` is otherwise indistinguishable from a
+            // fresh sequence.
+            let qual = crate::ddl::quote_qualified(&schema, &name);
+            let row = client
+                .query_one(&format!("SELECT last_value, is_called FROM {qual}"), &[])
+                .await
+                .map_err(|e| analyze_err(&format!("sequence state {schema}.{name}"), e))?;
+            seq.last_value = Some(row.get(0));
+            seq.is_called = row.get(1);
+        } else {
             let last_value: Option<i64> = r.get(10);
-            let seq = PgSequence {
-                schema: schema.clone(),
-                name: r.get(1),
-                owner: r.get(2),
-                data_type: r.get(3),
-                start: r.get(4),
-                increment: r.get(5),
-                min_value: r.get(6),
-                max_value: r.get(7),
-                cache: r.get(8),
-                cycle: r.get(9),
-                is_called: last_value.is_some(),
-                last_value,
-                acl: r.get::<_, Option<Vec<String>>>(11).unwrap_or_default(),
-                comment: r.get(12),
-                owned_by: r.get(13),
-            };
-            (schema, seq)
-        })
-        .collect())
+            seq.is_called = last_value.is_some();
+            seq.last_value = last_value;
+        }
+        out.push((schema, seq));
+    }
+    Ok(out)
 }
 
-async fn gather_views(client: &Client) -> Result<Vec<(String, PgView)>> {
+/// Returns `(view_oid, schema_name, view)`; the oid attaches matview indexes.
+async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
     let rows = client
         .query(
             "SELECT n.nspname::text, c.relname::text, \
                     pg_catalog.pg_get_userbyid(c.relowner)::text, \
                     pg_catalog.pg_get_viewdef(c.oid, true)::text, \
                     (c.relkind = 'm'), c.relacl::text[], \
-                    pg_catalog.obj_description(c.oid, 'pg_class')::text \
+                    pg_catalog.obj_description(c.oid, 'pg_class')::text, \
+                    (SELECT array_agg(DISTINCT (sn.nspname || '.' || sc.relname)::text \
+                                      ORDER BY (sn.nspname || '.' || sc.relname)::text) \
+                     FROM pg_catalog.pg_depend dep \
+                     JOIN pg_catalog.pg_rewrite rw ON rw.oid = dep.objid \
+                     JOIN pg_catalog.pg_class sc ON sc.oid = dep.refobjid \
+                     JOIN pg_catalog.pg_namespace sn ON sn.oid = sc.relnamespace \
+                     WHERE dep.classid = 'pg_rewrite'::regclass \
+                       AND dep.refclassid = 'pg_class'::regclass \
+                       AND rw.ev_class = c.oid AND sc.oid <> c.oid \
+                       AND sc.relkind IN ('v', 'm')), \
+                    c.oid::int8 \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('v', 'm') \
@@ -594,10 +663,12 @@ async fn gather_views(client: &Client) -> Result<Vec<(String, PgView)>> {
                 owner: r.get(2),
                 definition: r.get(3),
                 materialized: r.get(4),
+                indexes: Vec::new(),
+                depends_on: r.get::<_, Option<Vec<String>>>(7).unwrap_or_default(),
                 acl: r.get::<_, Option<Vec<String>>>(5).unwrap_or_default(),
                 comment: r.get(6),
             };
-            (schema, view)
+            (r.get(8), schema, view)
         })
         .collect())
 }
@@ -646,6 +717,237 @@ async fn gather_functions(client: &Client, major: u32) -> Result<Vec<(String, Pg
         .collect())
 }
 
+/// One object class this build cannot reproduce, plus the offenders found.
+struct UnsupportedClass {
+    /// What the class is, phrased for an operator.
+    what: &'static str,
+    /// Up to [`MAX_REPORTED`] example names.
+    names: Vec<String>,
+    /// How many were found in total.
+    total: usize,
+}
+
+const MAX_REPORTED: usize = 5;
+
+/// Probe for object classes that are absent from [`PgPlanPayload`].
+///
+/// Anything not in the model is invisible to `verify_catalog`, which compares
+/// the source model against a re-introspection *through the same model* — so an
+/// unmodelled class is lost silently and then certified as a faithful copy.
+/// Each probe below is one `SELECT` over `pg_catalog`.
+async fn find_unsupported_objects(
+    client: &Client,
+    database: &str,
+    major: u32,
+) -> Result<Vec<UnsupportedClass>> {
+    // `(what, name expression, from/where clause)`. The name expression is
+    // `text`; the query is wrapped so every probe shares one code path.
+    let mut probes: Vec<(&'static str, &'static str)> = vec![
+        (
+            "triggers",
+            "SELECT (n.nspname || '.' || c.relname || '.' || t.tgname)::text \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE NOT t.tgisinternal \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "row-level security policies",
+            "SELECT (n.nspname || '.' || c.relname || '.' || p.polname)::text \
+             FROM pg_catalog.pg_policy p \
+             JOIN pg_catalog.pg_class c ON c.oid = p.polrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "tables with row-level security enabled",
+            "SELECT (n.nspname || '.' || c.relname)::text \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE (c.relrowsecurity OR c.relforcerowsecurity) \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "user-defined types (enum, domain, composite or range)",
+            "SELECT (n.nspname || '.' || t.typname)::text \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND (t.typtype IN ('e', 'd', 'r') \
+                    OR (t.typtype = 'c' AND EXISTS (SELECT 1 FROM pg_catalog.pg_class rc \
+                                                    WHERE rc.oid = t.typrelid \
+                                                      AND rc.relkind = 'c'))) \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.objid = t.oid AND d.deptype = 'e')",
+        ),
+        (
+            "aggregate or window functions",
+            "SELECT (n.nspname || '.' || p.proname)::text \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND p.prokind IN ('a', 'w') \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.objid = p.oid AND d.deptype = 'e')",
+        ),
+        (
+            "foreign tables",
+            "SELECT (n.nspname || '.' || c.relname)::text \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'f' \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "view options such as WITH CHECK OPTION or security_barrier",
+            "SELECT (n.nspname || '.' || c.relname)::text \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('v', 'm') AND c.reloptions IS NOT NULL \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "column-level privileges",
+            "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE a.attacl IS NOT NULL AND NOT a.attisdropped \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "default privileges (ALTER DEFAULT PRIVILEGES)",
+            "SELECT (COALESCE(n.nspname::text || '.', '') \
+                     || pg_catalog.pg_get_userbyid(da.defaclrole)::text \
+                     || ':' || da.defaclobjtype::text)::text \
+             FROM pg_catalog.pg_default_acl da \
+             LEFT JOIN pg_catalog.pg_namespace n ON n.oid = da.defaclnamespace",
+        ),
+        (
+            "inheritance children whose inherited column is locally NOT NULL",
+            "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE a.attnotnull AND NOT a.attislocal AND a.attnum > 0 \
+               AND NOT a.attisdropped AND NOT c.relispartition \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid) \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i \
+                               JOIN pg_catalog.pg_attribute pa \
+                                 ON pa.attrelid = i.inhparent AND pa.attname = a.attname \
+                               WHERE i.inhrelid = c.oid AND pa.attnotnull)",
+        ),
+        (
+            "large objects",
+            "SELECT lo.oid::text FROM pg_catalog.pg_largeobject_metadata lo",
+        ),
+        (
+            "user-defined collations",
+            "SELECT (n.nspname || '.' || co.collname)::text \
+             FROM pg_catalog.pg_collation co \
+             JOIN pg_catalog.pg_namespace n ON n.oid = co.collnamespace \
+             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.objid = co.oid AND d.deptype = 'e')",
+        ),
+        (
+            "rules other than a view's own _RETURN rule",
+            "SELECT (n.nspname || '.' || c.relname || '.' || r.rulename)::text \
+             FROM pg_catalog.pg_rewrite r \
+             JOIN pg_catalog.pg_class c ON c.oid = r.ev_class \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE r.rulename <> '_RETURN' \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+        ),
+        (
+            "reg* columns, whose binary COPY representation is a raw OID that \
+             names a different object on the destination",
+            "SELECT (n.nspname || '.' || c.relname || '.' || a.attname || ' ' || \
+                     pg_catalog.format_type(a.atttypid, a.atttypmod))::text \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND pg_catalog.format_type(a.atttypid, NULL) ~ \
+                   '^reg(class|proc|procedure|type|namespace|role|oper|operator|config|dictionary|collation)(\\[\\])?$'",
+        ),
+    ];
+    // `prokind` is PostgreSQL 11+; on 10 the same split lives in two booleans.
+    if major < 11 {
+        for probe in &mut probes {
+            if probe.0 == "aggregate or window functions" {
+                probe.1 = "SELECT (n.nspname || '.' || p.proname)::text \
+                           FROM pg_catalog.pg_proc p \
+                           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                           WHERE n.nspname <> 'information_schema' \
+                             AND left(n.nspname, 3) <> 'pg_' \
+                             AND (p.proisagg OR p.proiswindow) \
+                             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                                WHERE d.objid = p.oid AND d.deptype = 'e')";
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    for (what, sql) in probes {
+        let rows = client
+            .query(&format!("{sql} ORDER BY 1"), &[])
+            .await
+            .map_err(|e| analyze_err(&format!("probe {what} in {database}"), e))?;
+        if rows.is_empty() {
+            continue;
+        }
+        found.push(UnsupportedClass {
+            what,
+            names: rows
+                .iter()
+                .take(MAX_REPORTED)
+                .map(|r| r.get::<_, String>(0))
+                .collect(),
+            total: rows.len(),
+        });
+    }
+    Ok(found)
+}
+
+/// Turn the probe result into a refusal, or a loud warning when the operator has
+/// explicitly accepted a partial copy.
+fn report_unsupported(found: Vec<UnsupportedClass>, allowed: bool) -> Result<()> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    let detail = found
+        .iter()
+        .map(|class| {
+            let mut names = class.names.join(", ");
+            if class.total > class.names.len() {
+                names.push_str(&format!(" and {} more", class.total - class.names.len()));
+            }
+            format!("{} ({}): {names}", class.what, class.total)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if allowed {
+        tracing::warn!(
+            unsupported = %detail,
+            "allow_unsupported_objects is set: this backup is NOT a 1:1 copy"
+        );
+        return Ok(());
+    }
+    Err(BackupError::phase(
+        Phase::Analyze,
+        format!(
+            "this build cannot reproduce the following objects, and the catalog read-back \
+             cannot detect their absence either, so the run would report a verified copy of a \
+             cluster that had lost them: {detail}. Set allow_unsupported_objects=true to accept \
+             a knowingly partial copy."
+        ),
+    ))
+}
+
 // --- plan assembly (pure) ----------------------------------------------------
 
 /// Build a self-contained [`BackupPlan`] from the payload. One data-stream item
@@ -657,6 +959,19 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
     let mut total: u64 = 0;
     let mut table_count = 0usize;
     for db in &payload.databases {
+        let all: Vec<&PgTable> = db.schemas.iter().flat_map(|s| s.tables.iter()).collect();
+        // Every table that at least one other table classically inherits from.
+        let inheritance_parents: HashSet<&str> = all
+            .iter()
+            .flat_map(|t| t.inherits.iter().map(|p| p.as_str()))
+            .collect();
+        // Partition children by parent, to attribute their size to the parent.
+        let mut partitions: HashMap<&str, Vec<&PgTable>> = HashMap::new();
+        for t in &all {
+            if let Some(p) = &t.partition_of {
+                partitions.entry(p.parent.as_str()).or_default().push(t);
+            }
+        }
         for schema in &db.schemas {
             for table in &schema.tables {
                 table_count += 1;
@@ -671,7 +986,13 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                     .filter(|c| c.generated.is_none())
                     .map(|c| c.name.clone())
                     .collect();
+                let qual = format!("{}.{}", table.schema, table.name);
+                // `pg_total_relation_size` of a partitioned parent excludes its
+                // partitions, and the partitions are not items of their own, so
+                // a multi-terabyte partitioned table reported ~0 planned bytes
+                // and every progress percentage derived from it was fiction.
                 let bytes = table.estimated_bytes.max(0) as u64;
+                let bytes = bytes.saturating_add(partition_subtree_bytes(&qual, &partitions));
                 total = total.saturating_add(bytes);
                 let id = items.len() as u32;
                 items.push(PlanItem {
@@ -685,6 +1006,7 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                         "schema": table.schema,
                         "table": table.name,
                         "columns": cols,
+                        "only": table.kind != "p" && inheritance_parents.contains(qual.as_str()),
                     }),
                 });
             }
@@ -709,6 +1031,26 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
         integrity: IntegritySpec::default(),
         payload: serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
     }
+}
+
+/// Total on-disk size of a partitioned table's whole partition tree.
+///
+/// Iterative (a worklist, not recursion) and visit-once, so a deep hierarchy
+/// cannot exhaust the stack and a malformed cycle cannot loop forever.
+fn partition_subtree_bytes(root: &str, partitions: &HashMap<&str, Vec<&PgTable>>) -> u64 {
+    let mut total = 0u64;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue = vec![root.to_string()];
+    while let Some(parent) = queue.pop() {
+        if !seen.insert(parent.clone()) {
+            continue;
+        }
+        for child in partitions.get(parent.as_str()).into_iter().flatten() {
+            total = total.saturating_add(child.estimated_bytes.max(0) as u64);
+            queue.push(format!("{}.{}", child.schema, child.name));
+        }
+    }
+    total
 }
 
 /// Current UTC time as an RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`). Implemented
@@ -865,5 +1207,88 @@ mod tests {
         // accounts + events parent = 2 items; the child partition is skipped.
         let names: Vec<&str> = plan.items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["appdb.app.accounts", "appdb.app.events"]);
+        // The parent's own `pg_total_relation_size` is ~0 — its bytes live in
+        // its partitions, which are not items of their own.
+        let events = &plan.items[1];
+        assert_eq!(events.estimated_bytes, 4096);
+        assert_eq!(plan.estimated_bytes, 81_920 + 4096);
+        assert_eq!(
+            events.meta["only"], false,
+            "a partitioned parent must NOT be read with ONLY: all of its rows live in partitions"
+        );
+    }
+
+    /// A classic inheritance child is its own data item, so the parent must be
+    /// streamed with `ONLY` — otherwise the parent's item carries the child's
+    /// rows too and the destination ends up with them twice.
+    #[test]
+    fn an_inheritance_parent_is_planned_with_only() {
+        let mut payload = crate::model::test_fixture();
+        let schema = &mut payload.databases[0].schemas[0];
+        schema.tables.push(PgTable {
+            schema: "app".to_string(),
+            name: "log".to_string(),
+            kind: "r".to_string(),
+            estimated_bytes: 1024,
+            ..Default::default()
+        });
+        schema.tables.push(PgTable {
+            schema: "app".to_string(),
+            name: "log_2025".to_string(),
+            kind: "r".to_string(),
+            inherits: vec!["app.log".to_string()],
+            estimated_bytes: 2048,
+            ..Default::default()
+        });
+        let plan = build_plan(&payload, "x".to_string());
+        let names: Vec<&str> = plan.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["appdb.app.accounts", "appdb.app.log", "appdb.app.log_2025"],
+            "an inheritance child holds its own rows and is its own item"
+        );
+        assert_eq!(plan.items[1].meta["only"], true, "the parent reads ONLY");
+        assert_eq!(
+            plan.items[2].meta["only"], false,
+            "the child has no children of its own"
+        );
+        assert_eq!(plan.items[0].meta["only"], false);
+    }
+
+    /// Deep partition trees must all be attributed to the root item.
+    #[test]
+    fn nested_partition_sizes_roll_up_to_the_root_item() {
+        let table = |name: &str, parent: Option<&str>, kind: &str, bytes: i64| PgTable {
+            schema: "app".to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            partition_of: parent.map(|p| PgPartitionOf {
+                parent: p.to_string(),
+                bound: "DEFAULT".to_string(),
+            }),
+            estimated_bytes: bytes,
+            ..Default::default()
+        };
+        let payload = PgPlanPayload {
+            databases: vec![PgDatabase {
+                name: "appdb".to_string(),
+                schemas: vec![PgSchema {
+                    name: "app".to_string(),
+                    tables: vec![
+                        table("sales", None, "p", 0),
+                        table("north", Some("app.sales"), "p", 0),
+                        table("apple", Some("app.north"), "r", 700),
+                        table("south", Some("app.sales"), "r", 300),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = build_plan(&payload, "x".to_string());
+        assert_eq!(plan.items.len(), 1, "only the root is a data item");
+        assert_eq!(plan.items[0].estimated_bytes, 1000);
+        assert_eq!(plan.estimated_bytes, 1000);
     }
 }
