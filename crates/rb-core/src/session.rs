@@ -368,6 +368,14 @@ async fn source_run(
             "destination downgraded carrier count"
         );
     }
+    // I-OBSERV: state the negotiated data plane positively, not only when it is
+    // downgraded. Without this line no observer — an operator or an e2e case —
+    // can tell a four-carrier run from a run that silently fell back to one, so
+    // a multi-carrier test could pass while proving nothing.
+    info!(
+        carriers = agreed_carriers,
+        separate_data_streams, "negotiated data plane"
+    );
     info!("destination accepted plan; streaming payload");
 
     if separate_data_streams || agreed_carriers > 1 {
@@ -794,12 +802,31 @@ where
     )
     .await?;
     if !approved {
+        // That frame is the only way the source learns *why* it is stopping:
+        // with it, the source reports a plan rejection (exit 4); without it,
+        // an EOF, which is a transport failure (exit 7). Sending it is not
+        // enough — returning here ends the process while the frame may still
+        // be buffered in the relay, so the source intermittently saw EOF
+        // instead. Wait, bounded, for the peer to consume it and close, the
+        // same way an apply-time `Abort` waits for its ack.
+        let _ = tokio::time::timeout(
+            ABORT_ACK_TIMEOUT,
+            wire::recv_frame::<_, ControlFrame>(&mut stream),
+        )
+        .await;
+        let _ = stream.shutdown().await;
         return Err(if !preflight.ok {
             BackupError::Preflight(reason)
         } else {
             BackupError::PlanRejected(reason)
         });
     }
+
+    // The same observable on the destination side (see the source path).
+    info!(
+        carriers = agreed_carriers,
+        separate_data_streams, "negotiated data plane"
+    );
 
     if separate_data_streams || agreed_carriers > 1 {
         return destination_stream_multi(dest, channel, progress, plan, stream, agreed_carriers)
