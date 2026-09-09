@@ -163,8 +163,10 @@ appeared under a case that ran the same rejection three times.
 
 ### What the matrix now proves
 
-`e2e/fault_matrix.sh` runs 15 live cases across all four modules, each asserting
-the same three-part contract: **(A)** the failing side exits with the phase-tagged
+`e2e/fault_matrix.sh` runs 22 cases: 15 fault injections across the four
+modules, the two immutability cases below, the refusal of a destination a killed
+run left partial, and four process-exit contract checks. Each of the 17 live
+fault cases asserts the same three-part contract: **(A)** the failing side exits with the phase-tagged
 code the failure deserves, **(B)** the destination is left with no half-restored
 state, and **(C)** the source is byte-identical afterwards. The cases kill the
 source mid-transfer, kill the destination at 10/50/90 % of the payload, reset the
@@ -191,6 +193,9 @@ tests that were already green.
 | OBS-1 | The negotiated carrier count was never logged — only a *downgrade* was, and only on the source. So `--carriers 4` produced a run indistinguishable from a run that fell back to one stream, which means the 4-carrier e2e cases could not prove they had exercised four carriers, and an operator could not tell either. Both peers now log `negotiated data plane carriers=N separate_data_streams=…` once negotiation settles (I-OBSERV), `e2e/relay_smoke.sh` asserts the count it asked for at 1 and 4, and `e2e/s3_minio_test.sh` now asks for four carriers and asserts the module cap brings the negotiation back to one — the first live proof of the per-module cap, QA criterion 13 |
 | DOC-3 | `docs/modules/FILESYSTEM.md` carried the same ghost `--preserve-ownership` flag that `USAGE.md` had. The parity check only ever read `USAGE.md`; its ghost-flag half now scans `README.md`, `docs/QA_GUIDE.md`, `docs/TRANSPORT.md`, `docs/DEPLOYMENT.md` and every `docs/modules/*.md` as well |
 | DOC-4 | `e2e/full_matrix.sh` printed a `SKIP` line for the privileged scripts but silently omitted the PostgreSQL/MongoDB version matrices, so "one command tells QA the whole state of the tree" was untrue in exactly the direction that matters — something not run looked like nothing to run |
+
+| TEST-1 | The matrix header claimed that a leftover from an uncleanable fault "is refused by a later restore instead of silently merged into", and nothing asserted it. A 22nd case now re-runs a restore into the tree the destination-killed case left behind and requires exit 3 with no success claim — with a precondition that fails the case outright if that tree turned out to be empty, since an empty root is legitimately accepted |
+| ENV-1 | `e2e/mongodb_matrix.sh 8` died with `FAIL: … not ready` on a host running Linux 7.0: every published MongoDB 8 image refuses to start above kernel 6.19 (SERVER-121912). That is an environment limit, and reporting it as a failure hides real ones while reporting it as a pass would be a lie. The script now prints a `SKIP` naming the image and the kernel, exits 77 when nothing ran, and `e2e/full_matrix.sh` renders 77 as a `SKIP` row with its own counter |
 
 Everything else re-read in this pass held: frame and chunk lengths are bounded
 before allocation on both sides, no production path allocates from a peer-

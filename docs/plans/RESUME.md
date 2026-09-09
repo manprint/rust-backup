@@ -24,7 +24,7 @@ command that ran is not done — that rule is the whole point of the table.
 | F1.5 per-module carrier caps | `cargo test --all-features -- clamp_carriers` and the CLI bank, plus the live cap proof in `e2e/s3_minio_test.sh` | PASS |
 | F1.6 direct/relay fallback | `sudo -n "$PWD/e2e/transport_netns_test.sh"` | PASS=9 FAIL=0 |
 | F2.1–F2.2 in-process fault banks | `bash e2e/fault_matrix.sh protocol` (26-case core bank) | PASS |
-| F2.3 live fault matrix, all four modules | `bash e2e/fault_matrix.sh` | **CASES=21 PASS=53 FAIL=0**, no `SKIP` |
+| F2.3 live fault matrix, all four modules | `bash e2e/fault_matrix.sh` | **CASES=22 PASS=54 FAIL=0**, no `SKIP` |
 | F2.4 real ext4 ENOSPC | `sudo -n "$PWD/e2e/filesystem_disk_full.sh"` | PASS=5 FAIL=0 |
 | F2.5 immutability under concurrent load | `bash e2e/fault_matrix.sh immutability` | PASS=2 FAIL=0 (both directions) |
 | F3.1 filesystem ownership in a netns | `sudo -n "$PWD/e2e/filesystem_netns_test.sh"` | PASS=4 FAIL=0 |

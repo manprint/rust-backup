@@ -152,6 +152,13 @@ sessions, the non-backend part of the fault matrix, and MinIO. Add
 `RUST_BACKUP_FULL_DB_MATRIX=1` for the Docker PostgreSQL/MongoDB matrices
 (PostgreSQL 10–18 including cross-major pairs, MongoDB 4–8).
 
+MongoDB 8 needs a host kernel older than 6.19: every published MongoDB 8 image
+refuses to start above that (SERVER-121912). On a newer kernel
+`e2e/mongodb_matrix.sh 8` prints a `SKIP` naming the kernel and exits 77, which
+`e2e/full_matrix.sh` renders as a `SKIP` row rather than a pass or a failure —
+that major has to be exercised on an older kernel or in CI. Nothing else in the
+suite depends on it.
+
 The fault matrix is also runnable on its own, and takes a group name so a failed
 group can be re-run alone (Docker is needed only for the backend groups):
 

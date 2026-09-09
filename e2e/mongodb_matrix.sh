@@ -20,6 +20,7 @@ source e2e/lib.sh
 CASES=("${@:-6}")
 PASS=0
 FAIL=0
+SKIPPED=0
 BIN="./target/release/rust-backup"
 CTRL_PORT=$(rb_free_port)
 
@@ -45,9 +46,11 @@ cargo build --release --all-features
 image_for() { # major -> docker image tag
   case "$1" in
     4) echo "mongo:4.4" ;;
-    # 8.0.x refuses Linux >= 6.19 (SERVER-121912).  `mongo:8` tracks the
-    # maintained MongoDB 8 release line while still exercising the 8.x wire
-    # and dump/restore format.
+    # Every published MongoDB 8 image refuses to start on Linux >= 6.19
+    # (SERVER-121912) — `mongo:8` included, as of 2026-09-09. The tag still
+    # tracks the maintained 8 release line, so it is the right image; a host on
+    # a newer kernel simply cannot run this major, which `start_mongo` reports
+    # as a skip rather than as a fault in this tool.
     8) echo "mongo:8" ;;
     *) echo "mongo:$1.0" ;;
   esac
@@ -64,6 +67,9 @@ mongo_eval() { # container db js
   fi
 }
 
+# Returns 2 when this host cannot run the requested MongoDB major at all, which
+# is an environment limit and not a defect in this tool: reporting it as a
+# failure would hide real ones, and reporting it as a pass would be a lie.
 start_mongo() { # name port image -> start container, wait ready
   local name="$1" port="$2" image="$3"
   CONTAINERS+=("$name")
@@ -75,6 +81,12 @@ start_mongo() { # name port image -> start container, wait ready
     fi
     sleep 1
   done
+  if docker logs "$name" 2>&1 | grep -q 'SERVER-121912'; then
+    printf 'SKIP: %s refuses to start on Linux %s (SERVER-121912); run this major on a kernel < 6.19\n' \
+      "$image" "$(uname -r)"
+    SKIPPED=$((SKIPPED + 1))
+    return 2
+  fi
   echo "FAIL: $name not ready"; return 1
 }
 
@@ -189,8 +201,16 @@ for CASE in "${CASES[@]}"; do
   DST_PORT=$(rb_free_port)
   while [[ $DST_PORT == "$SRC_PORT" ]]; do DST_PORT=$(rb_free_port); done
 
-  start_mongo "$SRC" "$SRC_PORT" "$SOURCE_IMAGE"
-  start_mongo "$DST" "$DST_PORT" "$DESTINATION_IMAGE"
+  start_status=0
+  start_mongo "$SRC" "$SRC_PORT" "$SOURCE_IMAGE" || start_status=$?
+  if (( start_status == 0 )); then
+    start_mongo "$DST" "$DST_PORT" "$DESTINATION_IMAGE" || start_status=$?
+  fi
+  if (( start_status == 2 )); then
+    docker rm -f "$SRC" "$DST" >/dev/null 2>&1 || true
+    continue
+  fi
+  (( start_status == 0 )) || exit "$start_status"
   seed_source "$SRC"
 
   # Source content baseline (external immutability reference).
@@ -241,5 +261,10 @@ for CASE in "${CASES[@]}"; do
 done
 
 echo "================================================"
-echo "PASS=${PASS}  FAIL=${FAIL}"
+echo "PASS=${PASS}  FAIL=${FAIL}  SKIPPED=${SKIPPED}"
+# Exit 77 when nothing actually ran, so an aggregate cannot count a matrix that
+# never started as a matrix that passed. `e2e/full_matrix.sh` renders 77 as SKIP.
+if (( FAIL == 0 && PASS == 0 && SKIPPED > 0 )); then
+  exit 77
+fi
 [[ $FAIL -eq 0 ]]

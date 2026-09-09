@@ -18,7 +18,9 @@ this point; `docs/plans/RESUME.md` records the command that proved each phase.
   immutability, the absence of usable partial state, and a truthful error phase.
   It also covers immutability under concurrent load in both directions: writes
   beside the source root are not a false `SourceMutated`, and writes into it
-  exit 6.
+  exit 6. A further case proves the other half of that promise for the faults
+  nothing can clean up: a restore into the tree a killed destination left behind
+  is refused at preflight rather than merged into.
 - `e2e/bandwidth_netem.sh` adds the one-vs-four-carrier proof: identical
   restored trees and no regression on a shaped link, with the measured ratio
   recorded.
@@ -36,6 +38,11 @@ this point; `docs/plans/RESUME.md` records the command that proved each phase.
 - `scripts/crate_invariants.sh` asserts `#![forbid(unsafe_code)]` and the
   unwrap/expect/panic denial in every crate root — `rb-core` was missing both,
   so the crate every module depends on sat outside its own lint gate.
+- `e2e/mongodb_matrix.sh` reports a host that cannot run a MongoDB major at all
+  as a `SKIP` naming the image and the kernel, and exits 77 when nothing ran;
+  `e2e/full_matrix.sh` renders 77 as a `SKIP` row with its own counter. Every
+  published MongoDB 8 image refuses Linux 6.19 and newer (SERVER-121912), which
+  used to surface as an opaque "not ready" failure.
 - `scripts/help_parity.sh` now checks both directions, so a flag documented in
   `USAGE.md` that the CLI does not accept fails the gate. That caught
   `--preserve-ownership`, which never existed as a flag.

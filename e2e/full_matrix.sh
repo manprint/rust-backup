@@ -3,8 +3,19 @@
 # exact absolute script path; database matrices are opt-in because they pull images.
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
-passed=0; failed=0
-run() { if "$@"; then printf 'PASS: %s\n' "$*"; passed=$((passed + 1)); else printf 'FAIL: %s\n' "$*" >&2; failed=$((failed + 1)); fi; }
+passed=0; failed=0; skipped=0
+# Exit 77 means the script could not run its subject on this host at all (for
+# example a MongoDB major the running kernel refuses). That is neither a pass
+# nor a failure, and it must stay visible.
+run() {
+  local rc=0
+  "$@" || rc=$?
+  case $rc in
+    0) printf 'PASS: %s\n' "$*"; passed=$((passed + 1)) ;;
+    77) printf 'SKIP: %s — the script reported an environment limit\n' "$*"; skipped=$((skipped + 1)) ;;
+    *) printf 'FAIL: %s\n' "$*" >&2; failed=$((failed + 1)) ;;
+  esac
+}
 cd "$root" || exit
 run bash e2e/resource_hygiene_check.sh
 run bash e2e/relay_smoke.sh
@@ -31,5 +42,5 @@ if [[ ${RUST_BACKUP_FULL_DB_MATRIX:-0} == 1 ]]; then
 else
   printf 'SKIP: PostgreSQL/MongoDB version matrices (set RUST_BACKUP_FULL_DB_MATRIX=1)\n'
 fi
-printf 'e2e summary: %d passed, %d failed\n' "$passed" "$failed"
+printf 'e2e summary: %d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
 (( failed == 0 ))

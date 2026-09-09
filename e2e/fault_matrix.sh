@@ -266,6 +266,45 @@ if group_enabled filesystem; then
   fs_case fs-destination-kill90 destination 90
   fs_case fs-server-kill-plan   server      plan
   fs_case fs-relay-reset        server      40
+
+  # The other half of assertion B, for the faults where nothing can clean up:
+  # the leftover must be *refused* by the next restore rather than silently
+  # merged into. The destination killed at 50 % above left a partial tree; a
+  # fresh run into that same root must stop at preflight (exit 3) and must not
+  # report a verified restore.
+  case_begin fs-dirty-destination-refused
+  # Precondition, or the case is vacuous: an empty destination root is accepted,
+  # so this only proves anything while the earlier kill really left files behind.
+  if [[ -z "$(ls -A "$work/fs-destination-kill50-dst" 2>/dev/null)" ]]; then
+    fail 'fs-dirty-destination-refused: the killed run left an empty root, so there is nothing to refuse'
+  fi
+  dirty_src="$work/fs-dirty-src"
+  mkdir -p "$dirty_src"
+  rb_seed_filesystem_fixture "$dirty_src" $((2 * 1024 * 1024))
+  if start_server "$work/fs-dirty-server.log"; then
+    dirty_port=$RB_SERVER_PORT dirty_server_pid=$RB_SERVER_PID
+    RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$dirty_port" \
+      --channel fs-dirty --no-udp --insecure --root "$dirty_src" \
+      >"$work/fs-dirty-source.log" 2>&1 &
+    dirty_source_pid=$!; PIDS+=("$dirty_source_pid")
+    sleep .3
+    RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$dirty_port" \
+      --channel fs-dirty --no-udp --insecure --yes \
+      --root "$work/fs-destination-kill50-dst" >"$work/fs-dirty-destination.log" 2>&1
+    dirty_destination_rc=$?
+    reap "$dirty_source_pid"
+    kill -9 "$dirty_server_pid" >/dev/null 2>&1
+    reap "$dirty_server_pid"
+    if (( dirty_destination_rc == 3 )) && \
+       no_false_success "$work/fs-dirty-source.log" "$work/fs-dirty-destination.log"; then
+      pass 'fs-dirty-destination-refused [B] a partial destination is refused at preflight, not merged into'
+    else
+      fail "fs-dirty-destination-refused [B] exited $dirty_destination_rc, expected 3 with no success claim"
+      sed -n '1,10p' "$work/fs-dirty-destination.log" >&2
+    fi
+  else
+    fail 'fs-dirty-destination-refused server did not start'
+  fi
 fi
 
 # --- F2.5: immutability under concurrent load --------------------------------

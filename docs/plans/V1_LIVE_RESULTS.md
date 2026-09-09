@@ -46,8 +46,8 @@ the exact-path sudoers rule.
 | Matrix | Exact command | Result |
 |---|---|---|
 | Rust gates | `bash scripts/gates.sh` | **PASS** — 233 tests passed, 0 ignored |
-| Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=21 PASS=53 FAIL=0**, no `SKIP` — every group ran |
-| Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **PASS=18 FAIL=0** (6 cases × A/B/C) |
+| Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=22 PASS=54 FAIL=0**, no `SKIP` — every group ran |
+| Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **CASES=7 PASS=19 FAIL=0** — 6 fault cases × A/B/C, plus the refusal of a destination a killed run left partial |
 | Fault matrix, immutability (F2.5) | `bash e2e/fault_matrix.sh immutability` | **PASS=2 FAIL=0** — a sibling load raises no false `SourceMutated` and still verifies; a real source write exits 6 with `SOURCE-IMMUTABILITY VIOLATION` and no `RESTORE VERIFIED` |
 | Fault matrix, postgres | `bash e2e/fault_matrix.sh postgres` | **PASS=9 FAIL=0** (source killed, relay reset, destination backend stopped) |
 | Fault matrix, mongodb | `bash e2e/fault_matrix.sh mongodb` | **PASS=9 FAIL=0** |
@@ -55,6 +55,10 @@ the exact-path sudoers rule.
 | Fault matrix, exit codes | `bash e2e/fault_matrix.sh exitcodes` | **PASS=5 FAIL=0**, the rejection case repeated 3× |
 | Privileged netem, rate cap and carriers (F3.3 + F3.4) | `sudo -n "$PWD/e2e/bandwidth_netem.sh"` | **PASS=16 FAIL=0** — 200 MiB over a 5 Mbit/s + 80 ms link in 355 s; 16 MiB under a 256 KiB/s cap in 66 s; peak source RSS 10.9 MiB against a 192 MiB ceiling; **1 carrier 43 s vs 4 carriers 44 s (ratio 102 %) on byte-identical restored trees**, with both peers observed negotiating 1 and 4 respectively |
 | Relay smoke, plain, 1 and 4 carriers | `bash e2e/relay_smoke.sh`, `RUST_BACKUP_E2E_CARRIERS=4 bash e2e/relay_smoke.sh` | **PASS=5 FAIL=0** each, including the negotiated-count assertion |
+| PostgreSQL 16 regression spot-check after the rollback change | `bash e2e/postgres_matrix.sh 16` | **PASS=12 FAIL=0** — a successful restore, `--overwrite` included, is unaffected by the new failure path |
+| MongoDB 7 regression spot-check after the rollback change | `bash e2e/mongodb_matrix.sh 7` | **PASS=5 FAIL=0 SKIPPED=0** |
+| MongoDB 8 on this host | `bash e2e/mongodb_matrix.sh 8` | **SKIP (exit 77)** — `mongo:8` refuses Linux 7.0.0 (SERVER-121912); the major is covered by CI, whose runners are on 6.x |
+| Two-target YAML session incl. `--fail-fast` | `bash e2e/session_two_targets.sh` | **PASS** |
 | MinIO S3 incl. the per-module carrier cap | `bash e2e/s3_minio_test.sh` | **PASS** — a source asking for 4 carriers negotiates down to the 1 the S3 destination permits |
 
 F3.4 is deliberately a no-regression proof, not a speedup: the link is the
