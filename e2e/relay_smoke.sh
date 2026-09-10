@@ -37,7 +37,11 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 src="$work/source"
 dst="$work/destination"
 mkdir -p "$src" "$dst"
-rb_seed_filesystem_fixture "$src" $((3 * 1024 * 1024 + 71))
+# The carrier acceptance (plan F1.1, QA criterion 2) needs a plan whose items
+# overlap in flight; 220 bulk items plus the metadata fixture keeps four carriers
+# busy simultaneously, which the original eight-entry tree never did.
+rb_seed_filesystem_fixture "$src" $((3 * 1024 * 1024 + 71)) \
+  "${RUST_BACKUP_E2E_BULK_FILES:-220}"
 before=$(rb_tree_digest "$src")
 port=$(rb_free_port)
 endpoint="127.0.0.1:$port"

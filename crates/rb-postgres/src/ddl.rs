@@ -710,9 +710,11 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
     // emission order can satisfy every dependency direction at once.
     pre.push("SET check_function_bodies = false;".to_string());
 
-    for e in &d.extensions {
-        pre.push(create_extension(e));
-    }
+    // Schemas before extensions: `CREATE EXTENSION … WITH SCHEMA gis` fails with
+    // `schema "gis" does not exist` unless the schema is already there, and the
+    // reverse dependency does not exist — a schema never needs an extension to
+    // be created. This only ever worked because every fixture installed its
+    // extensions into the pre-existing `public`.
     for sc in &d.schemas {
         pre.push(create_schema(sc));
         // `CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION ...` does not alter
@@ -734,6 +736,9 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
             pre.push(comment_on("SCHEMA", &quote_ident(&sc.name), c));
         }
         post.extend(grants_from_acl("SCHEMA", &quote_ident(&sc.name), &sc.acl));
+    }
+    for e in &d.extensions {
+        pre.push(create_extension(e));
     }
 
     // PostgreSQL creates an owned sequence itself for every IDENTITY column. Do
@@ -1127,6 +1132,44 @@ mod tests {
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
         assert_eq!(quote_qualified("app", "t"), "\"app\".\"t\"");
         assert_eq!(quote_literal("it's"), "'it''s'");
+    }
+
+    /// `CREATE EXTENSION … WITH SCHEMA gis` needs `gis` to exist already. The
+    /// emitted order used to be extensions first, which only ever worked because
+    /// every fixture put its extensions in the pre-existing `public`.
+    #[test]
+    fn a_schema_is_created_before_an_extension_that_lives_in_it() {
+        let db = crate::model::PgDatabase {
+            name: "appdb".to_string(),
+            owner: "app_owner".to_string(),
+            schemas: vec![crate::model::PgSchema {
+                name: "gis".to_string(),
+                owner: "app_owner".to_string(),
+                ..Default::default()
+            }],
+            extensions: vec![crate::model::PgExtension {
+                name: "postgis".to_string(),
+                version: "3.4.2".to_string(),
+                schema: "gis".to_string(),
+            }],
+            ..Default::default()
+        };
+        let ddl = build_database_ddl(&db, 16).expect("database ddl");
+        let schema_at = ddl
+            .pre_data
+            .iter()
+            .position(|statement| statement.starts_with("CREATE SCHEMA \"gis\""))
+            .expect("the schema must be created");
+        let extension_at = ddl
+            .pre_data
+            .iter()
+            .position(|statement| statement.contains("CREATE EXTENSION IF NOT EXISTS \"postgis\""))
+            .expect("the extension must be created");
+        assert!(
+            schema_at < extension_at,
+            "schema at {schema_at} must precede its extension at {extension_at}: {:#?}",
+            ddl.pre_data
+        );
     }
 
     #[test]

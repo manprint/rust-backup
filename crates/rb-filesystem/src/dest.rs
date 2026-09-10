@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use nix::fcntl::AtFlags;
@@ -223,7 +223,7 @@ pub(crate) fn verify_metadata(params: &FilesystemParams, plan: &BackupPlan) -> R
     Ok(())
 }
 
-struct ActiveFile {
+pub(crate) struct ActiveFile {
     item_id: u32,
     path: std::path::PathBuf,
     file: File,
@@ -233,17 +233,26 @@ struct ActiveFile {
 }
 
 impl ActiveFile {
-    fn open(root: &Path, item_id: u32, name: &str) -> Result<Self> {
+    pub(crate) fn open(root: &Path, item_id: u32, name: &str) -> Result<Self> {
         let path = at_root(root, name, Phase::Apply)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_error(Phase::Apply, parent, e))?;
+            create_private_dir_all(parent)?;
         }
         // O_NOFOLLOW: a plan that planted a symlink at this path must not have
         // the restore write the item's bytes into the link's target.
+        //
+        // `.mode(OWNER_ONLY_FILE)`: the source's real mode is applied later, in
+        // one pass after every item has streamed. Creating at the OS default
+        // (0o666 minus the destination's umask, so typically 0o644) published a
+        // file that is meant to be 0o600 — a private key, a credentials file —
+        // world-readable for the whole rest of the restore. Start closed and let
+        // `apply_metadata` open it up; a restore that fails in between leaves
+        // the restrictive mode, never the permissive one.
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(OWNER_ONLY_FILE)
             .custom_flags(libc_o_nofollow())
             .open(&path)
             .map_err(|e| io_error(Phase::Apply, &path, e))?;
@@ -276,11 +285,29 @@ impl Drop for ActiveFile {
     }
 }
 
+/// A file is created owner-only and widened later; the same rule applies to the
+/// directories that hold it.
+pub(crate) const OWNER_ONLY_FILE: u32 = 0o600;
+pub(crate) const OWNER_ONLY_DIR: u32 = 0o700;
+
+/// `fs::create_dir_all` with an owner-only mode on every component it creates.
+/// The plan's own mode is applied by `apply_metadata` once the tree is complete,
+/// so a directory that is meant to be 0o700 must not be readable in the
+/// meantime — and an intermediate component the plan never names keeps the
+/// restrictive mode rather than inheriting 0o777 minus the umask.
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(OWNER_ONLY_DIR)
+        .create(path)
+        .map_err(|e| io_error(Phase::Apply, path, e))
+}
+
 fn create_directories(root: &Path, plan: &FilesystemPlan) -> Result<()> {
     for entry in &plan.entries {
         if entry.kind == "dir" {
             let path = at_root(root, &entry.path, Phase::Apply)?;
-            fs::create_dir_all(&path).map_err(|e| io_error(Phase::Apply, &path, e))?;
+            create_private_dir_all(&path)?;
         }
     }
     Ok(())
@@ -421,6 +448,64 @@ fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
                     entry.path
                 ),
             ));
+        }
+    }
+
+    // Two cross-entry rules. Both are about what one entry can make another
+    // entry's path mean, which the per-entry checks above cannot see.
+    let kinds: HashMap<&str, &str> = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.kind.as_str()))
+        .collect();
+    for entry in &plan.entries {
+        // 1. A non-directory entry must not be an ancestor of another entry.
+        //    `create_directories` and the per-item `create_dir_all` materialise
+        //    ancestors as real directories, so a plan holding both `x` (symlink)
+        //    and `x/sub` made `x` a directory before `create_links` ever saw it,
+        //    and the run then died on an unlink of a non-empty directory instead
+        //    of refusing the plan.
+        let mut ancestor = entry.path.as_str();
+        while let Some(cut) = ancestor.rfind('/') {
+            ancestor = &ancestor[..cut];
+            if let Some(kind) = kinds.get(ancestor) {
+                if *kind != "dir" {
+                    return Err(BackupError::phase(
+                        Phase::Validate,
+                        format!(
+                            "filesystem plan entry {:?} of kind {kind} is an ancestor of {:?}",
+                            ancestor, entry.path
+                        ),
+                    ));
+                }
+            }
+        }
+        // 2. A hardlink must name a regular file in the same plan. `link(2)` on
+        //    Linux does not dereference a symlink source, so pointing one at a
+        //    symlink entry is not an escape today — but that is POSIX-
+        //    unspecified, and nothing else in the restore re-checks it.
+        if let Some(target) = &entry.hardlink_to {
+            match kinds.get(target.as_str()) {
+                Some(&"file") => {}
+                Some(kind) => {
+                    return Err(BackupError::phase(
+                        Phase::Validate,
+                        format!(
+                            "filesystem entry {:?} hardlinks to {:?}, which the plan declares as {kind}, not a file",
+                            entry.path, target
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(BackupError::phase(
+                        Phase::Validate,
+                        format!(
+                            "filesystem entry {:?} hardlinks to {:?}, which the plan does not contain",
+                            entry.path, target
+                        ),
+                    ));
+                }
+            }
         }
     }
     Ok(())

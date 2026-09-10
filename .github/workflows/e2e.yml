@@ -67,6 +67,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-pg-introspect-${{ hashFiles('Cargo.lock') }}
       - run: bash e2e/postgres_introspect.sh 16
 
   postgres:
@@ -203,6 +211,10 @@ jobs:
     timeout-minutes: 30
     environment: aws-e2e
     env:
+      # The job is already gated by `vars.RUN_AWS_E2E`; without this the script's
+      # own opt-in was never set, so the job printed SKIP and still reported
+      # green — a real-AWS run that never happened.
+      RUST_BACKUP_AWS_E2E: "1"
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}

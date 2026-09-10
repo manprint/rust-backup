@@ -89,7 +89,16 @@ pub async fn stream_out(
 fn copy_out_sql(meta: &ItemMeta) -> String {
     let qual = quote_qualified(&meta.schema, &meta.table);
     if meta.columns.is_empty() {
-        format!("COPY {qual} TO STDOUT (FORMAT binary)")
+        // A table with no COPY-able columns (`CREATE TABLE t ();`) still has
+        // rows and can still be a classic-inheritance parent. `COPY t TO` has no
+        // `ONLY` form, so the parent's item silently streamed its children's
+        // rows too and the restore duplicated them into the parent — the
+        // read-back then failed with an integrity error on a perfectly legal
+        // source. `SELECT` with an empty select list is the zero-column
+        // counterpart of the column list below and matches the destination's
+        // column-less `COPY … FROM STDIN`.
+        let only = if meta.only { "ONLY " } else { "" };
+        format!("COPY (SELECT FROM {only}{qual}) TO STDOUT (FORMAT binary)")
     } else {
         let cols = meta
             .columns
@@ -197,7 +206,25 @@ mod tests {
         };
         assert_eq!(
             copy_out_sql(&m2),
-            "COPY \"app\".\"accounts\" TO STDOUT (FORMAT binary)"
+            "COPY (SELECT FROM \"app\".\"accounts\") TO STDOUT (FORMAT binary)"
+        );
+    }
+
+    /// The `ONLY` rule holds for a table with no COPY-able columns too. A
+    /// zero-column inheritance parent read without it streams its children's
+    /// rows as its own, and the restore duplicates them into the parent.
+    #[test]
+    fn a_zero_column_inheritance_parent_is_still_read_with_only() {
+        let m = ItemMeta {
+            database: "d".into(),
+            schema: "app".into(),
+            table: "marker".into(),
+            columns: vec![],
+            only: true,
+        };
+        assert_eq!(
+            copy_out_sql(&m),
+            "COPY (SELECT FROM ONLY \"app\".\"marker\") TO STDOUT (FORMAT binary)"
         );
     }
 

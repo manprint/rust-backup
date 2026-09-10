@@ -6,7 +6,7 @@
 # Crates:
 #   rb-core       library: traits, plan model, wire framing, config, errors, progress
 #   rb-transport  library: coordination server + paired byte-channel (relay+direct)
-#   rb-postgres   module: PostgreSQL  10..=latest  (stub; see docs/plans)
+#   rb-postgres   module: PostgreSQL  10+          (minimum enforced; CI 10..=18)
 #   rb-mongodb    module: MongoDB     4..=8        (stub)
 #   rb-filesystem module: filesystem (ownership/perms preserved on Linux) (stub)
 #   rb-s3         module: S3-compatible object storage (stub)

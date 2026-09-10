@@ -395,6 +395,120 @@ mod tests {
         let _ = fs::remove_dir_all(&victim_dir);
     }
 
+    /// A plan whose non-directory entry is an ancestor of another entry must be
+    /// refused up front: the restore materialises ancestors as real directories
+    /// before it ever looks at the entry that claims the same path, so the run
+    /// used to die mid-apply on an unlink of a non-empty directory and leave
+    /// stray directories behind instead of rejecting the plan.
+    #[tokio::test]
+    async fn a_non_directory_entry_may_not_be_an_ancestor_of_another() {
+        let destination_root = tempdir("ancestor-kind-destination");
+        let mut link = entry("x", "symlink", 0o120_777);
+        link.target = Some("/etc/shadow".to_string());
+        let plan = hostile_plan(
+            &destination_root,
+            vec![link, entry("x/sub", "dir", 0o040_755)],
+        );
+
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        let error = destination
+            .stream_in(&plan, &mut source)
+            .await
+            .expect_err("an entry under a symlink must be refused");
+        assert!(
+            error.to_string().contains("is an ancestor of"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !destination_root.join("x").exists(),
+            "the refused plan must not have created anything"
+        );
+        let _ = fs::remove_dir_all(&destination_root);
+    }
+
+    /// A hardlink must name a regular file the same plan restores. `link(2)` not
+    /// dereferencing a symlink source is Linux behaviour, not a guarantee, and
+    /// nothing later in the restore re-checks what the target actually is.
+    #[tokio::test]
+    async fn a_hardlink_must_name_a_file_in_the_plan() {
+        let destination_root = tempdir("hardlink-kind-destination");
+        let mut link = entry("victim-link", "symlink", 0o120_777);
+        link.target = Some("/etc/shadow".to_string());
+        let mut hard = entry("copy", "hardlink", 0o100_644);
+        hard.hardlink_to = Some("victim-link".to_string());
+        let plan = hostile_plan(&destination_root, vec![link, hard]);
+
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        let error = destination
+            .stream_in(&plan, &mut source)
+            .await
+            .expect_err("a hardlink onto a symlink entry must be refused");
+        assert!(
+            error.to_string().contains("not a file"),
+            "unexpected error: {error}"
+        );
+
+        let mut dangling = entry("orphan", "hardlink", 0o100_644);
+        dangling.hardlink_to = Some("absent".to_string());
+        let plan = hostile_plan(&destination_root, vec![dangling]);
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        let error = destination
+            .stream_in(&plan, &mut source)
+            .await
+            .expect_err("a hardlink to an absent entry must be refused");
+        assert!(
+            error.to_string().contains("does not contain"),
+            "unexpected error: {error}"
+        );
+        let _ = fs::remove_dir_all(&destination_root);
+    }
+
+    /// The source's real mode is applied in a single pass after every item has
+    /// streamed, so whatever a restored file is created with is its mode for the
+    /// rest of the run. Creating at the OS default published a file destined to
+    /// be 0o600 as 0o644 for that whole window; it must start owner-only and be
+    /// widened later, never the other way round. The same holds for the
+    /// directories the restore creates on the way.
+    #[test]
+    fn a_restored_file_and_its_parents_start_owner_only() {
+        let root = tempdir("private-until-applied");
+        let active = crate::dest::ActiveFile::open(&root, 1, "nested/deep/secret.key")
+            .expect("open the restored file");
+
+        let file_mode = fs::symlink_metadata(root.join("nested/deep/secret.key"))
+            .expect("the restored file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode,
+            crate::dest::OWNER_ONLY_FILE,
+            "a restored file must not be readable by anyone else before its mode is applied"
+        );
+
+        for parent in ["nested", "nested/deep"] {
+            let mode = fs::symlink_metadata(root.join(parent))
+                .expect("the parent directory exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                crate::dest::OWNER_ONLY_DIR,
+                "parent {parent} must not be traversable by anyone else yet"
+            );
+        }
+
+        drop(active);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The mode application itself must be no-follow, independently of the
     /// plan-level guards above: a symlink at the target path fails the open
     /// rather than re-permissioning whatever it points at.

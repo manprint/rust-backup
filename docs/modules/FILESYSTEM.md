@@ -19,6 +19,14 @@ On privileged restores ownership is applied before the final permission bits:
 POSIX `chown` clears setuid/setgid on regular files, so the reverse order would
 silently turn modes such as `04755` into `0755`.
 
+The **destination root itself** is not restored: its own mode, ownership and
+mtime stay whatever the operator created them as. Only the entries *inside* the
+tree are reproduced. Give the root the permissions you want before the run.
+
+Files and directories are created owner-only (`0600` / `0700`) and widened to
+their recorded mode once the content and ownership are in place, so a restore
+never leaves a world-readable window on a file whose final mode is private.
+
 ## The sudo / ownership case (important)
 
 `chown`-ing a restored file to an arbitrary `uid`/`gid` is a privileged operation on
@@ -93,6 +101,12 @@ adversarially deep tree would abort the process rather than return an error.
 - Regular file reads try Linux `O_NOATIME` first. If the caller does not own the
   file and has no capability to use it, the kernel rejects that flag and the
   read falls back to ordinary read-only open.
+- The destination root's own metadata is never restored (see above).
+- `SIGINT`/`SIGTERM` abort the run: the active item is removed, no `VERIFIED`
+  line is printed, and the process exits non-zero with an explicit "interrupted
+  by SIGINT/SIGTERM" message. Items already completed before the signal stay on
+  disk — an interrupted restore leaves a partial *tree*, never a partial *file*,
+  and nothing about it is certified.
 
 ## Invariant notes
 

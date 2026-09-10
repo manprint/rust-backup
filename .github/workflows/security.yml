@@ -24,6 +24,11 @@ jobs:
     name: Advisories, licenses, bans and sources
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # One source of truth for the pinned version. The cache key used to repeat it
+    # by hand, so bumping only the `--version` argument restored the OLD binary
+    # from cache and `command -v` then skipped the install entirely.
+    env:
+      CARGO_AUDIT_VERSION: 0.22.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -35,9 +40,9 @@ jobs:
             ~/.cargo/advisory-db
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
-          key: ${{ runner.os }}-${{ runner.arch }}-security-tools-audit-0.22.1
+          key: ${{ runner.os }}-${{ runner.arch }}-security-tools-audit-${{ env.CARGO_AUDIT_VERSION }}
       - name: Install pinned audit tool
-        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version 0.22.1 --locked
+        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
       - name: RustSec vulnerability audit
         run: cargo audit --deny warnings
       - name: Dependency policy
@@ -51,6 +56,9 @@ jobs:
     name: Unused, duplicate and outdated dependencies
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    env:
+      CARGO_MACHETE_VERSION: 0.9.2
+      CARGO_OUTDATED_VERSION: 0.19.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -63,11 +71,11 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ${{ runner.os }}-${{ runner.arch }}-dependency-tools-machete-0.9.2-outdated-0.19.0
+          key: ${{ runner.os }}-${{ runner.arch }}-dependency-tools-machete-${{ env.CARGO_MACHETE_VERSION }}-outdated-${{ env.CARGO_OUTDATED_VERSION }}
       - name: Install pinned dependency tools
         run: |
-          command -v cargo-machete >/dev/null || cargo install cargo-machete --version 0.9.2 --locked
-          command -v cargo-outdated >/dev/null || cargo install cargo-outdated --version 0.19.0 --locked
+          command -v cargo-machete >/dev/null || cargo install cargo-machete --version "$CARGO_MACHETE_VERSION" --locked
+          command -v cargo-outdated >/dev/null || cargo install cargo-outdated --version "$CARGO_OUTDATED_VERSION" --locked
       - name: Reject unused direct dependencies
         run: cargo machete
       - name: Report duplicate versions

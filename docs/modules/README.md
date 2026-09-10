@@ -5,12 +5,12 @@ supplies: a connection-params struct, a plan-payload struct (the module-specific
 of `BackupPlan.payload`), a `Source` (read-only analyze + stream out), and a
 `Destination` (validate + stream in).
 
-| Module | Crate | Versions | Driver (Phase 2+) | Status |
-|--------|-------|----------|-------------------|--------|
-| postgres | `rb-postgres` | 10..=18 | `tokio-postgres` (pure Rust) | logical copy; live matrix pending — see [POSTGRES.md](POSTGRES.md) |
-| mongodb | `rb-mongodb` | 4..=8 | `mongodb` (pure Rust) | logical copy; live matrix pending — see [MONGODB.md](MONGODB.md) |
-| filesystem | `rb-filesystem` | POSIX | `std` + `nix` | core path implemented; privileged/live e2e pending — see [FILESYSTEM.md](FILESYSTEM.md) |
-| s3 | `rb-s3` | AWS S3 / MinIO | `aws-sdk-s3` | streaming prototype; fidelity limits — see [S3.md](S3.md) |
+| Module | Crate | Versions | Driver | Status |
+|--------|-------|----------|--------|--------|
+| postgres | `rb-postgres` | 10+ | `tokio-postgres` (pure Rust) | complete; live matrix 10–18 + cross-major pairs green — limits in [POSTGRES.md](POSTGRES.md) |
+| mongodb | `rb-mongodb` | 4..=8 | `mongodb` (pure Rust) | complete; live matrix 4–8 + cross-major pairs green — limits in [MONGODB.md](MONGODB.md) |
+| filesystem | `rb-filesystem` | POSIX | `std` + `nix` | complete; privileged metadata, netns and ENOSPC e2e green — limits in [FILESYSTEM.md](FILESYSTEM.md) |
+| s3 | `rb-s3` | AWS S3 / MinIO | `aws-sdk-s3` | complete; MinIO matrix green, real AWS credential-gated — limits in [S3.md](S3.md) |
 
 ## Adding a new module (I-MODULAR)
 

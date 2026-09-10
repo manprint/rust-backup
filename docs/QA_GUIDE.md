@@ -121,8 +121,9 @@ payload BLAKE3 values, and the respective `BACKUP VERIFIED` / `RESTORE VERIFIED`
 messages. The destination proof comes from re-introspection plus a complete
 read-back of the persisted payload, never from writes having returned success.
 
-Exit codes: 2 configuration, 3 preflight, 4 plan rejection, 5 integrity/verify,
-6 source mutation, 7 transport.
+Exit codes: 0 success, 1 any other failure, 2 configuration, 3 preflight, 4 plan
+rejection, 5 integrity *or* apply *or* verify, 6 source mutation, 7
+transport/connect. The same table is in [USAGE.md](../USAGE.md#exit-codes).
 
 ## When a run fails
 

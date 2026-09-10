@@ -391,13 +391,46 @@ pub struct QuicTransport {
     _endpoint: Endpoint,
 }
 
+/// A peer that closes the QUIC connection with application code `0` has left the
+/// protocol normally: `DirectConn::close`/`DirectListener::close` use that code,
+/// and quinn sends it on its own when the last connection handle is dropped as a
+/// finished process exits.
+///
+/// TCP delivers that as a clean FIN, so a read has to observe EOF for the relay
+/// and the direct path to behave alike. Without this the last read of a *fully
+/// successful* run fails whenever the peer's CONNECTION_CLOSE overtakes the
+/// stream FIN — which is exactly what `await_peer_close` does after the
+/// completion handshake, so a verified restore reported `[Transfer] frame len
+/// read: connection lost: closed by peer: 0` and exited non-zero.
+///
+/// This cannot hide a truncation: quinn returns buffered stream data first and
+/// only surfaces the connection error once nothing is readable, and every frame
+/// before the final close is still covered by the protocol's own item, total and
+/// digest checks — a short stream fails them exactly as an early TCP FIN does.
+fn is_graceful_peer_close(error: &io::Error) -> bool {
+    let Some(read) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<quinn::ReadError>())
+    else {
+        return false;
+    };
+    matches!(
+        read,
+        quinn::ReadError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code == quinn::VarInt::from_u32(0)
+    )
+}
+
 impl AsyncRead for QuicTransport {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf)
+        match AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf) {
+            Poll::Ready(Err(error)) if is_graceful_peer_close(&error) => Poll::Ready(Ok(())),
+            other => other,
+        }
     }
 }
 
@@ -581,18 +614,6 @@ impl DirectListener {
     /// Gracefully close the endpoint and all its connections.
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"provider shutting down");
-    }
-
-    /// Re-open this endpoint's NAT mapping toward reconnecting consumers.
-    pub fn punch_via_endpoint(&self, peers: &[SocketAddr]) {
-        info!(peer_candidates = ?peers, "provider re-punching UDP peer candidates");
-        for &peer in peers {
-            if let Ok(connecting) = self.endpoint.connect(peer, "bore") {
-                tokio::spawn(async move {
-                    let _ = timeout(NETWORK_TIMEOUT, connecting).await;
-                });
-            }
-        }
     }
 
     /// Accept the next direct connection and authenticate it with `token`.
@@ -849,6 +870,126 @@ mod tests {
             },
         )
         .await;
+    }
+
+    // A finished peer closes the QUIC connection with application code 0 — either
+    // explicitly through `DirectConn::close` or implicitly when quinn drops the
+    // last handle as the process exits. The relay delivers that as a clean FIN, so
+    // the direct path has to read EOF, not an error: the completion handshake ends
+    // with `await_peer_close`, which reads until EOF after the peer has already
+    // been told everything it needs. Before this, a verified transfer failed on the
+    // destination with `[Transfer] frame len read: connection lost: closed by
+    // peer: 0` whenever CONNECTION_CLOSE overtook the stream FIN (observed in
+    // e2e/transport_netns_test.sh, T-NET-DIRECT).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_read_sees_eof_when_peer_closes_gracefully() {
+        let tuning = UdpDirectTuning::default();
+
+        let listener_socket = bind_socket(0).await.expect("bind listener socket");
+        let listener_port = listener_socket
+            .local_addr()
+            .expect("listener local_addr")
+            .port();
+        let connect_addr =
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, listener_port));
+
+        let listener = DirectListener::new(listener_socket, vec![], tuning)
+            .await
+            .expect("create listener");
+        let token = [7u8; TOKEN_LEN];
+
+        let consumer_socket = bind_socket(0).await.expect("bind consumer socket");
+        let consumer_task = tokio::spawn(async move {
+            connect_direct(consumer_socket, vec![connect_addr], token, tuning)
+                .await
+                .expect("connect_direct")
+        });
+        let provider_task =
+            tokio::spawn(async move { listener.accept(token).await.expect("accept") });
+        let provider_conn = provider_task.await.expect("provider join");
+        let consumer_conn = consumer_task.await.expect("consumer join");
+
+        let provider_stream = tokio::spawn({
+            let conn = provider_conn.clone();
+            async move { conn.accept_stream().await.expect("provider accept_stream") }
+        });
+        let mut consumer_stream = consumer_conn
+            .open_stream()
+            .await
+            .expect("consumer open_stream");
+
+        let payload = b"final-frame";
+        let mut provider_stream = futures_util::future::join(
+            async {
+                AsyncWriteExt::write_all(&mut consumer_stream, payload)
+                    .await
+                    .expect("consumer write");
+                AsyncWriteExt::flush(&mut consumer_stream)
+                    .await
+                    .expect("consumer flush");
+            },
+            async { provider_stream.await.expect("provider join") },
+        )
+        .await
+        .1;
+
+        let mut buf = vec![0u8; payload.len()];
+        AsyncReadExt::read_exact(&mut provider_stream, &mut buf)
+            .await
+            .expect("provider read");
+        assert_eq!(buf.as_slice(), payload, "payload must arrive intact");
+
+        // Close without finishing the stream first, which is the losing half of
+        // the race the fix has to absorb.
+        consumer_conn.close();
+        drop(consumer_stream);
+        drop(consumer_conn);
+
+        let mut tail = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(10),
+            AsyncReadExt::read(&mut provider_stream, &mut tail),
+        )
+        .await
+        .expect("read after peer close must not hang")
+        .expect("graceful peer close must read as EOF, not an error");
+        assert_eq!(read, 0, "graceful peer close must be reported as EOF");
+    }
+
+    // The EOF mapping is exactly and only the graceful code: any other close, and
+    // any transport-level loss, must still surface as an error so a truncated run
+    // can never be mistaken for a completed one.
+    #[test]
+    fn only_application_close_zero_reads_as_eof() {
+        let graceful = io::Error::from(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: bytes::Bytes::new(),
+            }),
+        ));
+        assert!(is_graceful_peer_close(&graceful), "code 0 is a clean close");
+
+        let coded = io::Error::from(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(7),
+                reason: bytes::Bytes::from_static(b"boom"),
+            }),
+        ));
+        assert!(
+            !is_graceful_peer_close(&coded),
+            "a non-zero code is a fault"
+        );
+
+        let timed_out = io::Error::from(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::TimedOut,
+        ));
+        assert!(!is_graceful_peer_close(&timed_out), "loss is not a close");
+
+        let reset = io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(0)));
+        assert!(!is_graceful_peer_close(&reset), "a stream reset is a fault");
+
+        let plain = io::Error::new(io::ErrorKind::NotConnected, "not a quinn error");
+        assert!(!is_graceful_peer_close(&plain), "unrelated errors are kept");
     }
 
     #[test]

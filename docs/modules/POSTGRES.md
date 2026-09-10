@@ -1,7 +1,14 @@
 # PostgreSQL module
 
-`postgres` performs a logical PostgreSQL 10..=18 copy with pure-Rust catalog
+`postgres` performs a logical PostgreSQL copy with pure-Rust catalog
 introspection and binary `COPY`; it never calls `pg_dump`.
+
+**Supported majors.** Major 10 is the enforced minimum (`MIN_PG_MAJOR`): an
+older server is refused at connect. There is no enforced upper bound. The CI
+matrix runs 10–18 same-major plus the cross-major pairs `10:18`, `12:16`,
+`14:17` and `16:18`; a newer major is accepted and, because analysis fails on
+any catalog object this build cannot reproduce (see below), a version that
+introduces something new refuses rather than certifying a partial copy.
 
 Database encoding and locale are restored independently of the destination
 cluster defaults. The module uses `template0` automatically and preserves the
@@ -129,6 +136,13 @@ inheritance child whose inherited column is locally `NOT NULL`, or a `reg*`
 column — whose binary `COPY` representation is a raw OID that names a different
 object on the destination.
 
+Analysis also fails on **logical-replication publications and subscriptions**
+(a publication is not copied and a subscription would restart replication
+against the source's upstream from the destination), on **event triggers** (a
+cluster-wide DDL hook the model does not carry), and on any **identifier
+containing a dot** — schema, relation or column — because this build's qualified
+references cannot name `a.b`.`c` unambiguously.
+
 On a **PostgreSQL 18 or newer source** the same applies to a `NOT NULL`
 constraint that is named or `NOT VALID`. PostgreSQL 18 catalogues every not-null
 constraint in `pg_constraint` (`contype = 'n'`), which makes two things
@@ -162,6 +176,9 @@ previous contents must survive a failed attempt.
 ## Limits
 
 - PostgreSQL passwords are never captured or restored.
+- Roles are cluster-wide and are **not** rolled back. The destination removes the
+  databases a failed restore created, but roles it created stay behind; drop them
+  by hand if the cluster must be returned to its exact prior state.
 - The source account needs `SELECT` or `USAGE` on every sequence.
   `pg_sequences.last_value` is NULL both for a sequence that was never called
   and for one the role may not read, and `GRANT SELECT ON ALL TABLES` does not

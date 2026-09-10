@@ -143,8 +143,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Delimited<T> {
                 self.read_buf.len() < MAX_FRAME_LENGTH,
                 "control frame exceeds MAX_FRAME_LENGTH ({MAX_FRAME_LENGTH}) with no delimiter"
             );
+            // Read no more than the frame bound still allows. Reading a full
+            // 1 KiB into a buffer already at `MAX_FRAME_LENGTH - 1` let the
+            // accumulated frame overshoot the bound this doc comment promises by
+            // up to 1023 bytes before the next iteration noticed.
             let mut buf = [0u8; 1024];
-            match self.inner.read(&mut buf).await? {
+            let allowance = (MAX_FRAME_LENGTH - self.read_buf.len()).min(buf.len());
+            match self.inner.read(&mut buf[..allowance]).await? {
                 0 => return Ok(None),
                 n => self.read_buf.extend_from_slice(&buf[..n]),
             }
@@ -183,5 +188,68 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Delimited<T> {
         timeout(HANDSHAKE_TIMEOUT, self.recv_server())
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for server handshake frame"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A peer that hands over `STEP` bytes per read and never a delimiter. The
+    /// step is deliberately not a divisor of [`MAX_FRAME_LENGTH`], so the buffer
+    /// lands just under the bound and the next read is the one that could
+    /// overshoot it.
+    struct Trickle;
+
+    const STEP: usize = 700;
+
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let n = STEP.min(buf.remaining());
+            buf.put_slice(&vec![b'x'; n]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Trickle {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The refusal is not enough on its own: the buffer must never hold more
+    /// than the bound it is refused against, whatever chunk sizes the peer uses.
+    #[tokio::test]
+    async fn the_frame_buffer_never_exceeds_the_bound() {
+        let mut framed = Delimited::new(Trickle);
+        let error = framed
+            .recv_client()
+            .await
+            .expect_err("a frame with no delimiter must be refused");
+        assert!(
+            error.to_string().contains("MAX_FRAME_LENGTH"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            framed.read_buf.len() <= MAX_FRAME_LENGTH,
+            "the buffer grew to {} bytes, past MAX_FRAME_LENGTH ({MAX_FRAME_LENGTH})",
+            framed.read_buf.len()
+        );
     }
 }

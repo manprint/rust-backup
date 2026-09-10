@@ -49,6 +49,14 @@ quotes to force a string that would otherwise read as a number or a boolean —
 | `--config <file>` | `RUST_BACKUP_CONFIG` | — | YAML config underlay |
 | `-v` | — | — | increase log verbosity (repeatable) |
 
+**Module boolean switches are three-state.** `--overwrite`, `--admin`,
+`--path-style`, `--follow-symlinks`, `--no-preserve-ownership` and
+`--preserve-xattr` mean "true" when given bare, take an explicit value with
+`=` (`--overwrite=false`), and fold into the config only when they were actually
+given — so an explicit `false` overrides a YAML `true`, like every other field.
+The value must be attached with `=`; `--overwrite false` is rejected, because a
+space-separated value would swallow the next argument.
+
 **Client TLS is selected by the `--to` value, not by a flag.** `--to
 coordinator:7835` speaks plain TCP; `--to https://coordinator:7835` performs a
 TLS handshake against a coordination server started with `--tls-cert` and
@@ -57,10 +65,6 @@ TLS handshake against a coordination server started with `--tls-cert` and
 A scheme with no port defaults to 443 for `https://` and 80 for `http://`, so
 name the port explicitly. `--insecure` skips certificate verification and is for
 isolated tests only.
-
-`RUST_BACKUP_VERIFY_TIMEOUT` sets the maximum destination read-back verification
-time in seconds (default 86400). It is deliberately separate from transfer time:
-large databases and buckets may require a complete second read.
 
 > **`--overwrite` destroys before it restores, and a restore is not atomic.**
 > Plan a maintenance window on that basis. PostgreSQL drops each target
@@ -91,20 +95,20 @@ rust-backup server --bind-addr 0.0.0.0 --control-port 7835 \
   --secret-file /run/secrets/rust-backup --tls-cert server.crt --tls-key server.key
 ```
 
-| Flag | Env | Default |
-|------|-----|---------|
-| `--bind-addr` | `RUST_BACKUP_BIND_ADDR` | `0.0.0.0` |
-| `--control-port` | `RUST_BACKUP_CONTROL_PORT` | `7835` |
-| `--secret` | `RUST_BACKUP_SECRET` | none |
-| `--secret-file` | `RUST_BACKUP_SECRET_FILE` | none |
-| `--tls-cert` | `RUST_BACKUP_TLS_CERT` | none; TLS disabled |
-| `--tls-key` | `RUST_BACKUP_TLS_KEY` | none; required with `--tls-cert` |
-| `--max-conns` | `RUST_BACKUP_MAX_CONNS` | `256` |
-| `--udp` | `RUST_BACKUP_UDP` | on |
+| Flag | Env | Default | Meaning |
+|------|-----|---------|---------|
+| `--bind-addr` | `RUST_BACKUP_BIND_ADDR` | `0.0.0.0` | listen address |
+| `--control-port` | `RUST_BACKUP_CONTROL_PORT` | `7835` | TCP control port (and the UDP port when `--udp` is on) |
+| `--secret` | `RUST_BACKUP_SECRET` | none | shared HMAC secret |
+| `--secret-file` | `RUST_BACKUP_SECRET_FILE` | none | same, read from a file |
+| `--tls-cert` | `RUST_BACKUP_TLS_CERT` | none; TLS disabled | server certificate chain |
+| `--tls-key` | `RUST_BACKUP_TLS_KEY` | none; required with `--tls-cert` | server private key |
+| `--max-conns` | `RUST_BACKUP_MAX_CONNS` | `256` | the real bound, applied twice: at most this many client connections are accepted at once, and at most this many relayed substreams are spliced at once. A pairing uses two connections (source + destination), so this permits `--max-conns / 2` concurrent transfers. Excess connections wait in the kernel backlog rather than being dropped |
+| `--udp` | `RUST_BACKUP_UDP` | on | broker the direct UDP/QUIC path |
 
 ## Modules
 
-### postgres (PostgreSQL 10..=latest, cluster fidelity)
+### postgres (PostgreSQL 10+, cluster fidelity)
 
 ```sh
 # source: a READ-ONLY user is required
@@ -192,7 +196,27 @@ By default the destination prints the received plan + preflight results and wait
 `yes` on stdin before the transfer starts. Pass `--yes` (or `auto_accept: true` in
 YAML) to proceed automatically.
 
+## Environment variables with no flag
+
+These are read directly from the environment and therefore appear in no
+`--help` output. Every one of them is optional.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUST_LOG` | `info` | `tracing` filter; `-v` raises the level without it |
+| `RUST_BACKUP_PLAN_TIMEOUT` | `600` | seconds to wait for the peer's plan exchange (`Plan`/`PlanAck`). A value of `0` or unparsable text falls back to the default |
+| `RUST_BACKUP_VERIFY_TIMEOUT` | `86400` | seconds the source waits for the destination's read-back verification. Deliberately separate from transfer time: a large database or bucket needs a complete second read |
+| `RUST_BACKUP_STUN_SERVERS` | `stun.l.google.com:19302,stun.cloudflare.com:3478` | comma-separated STUN chain for the direct UDP path; the first four entries are used. `RUST_BACKUP_STUN_SERVER` (singular) is still accepted and used only when the plural one is unset |
+| `BORE_PROXY_BUFFER_SIZE` | `256 KiB` | relay splice buffer; accepts suffixes (`512k`, `1MiB`) and is clamped to 4 KiB..16 MiB. Inherited from the vendored `bore` transport |
+
+`RUST_BACKUP_S3_TEST_FAIL_AFTER_PART` is a test-only fault hook used by the
+MinIO e2e script; it is not part of the supported configuration surface.
+
 ## Exit codes
 
-`0` success · `2` config · `3` preflight · `4` operator rejection · `5`
-integrity/apply · `6` source mutation · `7` transport · `1` other failure.
+`0` success · `1` any other failure · `2` config · `3` preflight · `4` plan
+rejected by the operator · `5` integrity, apply or verify · `6` source mutation ·
+`7` transport/connect.
+
+Code `5` covers all three: an integrity failure (a digest or a read-back
+mismatch) and any error tagged `[Apply]` or `[Verify]`.

@@ -105,7 +105,7 @@ pub trait BackupModule: Send + Sync {
         1
     }
 
-    /// Human-readable supported-version range (e.g. "PostgreSQL 10..=latest").
+    /// Human-readable supported-version range (e.g. "PostgreSQL 10+").
     fn version_support(&self) -> &'static str;
 
     /// Open a read-only source from connection params.

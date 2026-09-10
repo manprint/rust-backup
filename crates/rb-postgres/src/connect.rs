@@ -5,10 +5,10 @@
 //! returned by `tokio-postgres` is spawned so the [`Client`] is usable; it ends
 //! when the client drops.
 //!
-//! TLS note: only the non-TLS sslmodes (`disable`/`allow`/`prefer`) are wired in
-//! this phase — `prefer`/`allow` simply connect without SSL here. The verifying
-//! modes (`require`/`verify-ca`/`verify-full`) are rejected with a clear error
-//! until the rustls connector lands (tracked in the plan's Phase 2 TLS follow-up).
+//! TLS: `disable`/`allow`/`prefer` connect without SSL. The verifying modes
+//! (`require`/`verify-ca`/`verify-full`) are implemented over rustls — see
+//! [`postgres_tls`] for the root store, the optional private CA (`sslrootcert`)
+//! and what each mode does and does not check.
 
 use rb_core::error::{BackupError, Phase, Result};
 use tokio_postgres::config::SslMode;

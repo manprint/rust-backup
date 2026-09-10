@@ -15,13 +15,17 @@ fn free_port() -> u16 {
 }
 
 async fn start_server(port: u16) {
+    start_server_with_max_conns(port, 256).await
+}
+
+async fn start_server_with_max_conns(port: u16, max_conns: usize) {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".to_string(),
         control_port: port,
         secret: None,
         tls_cert: None,
         tls_key: None,
-        max_conns: 256,
+        max_conns,
         udp: false,
     };
     tokio::spawn(async move {
@@ -270,4 +274,49 @@ async fn tls_handshake_has_a_deadline() {
 fn control_message_types_are_public() {
     let _ = ClientMsg::Heartbeat;
     let _ = ServerMsg::Ok;
+}
+
+/// `--max-conns` must bound the accepted control connections, not only the
+/// relayed substreams inside one of them. Before this, the accept loop spawned a
+/// task and a yamux session for every peer that could reach the port, and a
+/// `Register` then claimed a registry entry that outlived the handshake — none
+/// of it capped by the flag operators are told is "the real bound".
+#[tokio::test]
+async fn max_conns_bounds_the_accepted_control_connections() {
+    let port = free_port();
+    start_server_with_max_conns(port, 1).await;
+
+    let hog = rb_transport::connect_source(&transport(port, "hog"))
+        .await
+        .expect("the first source takes the only permit");
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(750),
+        rb_transport::connect_source(&transport(port, "second")),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the server served a second connection past --max-conns 1"
+    );
+
+    // The permit is held for the connection's whole life, so it comes back only
+    // when that connection ends.
+    drop(hog);
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if rb_transport::connect_source(&transport(port, "second"))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "the connection permit was never returned to the pool"
+    );
 }

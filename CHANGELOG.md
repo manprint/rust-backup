@@ -1,5 +1,117 @@
 # Changelog
 
+## Unreleased — pre-staging review (2026-09-11)
+
+A full line-level re-review of the tree before staging. Every item below fails
+against the previous code and carries a test that proves it.
+
+### Correctness
+
+- **A completed QUIC transfer could be reported as failed.** quinn's
+  `CONNECTION_CLOSE(0)` overtakes the stream FIN, so the destination's
+  `await_peer_close` saw `connection lost: closed by peer: 0` instead of EOF on
+  a transfer that had already verified. A graceful application close with code
+  `0` — the code both `DirectConn::close` and a dropped connection handle send —
+  now reads as EOF. Nothing else does, so a truncation still fails
+  (`rb-transport`).
+- **MongoDB `--overwrite` could leave a half-loaded replacement uncleaned.** The
+  "already present" snapshot was taken *after* `restore_namespaces` had already
+  dropped each target, so an overwritten collection was recorded as pre-existing
+  and excluded from rollback. The drops now happen before the snapshot.
+- **PostgreSQL: four classes of object were copied away silently.** Analysis now
+  refuses logical-replication publications, logical-replication subscriptions,
+  event triggers, and any identifier containing a dot (which this build's
+  qualified references cannot name unambiguously). Each probe was validated
+  against live PostgreSQL 10 and 18, as superuser and as a plain LOGIN role.
+- **PostgreSQL: a zero-column inheritance parent streamed its children's rows.**
+  `COPY t TO` has no `ONLY` form, and a table with no COPY-able columns took the
+  plain-`COPY` path. It now uses `COPY (SELECT FROM ONLY t)`.
+- **PostgreSQL: an extension was created before the schema it lives in.**
+  `CREATE EXTENSION … WITH SCHEMA gis` now follows the `CREATE SCHEMA`.
+- **`Ctrl-C` left the destination's partial item on disk.** `SIGINT`/`SIGTERM`
+  are handled: the run aborts through the normal path, the active item is
+  removed, nothing prints `VERIFIED`, and the message says the run was
+  interrupted. Proven by a new `e2e/fault_matrix.sh` case whose negative control
+  (an unhandled `SIGQUIT`) still fails assertion B.
+- **A module error wrapped by `plan` or the config loader lost its exit code.**
+  Four `map_err(|e| anyhow!("{e}"))` sites threw the typed `BackupError` away,
+  so a missing credential exited 1 instead of the documented 2.
+- **`--admin=false` could not override `admin: true` in YAML.** The six boolean
+  module flags are three-state now (`--flag`, `--flag=false`, absent), and only
+  an explicitly given value overlays the config. The value must be attached with
+  `=`; the space-separated `--flag false` spelling is rejected so the switch
+  cannot swallow the next argument.
+- **A watcher task leaked on the destination-verify timeout.** That one exit
+  path returned without aborting the spawned completion watcher.
+- **A carrier index above `u16::MAX` was truncated on the wire** instead of
+  refused at `Connect`.
+
+### Hardening
+
+- `--max-conns` now bounds **the accepted control connections as well as** the
+  relayed substreams. The accept loop was unbounded: any peer that could reach
+  the port got a task, a yamux session and — after `Register` — a registry entry
+  that outlived the handshake. The permit is taken *before* `accept()`, so the
+  excess waits in the kernel backlog.
+- Restored files and directories are created owner-only (`0600`/`0700`) and
+  widened to their recorded mode only once content and ownership are in place;
+  there is no longer a window in which a private file is world-readable.
+- The filesystem destination refuses two more hostile-plan shapes: a
+  non-directory entry that is an ancestor of another entry, and a hardlink that
+  names an entry the plan does not declare as a file.
+- The control-frame buffer can no longer overshoot `MAX_FRAME_LENGTH` by up to
+  1023 bytes before the bound trips; each read is capped by the remaining
+  allowance.
+- S3 re-checks the catalog size against the plan item's size inside
+  `restore_object`, not only at preflight.
+
+### Tests
+
+- The multi-carrier fault bank was fake coverage: `protocol_faults_are_…` bound
+  `carriers` and never passed it anywhere, so both passes drove the identical
+  single-stream parser and every defensive branch of `MultiStreamChunkSource`
+  was untested. There is now a real item-pinned multi-carrier harness, two tests
+  for the demux's own defences, one that proves an idle sibling carrier is not
+  read while the cursor sits on an item, and a per-case timeout so a stalled
+  parser fails instead of wedging CI.
+- `e2e/relay_smoke.sh` seeds the large mixed-size fixture (220 bulk entries plus
+  the metadata tree) that plan F1.1 and QA criterion 2 ask for; the old
+  eight-entry tree never kept four carriers busy at once.
+- Suite: 250 tests, 0 ignored (rb-postgres 65, rb-transport 58, rb-core 46,
+  rb-mongodb 31, rust-backup 24, rb-filesystem 13, rb-s3 13).
+
+### CI and tooling
+
+- The `aws-s3` e2e job never set `RUST_BACKUP_AWS_E2E=1`, so it printed SKIP and
+  reported green — a real-AWS run that never happened.
+- `scripts/gates.sh` passes `--locked` to clippy, both builds and the test run.
+- `security.yml` derives its tool cache keys from the pinned versions instead of
+  repeating them, so bumping a `--version` can no longer restore the old binary
+  from cache and skip the install.
+- The `postgres-introspection` job gained the cargo cache the other jobs have.
+- `scripts/help_parity.sh` scans documents by glob. Its hand-kept list named
+  `docs/DEPLOYMENT.md`, which does not exist, and the `[[ -f ]]` guard made that
+  silently a no-op.
+
+### Documentation
+
+- The PostgreSQL supported range is stated one way everywhere: major 10 is the
+  enforced minimum, there is no upper bound, and the CI matrix covers 10–18.
+- Exit code 5 is documented as integrity **or** apply **or** verify (it was
+  "integrity/apply" in one place and "integrity/verify" in another), and both
+  lists now include 0 and 1.
+- New: every environment variable that has no flag (`RUST_LOG`,
+  `RUST_BACKUP_PLAN_TIMEOUT`, `RUST_BACKUP_VERIFY_TIMEOUT`,
+  `RUST_BACKUP_STUN_SERVERS`, `BORE_PROXY_BUFFER_SIZE`), every variable
+  `compose.yml` reads — including that `RUST_BACKUP_CONTROL_PORT` remaps only
+  the published host port — and every switch the e2e scripts read.
+- `docs/modules/README.md` no longer says "live matrix pending" for modules
+  whose matrices are green; the historical V1/V2 plans carry a superseded
+  banner; the README documentation index lists every document.
+- `CLAUDE.md`: `tokio::io::split` on a `mux::Stream` is safe for read/write
+  (yamux 0.13 keeps separate reader/writer waker slots) — what is unsafe is two
+  tasks on the same direction.
+
 ## 0.1.0 — 2026-09-09
 
 First release. The workspace version, the plan/wire `PLAN_FORMAT_VERSION` and

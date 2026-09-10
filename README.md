@@ -14,7 +14,8 @@ again on every exit path to prove that it was not modified.
 
 Supported modules:
 
-- PostgreSQL 10–18: logical cluster metadata and binary `COPY` data.
+- PostgreSQL 10+: logical cluster metadata and binary `COPY` data. Major 10 is
+  the enforced minimum; the CI matrix covers 10–18.
 - MongoDB 4–8: databases, collection options, indexes and BSON documents.
 - POSIX filesystem: files, directories, links, modes, ownership and mtimes.
 - AWS S3 and compatible storage such as MinIO: streaming multipart restore.
@@ -120,6 +121,19 @@ RUST_BACKUP_UDP_PORT=17835 \
 RUST_BACKUP_MAX_CONNS=1024 \
 docker compose up -d
 ```
+
+Every variable `compose.yml` reads, and what it actually changes:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `RUST_BACKUP_IMAGE` | `ghcr.io/manprint/rust-backup:latest` | image to run |
+| `RUST_BACKUP_CONTROL_PORT` | `7835` | **published host TCP port only.** The server inside the container always listens on 7835 — the compose `command` passes `--control-port 7835` literally. Clients still connect to the host port you publish here |
+| `RUST_BACKUP_UDP_PORT` | `7835` | published host UDP port, same mapping-only meaning |
+| `RUST_BACKUP_MAX_CONNS` | `256` | passed through as `--max-conns`; this one does change the server |
+| `RUST_BACKUP_UDP` | `true` | passed through as `--udp` |
+| `RUST_BACKUP_SECRET_FILE` | `./deploy/coordination/coordination.secret` | host path mounted as the `coordination_secret` docker secret |
+| `RUST_BACKUP_VERSION` | `dev` | build arg stamped into the image (`docker compose build` only) |
+| `RUST_BACKUP_VCS_REF` | `local` | build arg stamped into the image (`docker compose build` only) |
 
 For native TLS, place `tls.crt` and `tls.key` in
 `deploy/coordination/tls/` and apply the override:
@@ -419,8 +433,11 @@ Every push and pull request targeting `dev` or `main` runs:
 - `ci.yml`: fmt, Clippy with warnings denied, all/default feature builds and
   tests, rustdoc, shell lint, actionlint and Compose validation.
 - `e2e.yml`: every local e2e suite, database version matrices and privileged
-  network/disk/bandwidth tests. Real AWS runs only when the protected `aws-e2e`
-  environment, repository variables and secrets are configured.
+  network/disk/bandwidth tests. The real-AWS job runs only on a push (never on a
+  pull request) and only when the repository variable `RUN_AWS_E2E` is `true`;
+  it then needs the protected `aws-e2e` environment, the `AWS_*` secrets and the
+  `RUST_BACKUP_AWS_{SOURCE,DEST}_BUCKET` variables. When it runs, it really
+  runs — the job sets the script's own `RUST_BACKUP_AWS_E2E=1` opt-in.
 - `security.yml`: RustSec, cargo-deny advisories/licenses/bans/sources, unused,
   duplicate and outdated dependency checks, dependency review, workflow audit
   and CodeQL.
@@ -443,10 +460,29 @@ git push origin v0.1.0
 
 ## More documentation
 
+Operator-facing:
+
 - [Complete CLI reference](USAGE.md)
 - [Transport and carrier contract](docs/TRANSPORT.md)
-- [Module-specific behavior](docs/modules/README.md)
+- [Module-specific behavior](docs/modules/README.md) —
+  [postgres](docs/modules/POSTGRES.md) ·
+  [mongodb](docs/modules/MONGODB.md) ·
+  [filesystem](docs/modules/FILESYSTEM.md) ·
+  [s3](docs/modules/S3.md)
 - [QA guide](docs/QA_GUIDE.md)
-- [Severe implementation audit](docs/plans/RUST_BACKUP_AUDIT_2026-07-29.md)
+- [Release notes](CHANGELOG.md)
+- [End-to-end harness](e2e/README.md)
+
+Design and audit history (records, not instructions — the operator docs above
+are authoritative):
+
+- [Current status and sign-off](docs/plans/RESUME.md)
+- [Plan V3 — the final roadmap](docs/plans/RUST_BACKUP_PLAN_V3.md)
+- [Plan V2](docs/plans/RUST_BACKUP_PLAN_V2.md) ·
+  [original plan](docs/plans/RUST_BACKUP_PLAN.md)
+- [Live V1 results](docs/plans/V1_LIVE_RESULTS.md)
+- Implementation audits:
+  [2026-07-29](docs/plans/RUST_BACKUP_AUDIT_2026-07-29.md) ·
+  [2026-09-09](docs/plans/RUST_BACKUP_AUDIT_2026-09-09.md)
 
 Licensed under [AGPL-3.0-or-later](LICENSE).

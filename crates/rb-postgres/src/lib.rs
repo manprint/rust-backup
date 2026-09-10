@@ -6,7 +6,7 @@
 
 //! rust-backup PostgreSQL module.
 //!
-//! Logical, pure-Rust backup/restore for PostgreSQL 10..=latest via catalog
+//! Logical, pure-Rust backup/restore for PostgreSQL 10+ via catalog
 //! introspection + binary `COPY` streaming (no `pg_dump`). Built phase by phase
 //! per `docs/plans/RUST_BACKUP_PLAN.md` §"Phase 2".
 
@@ -119,7 +119,7 @@ impl BackupModule for Module {
     }
 
     fn version_support(&self) -> &'static str {
-        "PostgreSQL 10..=18 (logical, pure Rust)"
+        "PostgreSQL 10+ (logical, pure Rust)"
     }
 
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {

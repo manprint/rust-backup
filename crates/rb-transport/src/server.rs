@@ -327,7 +327,18 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
         _ => anyhow::bail!("--tls-cert and --tls-key must be supplied together"),
     };
 
+    // `max_conns` bounded the relayed substreams only, so the accept loop itself
+    // was unbounded: every peer that could reach the port got a task, a yamux
+    // session and — after `Register` — a registry entry that outlives the
+    // handshake, none of it capped. Acquire the permit BEFORE `accept()` so the
+    // excess waits in the kernel backlog (real backpressure) instead of being
+    // accepted and dropped, and hold it for the connection's whole life.
+    let sessions = Arc::new(Semaphore::new(cfg.max_conns));
     loop {
+        let permit = Arc::clone(&sessions)
+            .acquire_owned()
+            .await
+            .context("connection semaphore closed")?;
         match listener.accept().await {
             Ok((socket, peer)) => {
                 tune_tcp(&socket);
@@ -338,6 +349,7 @@ pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
                 let tls = tls.clone();
                 tokio::spawn(
                     async move {
+                        let _permit = permit;
                         if let Err(error) = handle_accepted_conn(
                             socket,
                             tls,

@@ -45,9 +45,9 @@ the exact-path sudoers rule.
 
 | Matrix | Exact command | Result |
 |---|---|---|
-| Rust gates | `bash scripts/gates.sh` | **PASS** — 234 tests passed, 0 ignored |
-| Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=22 PASS=54 FAIL=0**, no `SKIP` — every group ran |
-| Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **CASES=7 PASS=19 FAIL=0** — 6 fault cases × A/B/C, plus the refusal of a destination a killed run left partial |
+| Rust gates | `bash scripts/gates.sh` | **PASS** — 250 tests passed, 0 ignored |
+| Fault matrix, all groups | `bash e2e/fault_matrix.sh` | **CASES=23 PASS=57 FAIL=0**, no `SKIP` — every group ran |
+| Fault matrix, filesystem | `bash e2e/fault_matrix.sh filesystem` | **CASES=8 PASS=22 FAIL=0** — 7 fault cases × A/B/C (including the `SIGINT` destination interrupt), plus the refusal of a destination a killed run left partial |
 | Fault matrix, immutability (F2.5) | `bash e2e/fault_matrix.sh immutability` | **PASS=2 FAIL=0** — a sibling load raises no false `SourceMutated` and still verifies; a real source write exits 6 with `SOURCE-IMMUTABILITY VIOLATION` and no `RESTORE VERIFIED` |
 | Fault matrix, postgres | `bash e2e/fault_matrix.sh postgres` | **PASS=9 FAIL=0** (source killed, relay reset, destination backend stopped) |
 | Fault matrix, mongodb | `bash e2e/fault_matrix.sh mongodb` | **PASS=9 FAIL=0** |

@@ -17,7 +17,7 @@ is staged to disk on either host** — all data streams.
 - `rust-backup plan <module> source <PARAMS>` — dry-run: print plan only
 
 **Modules** (`module ∈ postgres | mongodb | filesystem | s3`): postgres (cluster
-fidelity, pg 10..=latest), mongodb (4..=8), filesystem (POSIX, ownership/perms on
+fidelity, pg 10+ — minimum enforced, CI matrix 10..=18), mongodb (4..=8), filesystem (POSIX, ownership/perms on
 Linux), s3 (AWS S3 + MinIO). All use **pure-Rust drivers — no external binaries**
 (`pg_dump`/`mongodump` are NOT used).
 
@@ -65,17 +65,22 @@ against an in-memory channel.
   plan alone — no extra round-trip to the source.
 - **Transport rules inherited from bore** (see `vendored-from-bore/` + the bore
   CLAUDE.md): client sends its `Register`/`Connect` BEFORE auth (yamux lazy
-  substream — else deadlock); write `STREAM_READY` before splice; never
-  `tokio::io::split` a `mux::Stream` across two tasks (yamux waker bug — one stream
-  = one task); apply `tune_tcp` to every socket; `--max-conns` semaphore is the
-  real bound. Direct path falls back to the warm relay per-connection; UDP never
-  gates channel liveness.
+  substream — else deadlock); write `STREAM_READY` before splice;
+  apply `tune_tcp` to every socket; `--max-conns` bounds BOTH the accepted
+  control connections and the relayed substreams. Direct path falls back to the
+  warm relay per-connection; UDP never gates channel liveness.
   - **Control heartbeat + recv-deadline reaper.** A yamux substream hides a
     half-open peer, so liveness needs an app-level deadline. The provider sends
     `Heartbeat` every `CTRL_CLIENT_HEARTBEAT` (20 s); the coord server reaps a
     registry entry whose control substream has been silent for
     `SECRET_CTRL_TIMEOUT` (60 s). Without this, a wedged/abandoned provider
     zombies its channel id (`secret.rs`).
+  - **`tokio::io::split` on a `mux::Stream` — read/write only.** yamux 0.13's
+    `Shared` keeps separate `reader`/`writer` waker slots, so a read half in one
+    task and a write half in another is safe and is what the session does. What
+    is NOT safe is two tasks on the *same* direction: they overwrite each
+    other's waker in the one slot for that direction and one of them is lost.
+    One direction = one task.
   - **UDP hole-punch socket bind — never `SO_REUSEADDR`.** Bind the fixed/preferred
     punch port plainly; on `EADDRINUSE` fall back to an ephemeral port. Two
     wildcard UDP sockets that both set `SO_REUSEADDR` co-bind the same port and

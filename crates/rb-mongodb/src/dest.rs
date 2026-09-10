@@ -180,6 +180,18 @@ pub async fn stream_in(
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
     let conn = MongoConnection::connect(params).await?;
 
+    // `--overwrite` destroys every target namespace first, as one pass, before
+    // the snapshot below. Doing it per collection inside the create loop — where
+    // it used to live — recorded an overwritten collection as "already present",
+    // so a run that failed afterwards kept a half-loaded replacement of the very
+    // data the operator asked to replace and never reported it. Dropping first
+    // also means a namespace the drop pass never reached still holds its
+    // original contents, so the cleanup cannot remove something this run did not
+    // touch.
+    if params.overwrite {
+        drop_target_namespaces(&conn, &payload).await?;
+    }
+
     // Snapshot which target namespaces exist *before* this run creates any, so a
     // later failure removes exactly what this run brought into existence and
     // never a collection it found already there.
@@ -221,6 +233,29 @@ async fn restore_namespaces(
         let database = conn.client.database(&db.name);
         for coll in &db.collections {
             build_indexes(&database, coll).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every namespace the plan targets, before anything is created and before
+/// the pre-existing snapshot is taken. Only reached with `--overwrite`; the
+/// namespace guard is re-applied per collection so a hostile plan cannot make
+/// this pass destroy a system namespace.
+async fn drop_target_namespaces(conn: &MongoConnection, payload: &MongoPlanPayload) -> Result<()> {
+    for db in &payload.databases {
+        let database = conn.client.database(&db.name);
+        for coll in &db.collections {
+            check_namespace(&db.name, &coll.name)?;
+            if let Err(error) = database.collection::<Document>(&coll.name).drop().await {
+                if !is_namespace_not_found(&error) {
+                    return Err(BackupError::phase_src(
+                        Phase::Apply,
+                        format!("drop existing collection {}.{}", db.name, coll.name),
+                        error,
+                    ));
+                }
+            }
         }
     }
     Ok(())

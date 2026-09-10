@@ -11,7 +11,7 @@
 //!   `pg_get_indexdef`, `pg_get_viewdef`, `pg_get_functiondef`, `format_type`,
 //!   `pg_get_expr`, `pg_get_partkeydef`) instead of hand-reconstructing DDL.
 //! - `left(nspname,3) <> 'pg_'` to skip system schemas (no `LIKE`-escape pitfalls).
-//! - Version-branch the few catalog columns that differ across 10..=latest
+//! - Version-branch the few catalog columns that differ across 10 and newer
 //!   (`attgenerated` is 12+, `prokind` is 11+, database locale metadata is
 //!   provider-aware in 15+ and renamed in 17).
 //! - Exclude extension-owned objects from DDL (recreated by `CREATE EXTENSION`).
@@ -873,6 +873,43 @@ async fn find_unsupported_objects(
                AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
                AND pg_catalog.format_type(a.atttypid, NULL) ~ \
                    '^reg(class|proc|procedure|type|namespace|role|oper|operator|config|dictionary|collation)(\\[\\])?$'",
+        ),
+        (
+            "logical-replication publications",
+            "SELECT p.pubname::text FROM pg_catalog.pg_publication p",
+        ),
+        (
+            "logical-replication subscriptions",
+            "SELECT s.subname::text FROM pg_catalog.pg_subscription s \
+             WHERE s.subdbid = (SELECT d.oid FROM pg_catalog.pg_database d \
+                                WHERE d.datname = pg_catalog.current_database())",
+        ),
+        (
+            "event triggers",
+            "SELECT e.evtname::text FROM pg_catalog.pg_event_trigger e",
+        ),
+        (
+            "identifiers containing a dot, which this build's qualified \
+             references cannot name unambiguously",
+            "SELECT name FROM ( \
+               SELECT ('schema ' || n.nspname)::text AS name \
+                 FROM pg_catalog.pg_namespace n \
+                WHERE n.nspname LIKE '%.%' \
+                  AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               UNION ALL \
+               SELECT ('relation ' || n.nspname || '.' || c.relname)::text \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                WHERE c.relname LIKE '%.%' \
+                  AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               UNION ALL \
+               SELECT ('column ' || n.nspname || '.' || c.relname || '.' || a.attname)::text \
+                 FROM pg_catalog.pg_attribute a \
+                 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                WHERE a.attname LIKE '%.%' AND a.attnum > 0 AND NOT a.attisdropped \
+                  AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+             ) AS dotted",
         ),
     ];
     // PostgreSQL 18 catalogues every NOT NULL constraint in `pg_constraint`

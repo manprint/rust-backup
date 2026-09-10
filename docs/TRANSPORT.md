@@ -32,6 +32,14 @@ recv-deadline reaper instead. A relayed substream owes its readiness byte within
 `STREAM_READY_TIMEOUT`; that read holds a `--max-conns` permit, so it must never
 block indefinitely.
 
+`--max-conns` is applied in two places, and both matter. The accept loop takes a
+permit **before** `accept()`, so at most that many client connections exist at
+once and the excess waits in the kernel backlog — without it, any peer that
+could reach the port got a task, a yamux session, and after `Register` a
+registry entry that outlived the handshake. Each relayed substream then takes a
+permit of its own for the length of its splice. A pairing uses two client
+connections, so the flag permits `--max-conns / 2` concurrent transfers.
+
 A channel pairs exactly **one** source with **one** destination. The channel id
 is claimed atomically, so two sources that register at the same moment cannot
 both believe they own it and the loser can never evict the winner. A second

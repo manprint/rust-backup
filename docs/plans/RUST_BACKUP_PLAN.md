@@ -1,4 +1,10 @@
-# rust-backup — Implementation Plan
+# rust-backup — Implementation Plan (HISTORICAL)
+
+> **Superseded.** This is the original V1 plan, kept for its design rationale.
+> The current roadmap is [RUST_BACKUP_PLAN_V3.md](RUST_BACKUP_PLAN_V3.md) and the
+> current status is [RESUME.md](RESUME.md). Everything below — including the
+> "⏯ RESUME HERE" block dated 2026-06-25 — describes the state of the tree at
+> the time it was written, not today's. Do not act on it.
 
 > Self-contained, phased plan. Every sub-phase tags the model that should execute
 > it (Opus architect / Sonnet developer / Haiku explorer) and lists Files · Change
@@ -8,9 +14,11 @@
 
 ---
 
-## ⏯ RESUME HERE — current implementation state
+## ⏯ RESUME HERE — implementation state as of 2026-06-25 (STALE)
 
-> Read this first to continue work. Updated **2026-06-25**.
+> **Historical snapshot, not the current state.** Kept verbatim as a record of
+> where V1 stood on 2026-06-25. For where the project stands now see
+> [RESUME.md](RESUME.md).
 
 **Done & committed:** Phase 0 (skeleton) + **Phase 1 (transport direct path), all
 non-e2e sub-phases**. Working tree green on `bash scripts/gates.sh` (clippy
@@ -349,7 +357,7 @@ subcommand; relay channel moves bytes in an in-process e2e.
 
 ### Phase 2 — PostgreSQL module (cluster fidelity, D6)
 
-> `tokio-postgres = "0.7"`. Supports pg 10..=latest via protocol v3. Logical
+> `tokio-postgres = "0.7"`. Supports pg 10+ via protocol v3. Logical
 > approach: catalog introspection + `COPY … (FORMAT binary)` streaming.
 
 > **Status** *(2026-06-24)* — gates green; DB-backed e2e is script-only here

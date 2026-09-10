@@ -18,6 +18,7 @@ return non-zero on any failure.
 | `bandwidth_netem.sh` | T-BW | 6 | asymmetric bandwidth/RTT, backpressure proof |
 | `s3_minio_test.sh` | — | 5 | MinIO 1:1 |
 | `s3_aws_test.sh` | — | 5 | credential-gated real AWS S3 smoke |
+| `resource_hygiene_check.sh` | T-HYGIENE | 8 | static guard: every e2e script parses, and each one only removes namespaces/containers it created. Run by `full_matrix.sh`; no Docker or sudo |
 | `full_matrix.sh` | — | 8 | non-privileged matrix; Docker DBs and sudo tests opt in |
 
 `relay_smoke.sh` needs only cargo and Python 3. `s3_minio_test.sh` needs Docker.
@@ -37,6 +38,20 @@ MongoDB 4..8 same-version matrices plus the configured cross-version pairs.
 Each successful E2E path calls `rb_assert_formal_verification`: both peers must
 print their formal verified message, finish at `status="verified"` and `100.0%`,
 and report the same 64-character payload BLAKE3.
+
+Environment switches the scripts read:
+
+| Variable | Default | Used by | Effect |
+|----------|---------|---------|--------|
+| `RUST_BACKUP_BIN` | built release binary | all | absolute path to an already-built binary |
+| `RUST_BACKUP_PRIVILEGED` | `0` | `full_matrix.sh` | also run the sudo filesystem/ENOSPC/transport/bandwidth groups |
+| `RUST_BACKUP_FULL_DB_MATRIX` | `0` | `full_matrix.sh` | also run the PostgreSQL and MongoDB version matrices |
+| `RUST_BACKUP_FAULT_BACKENDS` | `1` | `fault_matrix.sh` | set `0` to skip the Docker-backed fault groups |
+| `RUST_BACKUP_E2E_CARRIERS` | `1` | `relay_smoke.sh` | carriers both peers request |
+| `RUST_BACKUP_E2E_BULK_FILES` | `220` | `relay_smoke.sh` | bulk fixture entries, so several carriers stay busy at once |
+| `RUST_BACKUP_E2E_TLS` | `0` | `relay_smoke.sh` | generate a self-signed cert and run the relay over TLS |
+| `RUST_BACKUP_E2E_KEEP` | `0` | most | keep the temporary work directory and print its path |
+| `RUST_BACKUP_AWS_E2E` | `0` | `s3_aws_test.sh` | opt in to the real-AWS smoke; without it the script prints SKIP |
 
 Database arguments accept `source:destination`, for example:
 

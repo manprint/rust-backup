@@ -206,6 +206,10 @@ fs_case() { # label victim when
   case "$victim" in
     source) kill -9 "$source_pid" >/dev/null 2>&1 ;;
     destination) kill -9 "$destination_pid" >/dev/null 2>&1 ;;
+    # An operator interrupt, not a hard kill: the destination handles SIGINT, so
+    # here the strong half of assertion B applies — the active partial file must
+    # be gone, exactly as the module documentation promises.
+    destination-interrupt) kill -INT "$destination_pid" >/dev/null 2>&1 ;;
     server) kill -9 "$server_pid" >/dev/null 2>&1 ;;
   esac
 
@@ -253,7 +257,7 @@ fs_case() { # label victim when
   # C. The peer that observed the fault as an error is the one that survived it.
   case "$victim" in
     source) assert_phase "$label" "$dlog" 'Transfer|Apply' ;;
-    destination) assert_phase "$label" "$slog" 'Transfer|Verify' ;;
+    destination | destination-interrupt) assert_phase "$label" "$slog" 'Transfer|Verify' ;;
     server) assert_phase "$label" "$slog" 'Connect|Transfer|Verify' ;;
   esac
 }
@@ -264,6 +268,7 @@ if group_enabled filesystem; then
   fs_case fs-destination-kill10 destination 10
   fs_case fs-destination-kill50 destination 50
   fs_case fs-destination-kill90 destination 90
+  fs_case fs-destination-int50  destination-interrupt 50
   fs_case fs-server-kill-plan   server      plan
   fs_case fs-relay-reset        server      40
 

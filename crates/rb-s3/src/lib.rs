@@ -1112,6 +1112,27 @@ fn part_size_for(total_bytes: u64) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Refuse an object whose catalog size and plan-item size disagree.
+///
+/// Defence in depth: `validate` already refuses such a plan, but `restore_object`
+/// derives the multipart part size and its closing byte-count assertion from
+/// `item.estimated_bytes` while every piece of object metadata comes from
+/// `object`. Re-checking at the point of use means no future caller can reach the
+/// upload with the two out of step and store an object under a size the catalog
+/// never declared.
+fn ensure_declared_size_matches(key: &str, object: &S3Object, item: &PlanItem) -> Result<()> {
+    if object.size != item.estimated_bytes {
+        return Err(BackupError::phase(
+            Phase::Apply,
+            format!(
+                "{key:?}: plan item {} declares {} bytes but the object catalog says {}",
+                item.id, item.estimated_bytes, object.size
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn restore_object(
     client: &Client,
     bucket: &str,
@@ -1120,6 +1141,7 @@ async fn restore_object(
     item: &PlanItem,
     source: &mut dyn ChunkSource,
 ) -> Result<()> {
+    ensure_declared_size_matches(key, object, item)?;
     if item.estimated_bytes == 0 {
         match source.next().await? {
             ChunkEvent::ItemEnd {
@@ -1420,6 +1442,33 @@ mod tests {
             expires: None,
             website_redirect_location: None,
         }
+    }
+
+    fn plan_item(id: u32, estimated_bytes: u64) -> PlanItem {
+        PlanItem {
+            id,
+            name: format!("item-{id}"),
+            kind: "object".into(),
+            ordinal: id,
+            estimated_bytes,
+            meta: serde_json::Value::Null,
+        }
+    }
+
+    /// `validate` is not the only gate: the restore re-checks the two sizes it
+    /// mixes, so a plan that reaches `restore_object` without a preflight cannot
+    /// upload an object under a size the catalog never declared.
+    #[test]
+    fn a_restore_refuses_an_item_whose_size_the_catalog_contradicts() {
+        let object = object("a/b.bin", 1024);
+        assert!(ensure_declared_size_matches("a/b.bin", &object, &plan_item(3, 1024)).is_ok());
+        let error = ensure_declared_size_matches("a/b.bin", &object, &plan_item(3, 2048))
+            .expect_err("a contradicted size must be refused")
+            .to_string();
+        assert!(
+            error.contains("declares 2048 bytes") && error.contains("catalog says 1024"),
+            "the error must name both sizes: {error}"
+        );
     }
 
     /// A part size derived from a peer-supplied item size must never reach

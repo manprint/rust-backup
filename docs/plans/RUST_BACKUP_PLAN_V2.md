@@ -1,4 +1,8 @@
-# rust-backup — Plan V2: everything still missing for a first working version
+# rust-backup — Plan V2: everything still missing for a first working version (HISTORICAL)
+
+> **Superseded by [RUST_BACKUP_PLAN_V3.md](RUST_BACKUP_PLAN_V3.md).** Kept as a
+> record of the 2026-07-29 remaining-work analysis; current status is in
+> [RESUME.md](RESUME.md).
 
 > Companion to `RUST_BACKUP_PLAN.md` (V1, phases 0–8). V1 describes the design and
 > what has been *implemented*. **This document is the remaining-work plan**: it was

@@ -76,6 +76,24 @@ async fn exchange_timeout_with<T>(
     })?
 }
 
+/// Carrier indices travel the wire as `u16` (`DataFrame::CarrierHello`). A plain
+/// `as u16` cast wraps silently, so index 65536 would introduce itself as
+/// carrier 0 and collide with the real one; the destination would then reject
+/// the run with a duplicate-carrier error that names the wrong index. The CLI
+/// refuses anything above 32 before it gets here, but rb-core is a library and
+/// must not depend on a caller having validated its input.
+fn carrier_index(index: usize) -> Result<u16> {
+    u16::try_from(index).map_err(|_| {
+        BackupError::phase(
+            Phase::Connect,
+            format!(
+                "carrier index {index} exceeds {} — the highest index the wire can name",
+                u16::MAX
+            ),
+        )
+    })
+}
+
 fn validate_completion_ack(frame: Option<ControlFrame>) -> Result<VerificationReport> {
     match frame {
         Some(ControlFrame::VerificationAck { report }) => Ok(report),
@@ -482,7 +500,7 @@ async fn source_stream_multi(
         wire::send_frame(
             &mut stream,
             &wire::DataFrame::CarrierHello {
-                carrier: index as u16,
+                carrier: carrier_index(index)?,
             },
         )
         .await?;
@@ -493,7 +511,7 @@ async fn source_stream_multi(
     // An Abort sent during setup remains buffered on the control stream.
     let (control_read, mut control_write) = tokio::io::split(control);
     let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
-    let abort_task = tokio::spawn(async move {
+    let mut abort_task = tokio::spawn(async move {
         let mut control_read = control_read;
         let received = wire::recv_frame::<_, ControlFrame>(&mut control_read).await;
         let observed = match &received {
@@ -556,21 +574,29 @@ async fn source_stream_multi(
         let _ = abort_task.await;
         return Err(error);
     }
-    let (completion, mut control_read) =
-        tokio::time::timeout(destination_verify_timeout(), abort_task)
-            .await
-            .map_err(|_| {
-                BackupError::phase(
-                    Phase::Verify,
-                    "timed out waiting for destination completion acknowledgement",
-                )
-            })?
-            .map_err(|error| {
-                BackupError::phase(
-                    Phase::Transfer,
-                    format!("completion watcher task failed: {error}"),
-                )
-            })?;
+    // Borrow the handle rather than moving it: `timeout` drops its inner future
+    // when the deadline elapses, and dropping a `JoinHandle` does *not* cancel
+    // the task. Moving it here left the control-plane watcher — which owns the
+    // read half of the control substream — running forever on the one exit path
+    // that never aborts it, so a wedged destination leaked a task and a
+    // substream per target for the life of a `run --config` session.
+    let joined = match tokio::time::timeout(destination_verify_timeout(), &mut abort_task).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            abort_task.abort();
+            let _ = abort_task.await;
+            return Err(BackupError::phase(
+                Phase::Verify,
+                "timed out waiting for destination completion acknowledgement",
+            ));
+        }
+    };
+    let (completion, mut control_read) = joined.map_err(|error| {
+        BackupError::phase(
+            Phase::Transfer,
+            format!("completion watcher task failed: {error}"),
+        )
+    })?;
     let completion = completion?;
     let verification = validate_completion_ack(completion)?;
     audit_source_before_ack(audit.source, audit.baseline, &mut control_write).await?;
@@ -1120,13 +1146,41 @@ async fn destination_stream_multi(
 #[cfg(test)]
 mod pacing_tests {
     use super::{
-        exchange_timeout_with, send_completion_ack_ack, validate_completion_ack, PacedSink,
+        carrier_index, exchange_timeout_with, send_completion_ack_ack, validate_completion_ack,
+        PacedSink,
     };
     use crate::channel::ChunkSink;
     use crate::error::{BackupError, Phase, Result};
     use async_trait::async_trait;
     use std::time::Duration;
     use tokio::sync::watch;
+
+    // A carrier index that does not fit the wire must be refused, not wrapped:
+    // `index as u16` turned 65536 into carrier 0, which introduces a second
+    // stream under the first one's identity.
+    #[test]
+    fn a_carrier_index_the_wire_cannot_name_is_refused() {
+        assert_eq!(carrier_index(0).expect("index 0"), 0);
+        assert_eq!(
+            carrier_index(u16::MAX as usize).expect("highest nameable index"),
+            u16::MAX
+        );
+        let error = carrier_index(u16::MAX as usize + 1).expect_err("65536 must not wrap to 0");
+        assert!(
+            matches!(
+                &error,
+                BackupError::Phase {
+                    phase: Phase::Connect,
+                    ..
+                }
+            ),
+            "the refusal must be Connect-phase: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("65536"),
+            "the error must name the rejected index: {error}"
+        );
+    }
 
     #[test]
     fn legacy_completion_without_readback_evidence_fails_closed() {

@@ -64,7 +64,7 @@ enum Cmd {
     },
     /// Dry-run: analyze a source and print its plan; no transport, no transfer.
     Plan(PlanArgs),
-    /// PostgreSQL backup/restore (10..=latest).
+    /// PostgreSQL backup/restore (10+).
     Postgres(TargetArgs),
     /// MongoDB backup/restore (4..=8).
     Mongodb(TargetArgs),
@@ -187,29 +187,40 @@ struct ModuleParamArgs {
     #[arg(long = "secret-key", env = "RUST_BACKUP_SECRET_KEY")]
     secret_key: Option<String>,
 
-    // --- bool module params: only folded when present (flip a default) ---
+    // --- bool module params ---
+    //
+    // `Option<bool>`, not `bool`: a plain `bool` collapses "flag absent" and
+    // "flag given as false" into the same value, so `overlay` could only ever
+    // encode `true` and a YAML `overwrite: true` could not be turned off from
+    // the CLI or the environment — which is exactly the opposite of the
+    // documented CLI > env > YAML precedence. `num_args(0..=1)` +
+    // `default_missing_value` keeps the bare `--overwrite` spelling working,
+    // and `require_equals` keeps `--overwrite` from swallowing a positional.
     /// postgres: connect as admin (destination).
-    #[arg(long, env = "RUST_BACKUP_ADMIN", value_parser = boolish())]
-    admin: bool,
+    #[arg(long, env = "RUST_BACKUP_ADMIN", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    admin: Option<bool>,
     /// Destination: replace existing databases, collections or objects.
-    #[arg(long, env = "RUST_BACKUP_OVERWRITE", value_parser = boolish())]
-    overwrite: bool,
+    #[arg(long, env = "RUST_BACKUP_OVERWRITE", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    overwrite: Option<bool>,
     /// s3: use path-style addressing (MinIO).
-    #[arg(long = "path-style", env = "RUST_BACKUP_PATH_STYLE", value_parser = boolish())]
-    path_style: bool,
+    #[arg(long = "path-style", env = "RUST_BACKUP_PATH_STYLE", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    path_style: Option<bool>,
     /// filesystem: follow symlinks.
-    #[arg(long = "follow-symlinks", env = "RUST_BACKUP_FOLLOW_SYMLINKS", value_parser = boolish())]
-    follow_symlinks: bool,
+    #[arg(long = "follow-symlinks", env = "RUST_BACKUP_FOLLOW_SYMLINKS", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    follow_symlinks: Option<bool>,
     /// filesystem: do NOT preserve ownership (default is to preserve).
     #[arg(
         long = "no-preserve-ownership",
         env = "RUST_BACKUP_NO_PRESERVE_OWNERSHIP",
-        value_parser = boolish()
+        value_parser = boolish(),
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
     )]
-    no_preserve_ownership: bool,
+    no_preserve_ownership: Option<bool>,
     /// filesystem: preserve xattrs.
-    #[arg(long = "preserve-xattr", env = "RUST_BACKUP_PRESERVE_XATTR", value_parser = boolish())]
-    preserve_xattr: bool,
+    #[arg(long = "preserve-xattr", env = "RUST_BACKUP_PRESERVE_XATTR", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    preserve_xattr: Option<bool>,
 
     /// Extra module params as key=value (repeatable); overrides typed flags.
     #[arg(short = 'P', long = "param")]
@@ -298,25 +309,23 @@ impl ModuleParamArgs {
         if let Some(p) = self.port {
             m.insert("port".into(), Value::Number(p.into()));
         }
-        // bool flags fold only when they flip a default.
-        if self.admin {
-            m.insert("admin".into(), Value::Bool(true));
-        }
-        if self.overwrite {
-            m.insert("overwrite".into(), Value::Bool(true));
-        }
-        if self.path_style {
-            m.insert("path_style".into(), Value::Bool(true));
-        }
-        if self.follow_symlinks {
-            m.insert("follow_symlinks".into(), Value::Bool(true));
-        }
-        if self.no_preserve_ownership {
-            m.insert("preserve_ownership".into(), Value::Bool(false));
-        }
-        if self.preserve_xattr {
-            m.insert("preserve_xattr".into(), Value::Bool(true));
-        }
+        // A bool folds whenever it was actually given, in either direction, so
+        // an explicit `false` overrides a YAML `true` like every other field.
+        let mut put_bool = |k: &str, v: Option<bool>| {
+            if let Some(b) = v {
+                m.insert(k.into(), Value::Bool(b));
+            }
+        };
+        put_bool("admin", self.admin);
+        put_bool("overwrite", self.overwrite);
+        put_bool("path_style", self.path_style);
+        put_bool("follow_symlinks", self.follow_symlinks);
+        put_bool("preserve_xattr", self.preserve_xattr);
+        // The switch is spelled in the negative; the parameter is not.
+        put_bool(
+            "preserve_ownership",
+            self.no_preserve_ownership.map(|no| !no),
+        );
         // -P key=value overrides (best-effort typed: bool/number/string).
         for kv in &self.param {
             let (k, v) = kv
@@ -332,7 +341,7 @@ impl ModuleParamArgs {
         let Some(path) = &self.config else {
             return Ok(None);
         };
-        let cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+        let cfg = SessionConfig::from_path(path).map_err(anyhow::Error::new)?;
         Ok(cfg
             .targets
             .into_iter()
@@ -473,7 +482,62 @@ async fn run_main() -> anyhow::Result<()> {
     init_tracing(cli.verbose);
     let registry = build_registry();
 
-    match cli.cmd {
+    // An operator interrupt has to unwind the run, not kill the process where it
+    // stands. SIGINT's default disposition terminates immediately, so no `Drop`
+    // ran: the destination's active file — the one item that is genuinely
+    // mid-write — was left at its final path, the length of however many bytes
+    // had arrived, indistinguishable from a complete file. `select!` drops the
+    // losing branch, so cancelling here runs `ActiveFile::drop` and removes it.
+    //
+    // A `SIGKILL` still denies every cleanup by definition; that case is covered
+    // separately by refusing a dirty destination on the next run.
+    tokio::select! {
+        biased;
+        signal = shutdown_signal() => Err(anyhow!(
+            "interrupted by {signal}: the run was aborted before completion. \
+             Nothing incomplete is ever certified — no VERIFIED line was printed — \
+             and the destination's active item was removed. Re-run the transfer."
+        )),
+        result = dispatch(cli.cmd, &registry) => result,
+    }
+}
+
+/// Resolve on the first `SIGINT`/`SIGTERM`, naming the one that arrived.
+///
+/// A failure to install either handler must not take the process down: the run
+/// is still perfectly valid, it simply loses the graceful-interrupt path, so the
+/// arm stays pending instead.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    match (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) {
+        (Ok(mut interrupt), Ok(mut terminate)) => tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        },
+        (Ok(mut interrupt), Err(error)) => {
+            tracing::warn!(%error, "cannot handle SIGTERM; only SIGINT will be graceful");
+            interrupt.recv().await;
+            "SIGINT"
+        }
+        (Err(error), Ok(mut terminate)) => {
+            tracing::warn!(%error, "cannot handle SIGINT; only SIGTERM will be graceful");
+            terminate.recv().await;
+            "SIGTERM"
+        }
+        (Err(error), Err(_)) => {
+            tracing::warn!(%error, "cannot install signal handlers; an interrupt will kill the \
+                 process outright and the destination's active item will be left behind");
+            std::future::pending().await
+        }
+    }
+}
+
+async fn dispatch(cmd: Cmd, registry: &ModuleRegistry) -> anyhow::Result<()> {
+    match cmd {
         Cmd::Server(a) => {
             if a.secret.is_some() && a.secret_file.is_some() {
                 return Err(anyhow!("--secret and --secret-file are mutually exclusive"));
@@ -503,12 +567,12 @@ async fn run_main() -> anyhow::Result<()> {
             config,
             parallel_targets,
             fail_fast,
-        } => run_session(&registry, &config, parallel_targets, fail_fast).await,
-        Cmd::Plan(a) => print_plan(&registry, &a).await,
-        Cmd::Postgres(a) => run_target(&registry, "postgres", &a).await,
-        Cmd::Mongodb(a) => run_target(&registry, "mongodb", &a).await,
-        Cmd::Filesystem(a) => run_target(&registry, "filesystem", &a).await,
-        Cmd::S3(a) => run_target(&registry, "s3", &a).await,
+        } => run_session(registry, &config, parallel_targets, fail_fast).await,
+        Cmd::Plan(a) => print_plan(registry, &a).await,
+        Cmd::Postgres(a) => run_target(registry, "postgres", &a).await,
+        Cmd::Mongodb(a) => run_target(registry, "mongodb", &a).await,
+        Cmd::Filesystem(a) => run_target(registry, "filesystem", &a).await,
+        Cmd::S3(a) => run_target(registry, "s3", &a).await,
     }
 }
 
@@ -587,8 +651,8 @@ async fn print_plan(reg: &ModuleRegistry, a: &PlanArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("unknown module '{module}'"))?;
     let underlay = a.params.underlay(module, Role::Source)?;
     let params = merge_params(underlay.as_ref().map(|t| &t.params), a.params.overlay()?);
-    let src = m.open_source(&params).await.map_err(|e| anyhow!("{e}"))?;
-    let plan = src.analyze().await.map_err(|e| anyhow!("{e}"))?;
+    let src = m.open_source(&params).await.map_err(anyhow::Error::new)?;
+    let plan = src.analyze().await.map_err(anyhow::Error::new)?;
     println!("{}", plan.render());
     Ok(())
 }
@@ -600,7 +664,7 @@ async fn run_session(
     requested_parallel: Option<usize>,
     requested_fail_fast: bool,
 ) -> anyhow::Result<()> {
-    let mut cfg = SessionConfig::from_path(path).map_err(|e| anyhow!("{e}"))?;
+    let mut cfg = SessionConfig::from_path(path).map_err(anyhow::Error::new)?;
     if cfg.server.is_some() {
         return Err(anyhow!(
             "`run --config` does not start `server:`; start `rust-backup server` separately"
@@ -916,6 +980,31 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// `plan` and the config loader used to rebuild a module error as a plain
+    /// string (`anyhow!("{e}")`), which threw the typed `BackupError` away: a
+    /// missing credential exited 1 instead of the documented 2, because the
+    /// text fallback has no case for "configuration error:". The wrapping must
+    /// survive a `context` layer too, which is how the real call sites use it.
+    #[test]
+    fn wrapping_a_module_error_keeps_its_documented_exit_code() {
+        use rb_core::BackupError;
+        let cases: Vec<(BackupError, i32)> = vec![
+            (BackupError::Config("secret key missing".into()), 2),
+            (BackupError::Preflight("destination not writable".into()), 3),
+            (BackupError::PlanRejected("operator declined".into()), 4),
+            (BackupError::SourceMutated("fingerprint changed".into()), 6),
+        ];
+        for (error, want) in cases {
+            let rendered = error.to_string();
+            let wrapped = anyhow::Error::new(error).context("analyze the source");
+            assert_eq!(
+                exit_code(&wrapped),
+                want,
+                "wrapped {rendered:?} must keep exit code {want}"
+            );
+        }
+    }
+
     /// The shell contract is classified from the TYPED error, over the errors
     /// the program can really produce — not from literals no `Display` impl
     /// emits. Each case is built the way the corresponding failure builds it.
@@ -1078,6 +1167,54 @@ targets:
         .await
         .expect_err("server section must not be silently ignored");
         assert!(error.to_string().contains("does not start `server:`"));
+        std::fs::remove_file(yaml).ok();
+    }
+
+    /// The YAML destination target sets `admin: true`. A `bool` field could only
+    /// ever encode `true` in the overlay, so an explicit `--admin=false` (or
+    /// `RUST_BACKUP_ADMIN=0`) silently lost to the YAML — the precedence
+    /// documented in USAGE.md held for every field except the booleans, which
+    /// are the ones that destroy data (`overwrite`) or escalate privilege
+    /// (`admin`).
+    #[test]
+    fn an_explicit_false_overrides_a_yaml_true() {
+        let yaml = write_yaml(YAML);
+        let path = yaml.to_str().expect("utf8 path").to_string();
+
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--admin=false",
+            "--config",
+            &path,
+        ]);
+        let Cmd::Postgres(explicit) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) =
+            resolve_target(&explicit, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(
+            params.0["admin"], false,
+            "an explicit --admin=false must beat the YAML target's admin: true"
+        );
+
+        // The other two directions still behave: unset falls through to YAML,
+        // and the bare flag still means true.
+        let cli = parse(&["rust-backup", "postgres", "destination", "--config", &path]);
+        let Cmd::Postgres(unset) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) =
+            resolve_target(&unset, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(params.0["admin"], true);
+
+        let cli = parse(&["rust-backup", "postgres", "destination", "--overwrite"]);
+        let Cmd::Postgres(bare) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        assert_eq!(bare.module.overwrite, Some(true), "a bare flag means true");
+
         std::fs::remove_file(yaml).ok();
     }
 

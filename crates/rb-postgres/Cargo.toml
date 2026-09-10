@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "rust-backup postgres module (PostgreSQL 10..=latest, logical, pure Rust)"
+description = "rust-backup postgres module (PostgreSQL 10+, logical, pure Rust)"
 
 [dependencies]
 rb-core = { path = "../rb-core" }

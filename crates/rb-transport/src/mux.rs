@@ -132,6 +132,17 @@ async fn drive<S: Transport>(
             Step::Inbound(stream) => {
                 let _ = inbound_tx.send(stream.compat()).await;
             }
+            // NOTE: the driver deliberately does NOT stop when `Opener` and
+            // `Acceptor` are both dropped. Substreams already handed out are
+            // independent handles that still need this task to pump the
+            // connection, and yamux gives no live-stream count to test, so
+            // stopping here would kill an in-flight relay whenever the
+            // registry entry that owned the handles went away first. The
+            // session therefore ends only on peer close or a connection error.
+            // A reaped zombie provider (`SECRET_CTRL_TIMEOUT`, 60 s) leaves this
+            // task and its socket alive until TCP keepalive gives up — bounded
+            // by `TCP_KEEPALIVE_TIME` + `TCP_KEEPALIVE_INTERVAL` * probes, not
+            // unbounded, and the channel id is already free by then.
             Step::Done => break,
         }
     }

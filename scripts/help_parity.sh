@@ -55,8 +55,13 @@ while IFS= read -r flag; do
   missing=1
 done < <(comm -13 <(cli_flags) <(documented_flags))
 
-# Ghost flags in the rest of the operator documentation.
-other_docs=(README.md docs/QA_GUIDE.md docs/TRANSPORT.md docs/DEPLOYMENT.md docs/modules/*.md)
+# Ghost flags in the rest of the operator documentation. Globs, not a hand-kept
+# list: the list named `docs/DEPLOYMENT.md`, a file that does not exist, and the
+# `[[ -f ]]` guard below made that silently a no-op — a document could be added
+# and never scanned. `docs/plans/` and `CHANGELOG.md` are excluded on purpose:
+# those are history, and both legitimately name flags that were proposed,
+# renamed, or (as with `--preserve-ownership`) never existed at all.
+other_docs=(README.md USAGE.md docs/*.md docs/modules/*.md e2e/README.md)
 for doc in "${other_docs[@]}"; do
   [[ -f $doc ]] || continue
   while IFS= read -r flag; do

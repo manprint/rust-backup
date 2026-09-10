@@ -390,7 +390,6 @@ async fn gather_candidates(socket: &tokio::net::UdpSocket) -> anyhow::Result<Gat
 /// Ordered best-effort STUN chain. Operators may replace it with a comma-separated
 /// `RUST_BACKUP_STUN_SERVERS`; the legacy singular variable remains supported.
 #[cfg(feature = "udp")]
-#[cfg(feature = "udp")]
 fn stun_targets() -> Vec<String> {
     let configured = std::env::var("RUST_BACKUP_STUN_SERVERS")
         .ok()

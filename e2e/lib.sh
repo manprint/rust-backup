@@ -273,8 +273,8 @@ for path, atime in rows:
 PY
 }
 
-rb_seed_filesystem_fixture() { # root [large bytes]
-  local root=$1 large_bytes=${2:-0}
+rb_seed_filesystem_fixture() { # root [large bytes] [bulk files]
+  local root=$1 large_bytes=${2:-0} bulk_files=${3:-0}
   mkdir -p "$root/nested/empty"
   printf 'rust-backup relay e2e\n' >"$root/nested/hello.txt"
   : >"$root/empty"
@@ -288,5 +288,19 @@ rb_seed_filesystem_fixture() { # root [large bytes]
     dd if=/dev/urandom of="$root/nested/payload.bin" bs=1M \
       count=$(((large_bytes + 1048575) / 1048576)) status=none
     truncate -s "$large_bytes" "$root/nested/payload.bin"
+  fi
+  # Many small-to-medium items of mixed size. A handful of items cannot expose an
+  # out-of-order demux (B1): the carrier map is `item_id % carriers`, so a plan
+  # has to hold enough items for several to be in flight at once before item N+1
+  # can be seen overtaking item N. Sizes are spread deterministically from 0 to
+  # 256 KiB so the set also covers zero-byte items and items that span several
+  # chunks on every carrier.
+  if [[ "$bulk_files" -gt 0 ]]; then
+    mkdir -p "$root/bulk"
+    local index size
+    for ((index = 0; index < bulk_files; index++)); do
+      size=$(((index * 7919) % 262144))
+      head -c "$size" /dev/urandom >"$root/bulk/item-$(printf '%04d' "$index").bin"
+    done
   fi
 }

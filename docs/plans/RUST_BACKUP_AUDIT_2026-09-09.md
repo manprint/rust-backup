@@ -113,7 +113,8 @@ per-item digests are compared against independently accumulated values.
 ## Test and CI coverage added
 
 * Every fix above carries a test that fails against the previous code. The
-  suite now stands at 229 passing tests: rb-postgres 61, rb-transport 53,
+  suite stood, **on the date of this audit**, at 229 passing tests (see
+  `RESUME.md` for the current figure): rb-postgres 61, rb-transport 53,
   rb-core 42, rb-mongodb 29, rust-backup 22, rb-s3 12, rb-filesystem 10.
 * 4 of those spawn the real binary to pin the environment contract (an
   env-only run, every boolean spelling, a misspelling still refused, and a flag
@@ -191,7 +192,7 @@ tests that were already green.
 | id | Defect |
 |----|--------|
 | OBS-1 | The negotiated carrier count was never logged — only a *downgrade* was, and only on the source. So `--carriers 4` produced a run indistinguishable from a run that fell back to one stream, which means the 4-carrier e2e cases could not prove they had exercised four carriers, and an operator could not tell either. Both peers now log `negotiated data plane carriers=N separate_data_streams=…` once negotiation settles (I-OBSERV), `e2e/relay_smoke.sh` asserts the count it asked for at 1 and 4, and `e2e/s3_minio_test.sh` now asks for four carriers and asserts the module cap brings the negotiation back to one — the first live proof of the per-module cap, QA criterion 13 |
-| DOC-3 | `docs/modules/FILESYSTEM.md` carried the same ghost `--preserve-ownership` flag that `USAGE.md` had. The parity check only ever read `USAGE.md`; its ghost-flag half now scans `README.md`, `docs/QA_GUIDE.md`, `docs/TRANSPORT.md`, `docs/DEPLOYMENT.md` and every `docs/modules/*.md` as well |
+| DOC-3 | `docs/modules/FILESYSTEM.md` carried the same ghost `--preserve-ownership` flag that `USAGE.md` had. The parity check only ever read `USAGE.md`; its ghost-flag half now scans `README.md` and every `docs/*.md` and `docs/modules/*.md` as well (the list originally named a `docs/DEPLOYMENT.md` that does not exist; it is a glob now) |
 | DOC-4 | `e2e/full_matrix.sh` printed a `SKIP` line for the privileged scripts but silently omitted the PostgreSQL/MongoDB version matrices, so "one command tells QA the whole state of the tree" was untrue in exactly the direction that matters — something not run looked like nothing to run |
 
 | TEST-1 | The matrix header claimed that a leftover from an uncleanable fault "is refused by a later restore instead of silently merged into", and nothing asserted it. A 22nd case now re-runs a restore into the tree the destination-killed case left behind and requires exit 3 with no success claim — with a precondition that fails the case outright if that tree turned out to be empty, since an empty root is legitimately accepted |
