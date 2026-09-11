@@ -17,4 +17,4 @@ tokio = { workspace = true }
 tracing.workspace = true
 
 # MongoDB 4..=8, pure-Rust driver (rustls TLS by default). Re-exports `bson`.
-mongodb = "3.9"
+mongodb = "3.9.1"
