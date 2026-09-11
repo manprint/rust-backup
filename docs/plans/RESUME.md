@@ -180,3 +180,12 @@ The three MongoDB skips are one environment limit, not a product gap: `mongo:8`
 refuses to start on this host's Linux 7.0.0 kernel (SERVER-121912), so every
 pair involving major 8 could not run locally. CI runs the same matrix on
 `ubuntu-24.04`, where major 8 starts; that is the run to read for MongoDB 8.
+
+**CI on `dev` after the review** (commit `ba9a0f8`): all five workflows green —
+`ci`, `End-to-end`, `Security and dependency health`, `Container image` and
+`Binary artifacts and release`. The end-to-end workflow's 27 jobs all pass,
+MongoDB 8 and the `4:8`/`6:8` pairs included, so the three local skips above are
+covered there. The `Real AWS S3 (credential gated)` job is `skipped` because the
+repository variable `RUN_AWS_E2E` is not set — the whole job does not run,
+rather than running and reporting SKIP while green, which is what it used to do
+before the `RUST_BACKUP_AWS_E2E` opt-in was wired up.
