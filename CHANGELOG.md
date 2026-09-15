@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.0.2 — prerelease (2026-09-15)
+
+What `v0.0.1` shipped, plus the three failures that release exposed. Every
+workflow on `dev` is green on this tree: CI, end-to-end, container, release and
+the security audit.
+
+### Security
+
+- **rustls 0.23.40 → 0.23.45** — RUSTSEC-2026-0285 (published 2026-09-14,
+  medium): TLS 1.3 handshake messages accepted across encryption-level
+  boundaries. The `v0.0.1` binaries and images link the affected version; use
+  `0.0.2` instead.
+
+### CI/CD
+
+- **MinIO images moved.** Docker Hub's `minio/minio` and `minio/mc` now answer
+  `pull access denied … repository does not exist`, which broke
+  `e2e/s3_minio_test.sh` and the `s3` group of `e2e/fault_matrix.sh`. Both pull
+  MinIO's own registry at a pinned release
+  (`quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`,
+  `quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z`).
+- **Action pins carry their exact release.** zizmor (pedantic) went red with no
+  change on our side because upstream moved the floating `v4`/`v7` tags:
+  `docker/setup-buildx-action` (v4.3.0) and `docker/build-push-action` (v7.3.0)
+  no longer matched their comments. Both are bumped to the current release, and
+  every pin in every workflow now names the exact version — an exact tag never
+  moves, so the finding cannot return on the next upstream re-tag.
+- **`ci.yml` no longer runs on `v*` tags.** Making a cache-using workflow
+  reachable from a release-triggering event is exactly what zizmor's
+  cache-poisoning audit flags, and the commit a tag points at has already passed
+  CI on `dev`; `release.yml` and `docker.yml` rebuild from scratch anyway.
+- `release.yml` names the repository for `gh` (`GH_REPO`): that job downloads
+  artifacts and never checks the repository out, so `gh release create` died
+  with `failed to run git: fatal: not a git repository` the first time a tag was
+  ever pushed.
+
 ## 0.0.1 — first prerelease (2026-09-15)
 
 The tree reviewed on 2026-09-11, cut as a prerelease so the binaries and the
@@ -35,13 +71,6 @@ surface and the plan wire format may still change.
   flavour would move the `latest` tag onto a prerelease cut from `dev`. `latest`
   keeps meaning `main`, and a `v*` tag publishes `v0.0.1`, `0.0.1`, `0.0` and
   `sha-…`.
-- `cargo update -p rustls` to 0.23.45: RUSTSEC-2026-0285 (TLS 1.3 handshake
-  messages accepted across encryption-level boundaries, published 2026-09-14)
-  affects 0.23.40, which is what the first `v0.0.1` build linked.
-- The MinIO e2e scripts pull from `quay.io/minio/…` at a pinned release.
-  Docker Hub's `minio/minio` and `minio/mc` now answer `pull access denied …
-  repository does not exist`, which took `s3_minio_test.sh` and the `s3` fault
-  group down with it — an image-registry change, not a code regression.
 - Workspace version set to `0.0.1` to match the tag.
 
 ## Unreleased — pre-staging review (2026-09-11)
