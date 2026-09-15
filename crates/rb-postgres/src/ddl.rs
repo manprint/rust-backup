@@ -892,7 +892,16 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
         let vq = quote_qualified(&v.schema, &v.name);
         post.push(alter_table_owner(&v.schema, &v.name, &v.owner));
         if let Some(c) = &v.comment {
-            post.push(comment_on("VIEW", &vq, c));
+            // `COMMENT ON VIEW` is refused on a materialized view — PostgreSQL
+            // answers `ERROR: "mv" is not a view` — and the comment is captured
+            // for both relkinds, so a commented matview aborted the restore in
+            // post_data. (`ALTER TABLE … OWNER TO` above is accepted for both.)
+            let kind = if v.materialized {
+                "MATERIALIZED VIEW"
+            } else {
+                "VIEW"
+            };
+            post.push(comment_on(kind, &vq, c));
         }
         post.extend(grants_from_acl("TABLE", &vq, &v.acl));
     }
@@ -1999,6 +2008,52 @@ mod tests {
             "a materialized view must still be created empty and populated afterwards"
         );
         assert!(refresh < index, "populate the matview before indexing it");
+    }
+
+    /// PostgreSQL refuses `COMMENT ON VIEW` for a materialized view
+    /// (`ERROR: "daily" is not a view`), and introspection captures the comment
+    /// of both relkinds, so the wrong keyword aborted the restore.
+    #[test]
+    fn a_materialized_view_comment_uses_the_materialized_keyword() {
+        let mut payload = crate::model::test_fixture();
+        let schema = &mut payload.databases[0].schemas[0];
+        schema.views.push(PgView {
+            schema: "app".into(),
+            name: "daily".into(),
+            owner: "app_owner".into(),
+            definition: "SELECT count(*) FROM app.accounts".into(),
+            materialized: true,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: Some("daily totals".into()),
+        });
+        schema.views.push(PgView {
+            schema: "app".into(),
+            name: "plain".into(),
+            owner: "app_owner".into(),
+            definition: "SELECT id FROM app.accounts".into(),
+            materialized: false,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: Some("plain one".into()),
+        });
+
+        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        assert!(
+            db.post_data
+                .iter()
+                .any(|s| s == "COMMENT ON MATERIALIZED VIEW \"app\".\"daily\" IS 'daily totals';"),
+            "a materialized view's comment needs the MATERIALIZED keyword"
+        );
+        assert!(
+            db.post_data
+                .iter()
+                .any(|s| s == "COMMENT ON VIEW \"app\".\"plain\" IS 'plain one';"),
+            "a plain view keeps the plain keyword"
+        );
     }
 
     /// A view may need a primary key to be *creatable*: SQL allows selecting a

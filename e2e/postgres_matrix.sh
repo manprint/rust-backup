@@ -147,6 +147,12 @@ CREATE MATERIALIZED VIEW app.account_totals AS
   FROM app.accounts a LEFT JOIN app.orders o ON o.acct = a.id
   GROUP BY a.id;
 CREATE UNIQUE INDEX account_totals_id_idx ON app.account_totals (id);
+
+-- Comments on both relkinds: `COMMENT ON VIEW` is refused for a materialized
+-- view (`ERROR: "account_totals" is not a view`), so the restore must emit
+-- `COMMENT ON MATERIALIZED VIEW` for it.
+COMMENT ON MATERIALIZED VIEW app.account_totals IS 'totals per account';
+COMMENT ON VIEW app.account_status IS 'status per account';
 SQL
   # Partitioned tables exist on 10, but a primary key or an index on the
   # partitioned parent needs 11+.

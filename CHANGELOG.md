@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.0.4 — prerelease (2026-09-16)
+
+### Correctness
+
+- **PostgreSQL: a commented materialized view aborted the restore.** The
+  comment of both relkinds is captured, but it was always replayed as
+  `COMMENT ON VIEW`, which PostgreSQL refuses for a materialized view —
+  verified against a live PostgreSQL 13:
+
+  ```text
+  ERROR:  "mv" is not a view
+  ```
+
+  Materialized views now get `COMMENT ON MATERIALIZED VIEW`; plain views are
+  unchanged. (`ALTER TABLE … OWNER TO`, used for both, is accepted by
+  PostgreSQL for either relkind — checked on the same server.) Covered by a
+  unit test on the emitted keyword and by comments on both the plain and the
+  materialized seed view in `e2e/postgres_matrix.sh`;
+  `e2e/postgres_matrix.sh 13` passes 12/12.
+
 ## 0.0.3 — prerelease (2026-09-15)
 
 ### Correctness
