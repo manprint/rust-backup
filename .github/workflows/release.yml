@@ -103,6 +103,10 @@ jobs:
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks the repository out — it only downloads the
+          # build artifacts — so `gh` has no git remote to infer the repository
+          # from and fails with "fatal: not a git repository". Name it here.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # A tag below 1.0.0, or one carrying a `-suffix` (v1.2.3-rc.1), is
