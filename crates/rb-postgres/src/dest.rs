@@ -391,10 +391,20 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     normalize_catalog(&mut expected);
     normalize_catalog(&mut actual);
     if actual != expected {
-        let difference = first_catalog_difference(&expected, &actual);
+        let differences = catalog_differences(&expected, &actual);
+        let counted = if differences.len() >= MAX_REPORTED_DIFFERENCES {
+            format!("first {MAX_REPORTED_DIFFERENCES} differences")
+        } else if differences.len() == 1 {
+            "1 difference".to_string()
+        } else {
+            format!("{} differences", differences.len())
+        };
         return Err(BackupError::phase(
             Phase::Verify,
-            format!("PostgreSQL catalog read-back differs from the source plan: {difference}"),
+            format!(
+                "PostgreSQL catalog read-back differs from the source plan ({counted}):\n  - {}",
+                differences.join("\n  - ")
+            ),
         ));
     }
     Ok(())
@@ -548,55 +558,141 @@ async fn render_view_definition(client: &Client, definition: &str) -> Result<Str
     Ok(rendered)
 }
 
-fn first_catalog_difference(expected: &PgPlanPayload, actual: &PgPlanPayload) -> String {
+/// How many catalog differences a failed read-back names before it stops
+/// walking. One structural mistake (a schema that never got created, an owner
+/// applied cluster-wide) differs in thousands of places; the first handful
+/// identify it and the rest only bury it.
+const MAX_REPORTED_DIFFERENCES: usize = 20;
+
+/// Every way the restored catalog differs from the plan, each difference named
+/// by the objects it belongs to — `tables["account_move"].columns["state"]`,
+/// not `tables[92].columns[57]` — so the message says what to go and look at.
+fn catalog_differences(expected: &PgPlanPayload, actual: &PgPlanPayload) -> Vec<String> {
     let expected = serde_json::to_value(expected).unwrap_or(serde_json::Value::Null);
     let actual = serde_json::to_value(actual).unwrap_or(serde_json::Value::Null);
-    first_json_difference("$", &expected, &actual)
-        .unwrap_or_else(|| "different serialized catalog values".to_string())
+    let mut found = Vec::new();
+    collect_json_differences("catalog", &expected, &actual, &mut found);
+    if found.is_empty() {
+        found.push("different serialized catalog values".to_string());
+    }
+    found
 }
 
-fn first_json_difference(
+/// The name a catalog object carries, used as its path segment.
+fn element_name(value: &serde_json::Value) -> Option<&str> {
+    value.get("name").and_then(serde_json::Value::as_str)
+}
+
+fn collect_json_differences(
     path: &str,
     expected: &serde_json::Value,
     actual: &serde_json::Value,
-) -> Option<String> {
+    found: &mut Vec<String>,
+) {
     use serde_json::Value;
+    if expected == actual || found.len() >= MAX_REPORTED_DIFFERENCES {
+        return;
+    }
     match (expected, actual) {
         (Value::Object(expected), Value::Object(actual)) => {
-            for key in expected.keys().chain(actual.keys()) {
+            let keys = expected
+                .keys()
+                .chain(actual.keys().filter(|key| !expected.contains_key(*key)));
+            for key in keys {
+                let child = format!("{path}.{key}");
                 match (expected.get(key), actual.get(key)) {
-                    (Some(expected), Some(actual)) if expected != actual => {
-                        return first_json_difference(&format!("{path}.{key}"), expected, actual);
+                    (Some(expected), Some(actual)) => {
+                        collect_json_differences(&child, expected, actual, found);
                     }
-                    (Some(_), None) => return Some(format!("{path}.{key} missing at destination")),
+                    (Some(_), None) => found.push(format!("{child} missing at destination")),
                     (None, Some(_)) => {
-                        return Some(format!("{path}.{key} unexpectedly present at destination"));
+                        found.push(format!("{child} unexpectedly present at destination"));
                     }
-                    _ => {}
+                    (None, None) => {}
+                }
+                if found.len() >= MAX_REPORTED_DIFFERENCES {
+                    return;
                 }
             }
-            None
         }
         (Value::Array(expected), Value::Array(actual)) => {
-            if expected.len() != actual.len() {
-                return Some(format!(
-                    "{path} length source={} destination={}",
-                    expected.len(),
-                    actual.len()
-                ));
-            }
-            for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-                if expected != actual {
-                    return first_json_difference(&format!("{path}[{index}]"), expected, actual);
+            let named = expected
+                .iter()
+                .chain(actual)
+                .all(|element| element_name(element).is_some());
+            if named {
+                collect_named_differences(path, expected, actual, found);
+            } else {
+                if expected.len() != actual.len() {
+                    found.push(format!(
+                        "{path} length source={} destination={}",
+                        expected.len(),
+                        actual.len()
+                    ));
+                }
+                for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                    collect_json_differences(&format!("{path}[{index}]"), expected, actual, found);
+                    if found.len() >= MAX_REPORTED_DIFFERENCES {
+                        return;
+                    }
                 }
             }
-            None
         }
-        _ => Some(format!(
+        _ => found.push(format!(
             "{path} source={} destination={}",
             compact_json(expected),
             compact_json(actual)
         )),
+    }
+}
+
+/// Compare two lists of named objects by name rather than by position: one
+/// missing table then reports itself instead of shifting every later index and
+/// drowning the real difference in noise.
+fn collect_named_differences(
+    path: &str,
+    expected: &[serde_json::Value],
+    actual: &[serde_json::Value],
+    found: &mut Vec<String>,
+) {
+    let names = |elements: &[serde_json::Value]| -> Vec<String> {
+        elements
+            .iter()
+            .filter_map(element_name)
+            .map(str::to_string)
+            .collect()
+    };
+    let expected_names = names(expected);
+    let actual_names = names(actual);
+    for (element, name) in expected.iter().zip(&expected_names) {
+        let child = format!("{path}[{name:?}]");
+        match actual
+            .iter()
+            .find(|candidate| element_name(candidate) == Some(name.as_str()))
+        {
+            Some(counterpart) => collect_json_differences(&child, element, counterpart, found),
+            None => found.push(format!("{child} missing at destination")),
+        }
+        if found.len() >= MAX_REPORTED_DIFFERENCES {
+            return;
+        }
+    }
+    for name in &actual_names {
+        if !expected_names.contains(name) {
+            found.push(format!(
+                "{path}[{name:?}] unexpectedly present at destination"
+            ));
+            if found.len() >= MAX_REPORTED_DIFFERENCES {
+                return;
+            }
+        }
+    }
+    // Same objects, different declaration order — invisible above, and a real
+    // difference: column order is part of a table's shape.
+    if expected_names.len() == actual_names.len() && expected_names != actual_names {
+        found.push(format!(
+            "{path} order source={expected_names:?} destination={actual_names:?}"
+        ));
     }
 }
 
@@ -616,6 +712,22 @@ fn normalize_catalog(payload: &mut PgPlanPayload) {
             for table in &mut schema.tables {
                 table.estimated_rows = 0;
                 table.estimated_bytes = 0;
+                // `ordinal` is `pg_attribute.attnum`, which keeps counting the
+                // columns a table has dropped: a source table that lost four
+                // columns numbers its 58th live column 62, while a logical
+                // restore — which recreates only the live columns — numbers the
+                // same column 58. That gap records the source table's *history*,
+                // not its shape, and no logical restore can reproduce it (only
+                // pg_upgrade can, because it keeps the physical files). Nor
+                // could comparing attnum ever be a complete check: a column
+                // dropped from the end leaves no gap at all. So both sides are
+                // renumbered and what the comparison enforces is the column
+                // *order*, which is checked in full.
+                for (position, column) in table.columns.iter_mut().enumerate() {
+                    column.ordinal = i32::try_from(position)
+                        .unwrap_or(i32::MAX)
+                        .saturating_add(1);
+                }
             }
         }
     }
@@ -1029,6 +1141,117 @@ mod tests {
         let mut modern = payload.clone();
         strip_privileges_newer_than(&mut modern, 17);
         assert_eq!(modern.databases[0].acl, vec!["postgres=CTc/postgres"]);
+    }
+
+    /// Build a one-table catalog whose columns carry the given `(name, attnum)`.
+    fn catalog_with_columns(columns: &[(&str, i32)]) -> PgPlanPayload {
+        PgPlanPayload {
+            databases: vec![crate::model::PgDatabase {
+                name: "appdb".into(),
+                schemas: vec![crate::model::PgSchema {
+                    name: "app".into(),
+                    tables: vec![crate::model::PgTable {
+                        name: "accounts".into(),
+                        columns: columns
+                            .iter()
+                            .map(|(name, ordinal)| crate::model::PgColumn {
+                                name: (*name).to_string(),
+                                ordinal: *ordinal,
+                                type_name: "integer".into(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn columns_dropped_on_the_source_do_not_fail_the_read_back() {
+        // The source dropped four columns before `state`, so it numbers it 62.
+        // A logical restore recreates only the live columns and numbers it 58 —
+        // the same table, in the same order.
+        let mut source = catalog_with_columns(&[("id", 1), ("email", 2), ("state", 62)]);
+        let mut destination = catalog_with_columns(&[("id", 1), ("email", 2), ("state", 3)]);
+        normalize_catalog(&mut source);
+        normalize_catalog(&mut destination);
+        assert_eq!(source, destination);
+    }
+
+    #[test]
+    fn a_reordered_column_still_fails_the_read_back() {
+        let mut source = catalog_with_columns(&[("id", 1), ("email", 2)]);
+        let mut destination = catalog_with_columns(&[("email", 1), ("id", 2)]);
+        normalize_catalog(&mut source);
+        normalize_catalog(&mut destination);
+        assert_ne!(source, destination);
+        let differences = catalog_differences(&source, &destination);
+        assert!(
+            differences.iter().any(|d| d.contains("order source=")),
+            "{differences:?}"
+        );
+    }
+
+    #[test]
+    fn a_difference_is_named_by_the_objects_it_belongs_to() {
+        let source = catalog_with_columns(&[("id", 1), ("email", 2)]);
+        let mut destination = source.clone();
+        destination.databases[0].schemas[0].tables[0].columns[1].type_name = "text".into();
+        let differences = catalog_differences(&source, &destination);
+        assert_eq!(
+            differences,
+            vec![concat!(
+                r#"catalog.databases["appdb"].schemas["app"].tables["accounts"]"#,
+                r#".columns["email"].type_name source="integer" destination="text""#
+            )]
+        );
+    }
+
+    #[test]
+    fn a_missing_object_is_reported_by_name_and_every_difference_is_listed() {
+        let source = catalog_with_columns(&[("id", 1), ("email", 2)]);
+        let mut destination = source.clone();
+        destination.databases[0].schemas[0].tables[0].columns.pop();
+        destination.databases[0].schemas[0].tables[0].columns[0].not_null = true;
+        let differences = catalog_differences(&source, &destination);
+        assert!(
+            differences
+                .iter()
+                .any(|d| d
+                    .ends_with("tables[\"accounts\"].columns[\"email\"] missing at destination")),
+            "{differences:?}"
+        );
+        assert!(
+            differences
+                .iter()
+                .any(|d| d.contains("columns[\"id\"].not_null source=false destination=true")),
+            "{differences:?}"
+        );
+    }
+
+    #[test]
+    fn the_difference_list_is_capped() {
+        let columns: Vec<(String, i32)> = (0..MAX_REPORTED_DIFFERENCES * 2)
+            .map(|index| (format!("c{index}"), index as i32 + 1))
+            .collect();
+        let borrowed: Vec<(&str, i32)> = columns
+            .iter()
+            .map(|(name, ordinal)| (name.as_str(), *ordinal))
+            .collect();
+        let source = catalog_with_columns(&borrowed);
+        let mut destination = source.clone();
+        for column in &mut destination.databases[0].schemas[0].tables[0].columns {
+            column.type_name = "text".into();
+        }
+        assert_eq!(
+            catalog_differences(&source, &destination).len(),
+            MAX_REPORTED_DIFFERENCES
+        );
     }
 
     #[test]

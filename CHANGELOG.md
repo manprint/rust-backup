@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.0.6 — prerelease (2026-09-16)
+
+### Correctness
+
+- **PostgreSQL: a table that ever dropped a column failed the read-back.** The
+  catalog comparison required `pg_attribute.attnum` to match, and PostgreSQL
+  never reuses an attnum: a source table that lost four columns numbers its 58th
+  live column 62, while a logical restore — which recreates only the live
+  columns — numbers the same column 58. A byte-perfect restore of a long-lived
+  schema (an upgraded Odoo cluster, for instance) was reported as corrupt:
+
+  ```text
+  [Verify] PostgreSQL catalog read-back differs from the source plan:
+  $.databases[0].schemas[1].tables[92].columns[57].ordinal source=62 destination=58
+  ```
+
+  The gap records the source table's *history*, not its shape. No logical
+  restore can rebuild it — only `pg_upgrade`, which keeps the physical files —
+  and the check could never have been complete anyway, because a column dropped
+  from the end leaves no gap at all. Both sides are now renumbered and the
+  comparison enforces the full column *order*, along with names, types,
+  nullability, defaults, identity, generation, collation and comments. The limit
+  is recorded in `docs/modules/POSTGRES.md`, and `e2e/postgres_matrix.sh` seeds a
+  table with dropped columns so a live restore exercises the case.
+
+### Diagnostics
+
+- **A failed catalog read-back now says what to go and look at.** It reported a
+  single difference, addressed by position (`tables[92].columns[57]`). It now
+  reports every difference it finds, up to 20, each named by the objects it
+  belongs to:
+
+  ```text
+  [Verify] PostgreSQL catalog read-back differs from the source plan (2 differences):
+    - catalog.databases["odoo"].schemas["public"].tables["account_move"].columns["state"].type_name source="varchar" destination="text"
+    - catalog.databases["odoo"].schemas["public"].tables["res_partner"].columns["vat"] missing at destination
+  ```
+
+  Lists of named objects are matched by name rather than by position, so one
+  missing table reports itself instead of shifting every later index and burying
+  the real difference. A pure reordering is still a difference, and is reported
+  as one.
+
 ## 0.0.5 — prerelease (2026-09-16)
 
 Same code as 0.0.4; the first tag published by the fast path.

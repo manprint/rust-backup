@@ -175,6 +175,15 @@ previous contents must survive a failed attempt.
 
 ## Limits
 
+- **Column numbering is not reproduced; column order is.** `pg_attribute.attnum`
+  keeps counting the columns a table has dropped, so a source table that lost
+  four columns numbers its 58th live column 62. A logical restore recreates only
+  the live columns and numbers that same column 58. The gap is the source
+  table's history, not its shape: no logical restore can rebuild it (only
+  `pg_upgrade` can, because it keeps the physical files), and comparing attnum
+  could never be a complete check anyway — a column dropped from the *end*
+  leaves no gap at all. The read-back therefore normalizes both sides and
+  enforces the full column order, names, types, defaults and comments.
 - PostgreSQL passwords are never captured or restored.
 - Roles are cluster-wide and are **not** rolled back. The destination removes the
   databases a failed restore created, but roles it created stay behind; drop them

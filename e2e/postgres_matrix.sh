@@ -93,6 +93,15 @@ INSERT INTO app.accounts (email) SELECT 'u'||g||'@x' FROM generate_series(1,500)
 INSERT INTO app.orders (acct, total)
   SELECT (random()*499)::int + 1, (random()*1000)::numeric(12,2) FROM generate_series(1,2000);
 
+-- Dropped columns leave permanent holes in `pg_attribute.attnum`: `note` below
+-- is the 4th live column of app.accounts but is numbered 6. A logical restore
+-- recreates only the live columns and numbers `note` 4, so the catalog
+-- read-back must compare the column *order* rather than the raw attnum.
+ALTER TABLE app.accounts ADD COLUMN legacy_a text, ADD COLUMN legacy_b int;
+ALTER TABLE app.accounts DROP COLUMN legacy_a, DROP COLUMN legacy_b;
+ALTER TABLE app.accounts ADD COLUMN note text;
+UPDATE app.accounts SET note = 'n'||id WHERE id % 7 = 0;
+
 -- Classic inheritance. The parent and the child both hold rows, and a plain
 -- SELECT on the parent expands into the child: a parent streamed without ONLY
 -- carries the child's rows too, and the child is its own item, so the
