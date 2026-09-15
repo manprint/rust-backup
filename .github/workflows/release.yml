@@ -33,7 +33,7 @@ jobs:
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check that the tag matches the crate version
@@ -70,7 +70,7 @@ jobs:
           (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
           rm -rf "dist/$package"
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rust-backup-${{ matrix.target }}
           path: dist/*
@@ -87,7 +87,7 @@ jobs:
       id-token: write # Request the OIDC identity used for provenance.
       attestations: write # Publish provenance for the release archives.
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-assets
           merge-multiple: true
