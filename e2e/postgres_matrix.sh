@@ -122,6 +122,25 @@ CREATE FUNCTION app.all_accounts() RETURNS SETOF app.accounts LANGUAGE sql
 CREATE VIEW app.zombies AS SELECT id, email FROM app.accounts WHERE status <> 'active';
 CREATE VIEW app.active AS SELECT * FROM app.zombies;
 
+-- A view that is only creatable once the primary key exists: `status` is
+-- neither grouped nor aggregated, and SQL permits that solely because it is
+-- functionally dependent on the grouped primary key — a dependency PostgreSQL
+-- proves from the key alone. Created before the keys it fails with
+-- `column "a.status" must appear in the GROUP BY clause or be used in an
+-- aggregate function`, which is how a real Odoo cluster's
+-- `report_project_task_user` broke a restore.
+CREATE VIEW app.account_status AS
+  SELECT a.id, a.status, count(o.id) AS orders
+  FROM app.accounts a LEFT JOIN app.orders o ON o.acct = a.id
+  GROUP BY a.id;
+
+-- The same dependency in a materialized view, which is created WITH NO DATA
+-- and therefore still has its query parsed at creation time.
+CREATE MATERIALIZED VIEW app.account_status_mv AS
+  SELECT a.id, a.email, count(o.id) AS orders
+  FROM app.accounts a LEFT JOIN app.orders o ON o.acct = a.id
+  GROUP BY a.id;
+
 -- A populated materialized view: its query must run only after the data load.
 CREATE MATERIALIZED VIEW app.account_totals AS
   SELECT a.id, count(o.id) AS orders

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.0.3 — prerelease (2026-09-15)
+
+### Correctness
+
+- **PostgreSQL: a view that depends on a primary key broke the whole restore.**
+  Views were created in `pre_data`, before the keys. SQL lets a query select a
+  column that is not in its `GROUP BY` when it is functionally dependent on it,
+  and PostgreSQL proves that dependency from the primary key alone — so a legal
+  source view such as `SELECT t.id, t.state FROM task t GROUP BY t.id` was
+  rejected at CREATE time while its table still had no primary key:
+
+  ```text
+  [Apply] apply DDL: CREATE VIEW ...: db error: ERROR: column "t.kanban_state"
+  must appear in the GROUP BY clause or be used in an aggregate function
+  ```
+
+  Reported on a real Odoo cluster (`report_project_task_user`, PostgreSQL 13 →
+  13). Views and materialized views are now emitted in `post_data`, after every
+  constraint; a materialized view is still created `WITH NO DATA` and refreshed
+  once the tables hold their rows. Nothing in the data load needs a view: `COPY`
+  targets tables.
+  Covered by a unit test on the emitted order and by two new seed views in
+  `e2e/postgres_matrix.sh` (plain and materialized) that reproduce the failure
+  against a live cluster. `e2e/postgres_matrix.sh 13` passes 12/12 with the fix.
+
 ## 0.0.2 — prerelease (2026-09-15)
 
 What `v0.0.1` shipped, plus the three failures that release exposed. Every

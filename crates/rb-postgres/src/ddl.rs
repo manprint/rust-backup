@@ -856,15 +856,6 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
     // Views in dependency order: a view selecting from another view must be
     // created after it, which catalog name order does not guarantee.
     let views: Vec<&PgView> = topological_views(d);
-    for v in &views {
-        pre.push(create_view(v));
-        let vq = quote_qualified(&v.schema, &v.name);
-        post.push(alter_table_owner(&v.schema, &v.name, &v.owner));
-        if let Some(c) = &v.comment {
-            post.push(comment_on("VIEW", &vq, c));
-        }
-        post.extend(grants_from_acl("TABLE", &vq, &v.acl));
-    }
 
     // Constraints: non-FK (PK/UNIQUE/CHECK/exclusion) before FK, so FK targets
     // already have the keys they reference.
@@ -877,6 +868,33 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
         for c in t.constraints.iter().filter(|c| c.kind == "f") {
             post.push(add_constraint(t, c));
         }
+    }
+
+    // Views come AFTER the keys, in `post_data`, because a view definition can
+    // depend on a primary key for its own validity. SQL lets a query select
+    // columns that are not in its `GROUP BY` when they are functionally
+    // dependent on it, and PostgreSQL proves that dependency from the primary
+    // key alone. So a perfectly legal source view like
+    //
+    //     SELECT t.id, t.state FROM task t GROUP BY t.id
+    //
+    // is rejected at CREATE time while `task` has no primary key yet:
+    //   ERROR: column "t.state" must appear in the GROUP BY clause or be used
+    //   in an aggregate function
+    //
+    // Creating views in `pre_data` therefore failed every restore of a cluster
+    // holding such a view (Odoo's `report_project_task_user` is one), even
+    // though nothing about the data load needs a view to exist: `COPY` targets
+    // tables. A materialized view is still created `WITH NO DATA` and populated
+    // by the `REFRESH` below, so it is not filled from a half-loaded table.
+    for v in &views {
+        post.push(create_view(v));
+        let vq = quote_qualified(&v.schema, &v.name);
+        post.push(alter_table_owner(&v.schema, &v.name, &v.owner));
+        if let Some(c) = &v.comment {
+            post.push(comment_on("VIEW", &vq, c));
+        }
+        post.extend(grants_from_acl("TABLE", &vq, &v.acl));
     }
     // Indexes that don't back a constraint, then the attachments that make a
     // partitioned parent's index valid.
@@ -1958,13 +1976,14 @@ mod tests {
         });
         let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
         let db = &ddl.per_database[0];
-        assert!(
-            db.pre_data.iter().any(
-                |s| s.starts_with("CREATE MATERIALIZED VIEW \"app\".\"daily\"")
+        let create = db
+            .post_data
+            .iter()
+            .position(|s| {
+                s.starts_with("CREATE MATERIALIZED VIEW \"app\".\"daily\"")
                     && s.ends_with("WITH NO DATA;")
-            ),
-            "a materialized view must be created empty: pre_data runs before the data load"
-        );
+            })
+            .expect("matview created in post_data, after the keys");
         let refresh = db
             .post_data
             .iter()
@@ -1975,7 +1994,61 @@ mod tests {
             .iter()
             .position(|s| s.contains("daily_idx"))
             .expect("matview index in post_data");
+        assert!(
+            create < refresh,
+            "a materialized view must still be created empty and populated afterwards"
+        );
         assert!(refresh < index, "populate the matview before indexing it");
+    }
+
+    /// A view may need a primary key to be *creatable*: SQL allows selecting a
+    /// column that is not in the `GROUP BY` when it is functionally dependent
+    /// on it, and PostgreSQL proves that from the primary key. Emitting such a
+    /// view before the keys failed the whole restore with
+    /// `column "t.state" must appear in the GROUP BY clause or be used in an
+    /// aggregate function` — so every view is emitted after every constraint.
+    #[test]
+    fn views_are_created_after_the_primary_keys_they_may_depend_on() {
+        let mut payload = crate::model::test_fixture();
+        let schema = &mut payload.databases[0].schemas[0];
+        schema.tables[0].constraints.push(PgConstraint {
+            name: "accounts_pkey".into(),
+            kind: "p".into(),
+            definition: "PRIMARY KEY (id)".into(),
+            references: None,
+        });
+        schema.views.push(PgView {
+            schema: "app".into(),
+            name: "per_account".into(),
+            owner: "app_owner".into(),
+            definition: "SELECT a.id, a.email FROM app.accounts a GROUP BY a.id".into(),
+            materialized: false,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: None,
+        });
+
+        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        assert!(
+            !db.pre_data.iter().any(|s| s.contains("CREATE VIEW")),
+            "no view may be created before the data load: pre_data has no keys yet"
+        );
+        let primary_key = db
+            .post_data
+            .iter()
+            .position(|s| s.contains("accounts_pkey"))
+            .expect("primary key in post_data");
+        let view = db
+            .post_data
+            .iter()
+            .position(|s| s.starts_with("CREATE VIEW \"app\".\"per_account\""))
+            .expect("view in post_data");
+        assert!(
+            primary_key < view,
+            "the primary key must exist before a view whose GROUP BY relies on it"
+        );
     }
 
     #[test]
