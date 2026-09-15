@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.0.5 — prerelease (2026-09-16)
+
+Same code as 0.0.4; the first tag published by the fast path.
 
 ### CI/CD
 

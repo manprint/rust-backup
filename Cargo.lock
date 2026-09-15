@@ -2637,7 +2637,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rb-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2652,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "rb-filesystem"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2665,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "rb-mongodb"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "rb-postgres"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2699,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "rb-s3"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "rb-transport"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "rust-backup"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "clap",
