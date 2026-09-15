@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### CI/CD
+
+- **`fast-release.yml` owns the tag path: binaries only.** It compiles once per
+  architecture on a native runner with a cargo cache keyed by `Cargo.lock`,
+  smoke-tests the binary, and publishes the archives, their checksums and the
+  GitHub release. `release.yml` and `docker.yml` no longer trigger on `v*`, so a
+  tag no longer pays for a second binary build, a container validation build, a
+  Trivy scan, SBOM or provenance — all of which still run on every branch push.
+  The tagged commit has already passed the full gate on `dev`.
+
 ## 0.0.4 — prerelease (2026-09-16)
 
 ### Correctness

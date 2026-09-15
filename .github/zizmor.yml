@@ -1,0 +1,13 @@
+rules:
+  cache-poisoning:
+    ignore:
+      # `fast-release.yml` exists to cut the wall clock of a tag build, and a
+      # cargo cache is the only thing that does that: without it every tag pays
+      # a cold ten-minute compile per architecture. The exposure is bounded and
+      # accepted: the cache key is the exact `Cargo.lock`, it holds only the
+      # dependency registry and `target/`, the artifact is built from a fresh
+      # checkout of the tagged commit with `--locked`, and the release archives
+      # carry published SHA256 checksums. The container image — the artifact
+      # that runs unattended — is still built by `docker.yml` with no cache at
+      # all, scanned by Trivy and published with SBOM and provenance.
+      - fast-release.yml
