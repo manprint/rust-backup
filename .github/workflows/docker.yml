@@ -161,6 +161,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.IMAGE_NAME }}
+          # `latest=false`: without it the action's auto flavour would move
+          # `latest` onto any semver tag, including a pre-1.0 prerelease cut
+          # from `dev`. Here `latest` means one thing only — the `main` branch.
+          flavor: latest=false
           tags: |
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}

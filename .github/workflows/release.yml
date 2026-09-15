@@ -36,6 +36,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Check that the tag matches the crate version
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          crate_version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [[ "$GITHUB_REF_NAME" != "v${crate_version}" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match the crate version $crate_version" >&2
+            exit 1
+          fi
       - name: Build locked release binary
         env:
           TARGET: ${{ matrix.target }}
@@ -94,9 +104,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          # A tag below 1.0.0, or one carrying a `-suffix` (v1.2.3-rc.1), is
+          # published as a prerelease: it must never become the default release
+          # a visitor downloads from the repository front page.
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == 0.* || "$version" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+          echo "publishing $GITHUB_REF_NAME (prerelease=$prerelease)"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --prerelease="$prerelease"
           else
-            gh release create "$GITHUB_REF_NAME" release-assets/* \
-              --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+            args=(release-assets/* --verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+            if [[ "$prerelease" == true ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" "${args[@]}"
           fi

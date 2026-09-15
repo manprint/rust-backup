@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.0.1 — first prerelease (2026-09-15)
+
+The tree reviewed on 2026-09-11, cut as a prerelease so the binaries and the
+container image can be exercised outside this repository. Pre-1.0: the CLI
+surface and the plan wire format may still change.
+
+### Documentation
+
+- **`docs/usage/` is now the single source of truth for operating the program.**
+  One page per feature — coordination server, transport, postgres, mongodb,
+  filesystem, s3, YAML sessions, the `plan` dry-run, Docker/Compose, environment
+  variables, exit codes — each opening with the minimal working invocation and
+  then covering every flag, its environment variable, its default and what it
+  actually changes. The guide is written in Italian; `README.md` and `USAGE.md`
+  point at it.
+- `USAGE.md` is now a pointer to those pages instead of a second, divergent flag
+  inventory.
+- Corrected a command that never existed: the dry-run is `rust-backup plan
+  <module> [PARAMS]`, with no `source` positional (`USAGE.md` and `CLAUDE.md`
+  both showed `plan <module> source`, which clap rejects with
+  `unexpected argument 'source' found`).
+
+### CI/CD
+
+- `scripts/help_parity.sh` now checks the binary's `--help` against
+  `docs/usage/*.md` in both directions, and the ghost-flag scan covers the new
+  guide as well as `README.md`, `USAGE.md`, `docs/`, `docs/modules/` and
+  `e2e/README.md`.
+- `release.yml` refuses a tag whose name does not match the crate version, and
+  publishes a tag below `1.0.0` (or one carrying a `-suffix`) as a **prerelease**
+  instead of as the repository's default download.
+- `docker.yml` pins `latest=false` on the metadata action: without it the auto
+  flavour would move the `latest` tag onto a prerelease cut from `dev`. `latest`
+  keeps meaning `main`, and a `v*` tag publishes `v0.0.1`, `0.0.1`, `0.0` and
+  `sha-…`.
+- `ci.yml` also runs on `v*` tags, so nothing is released from a tree that has
+  not passed the gate.
+- Workspace version set to `0.0.1` to match the tag.
+
 ## Unreleased — pre-staging review (2026-09-11)
 
 A full line-level re-review of the tree before staging. Every item below fails
