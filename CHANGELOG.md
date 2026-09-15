@@ -35,8 +35,13 @@ surface and the plan wire format may still change.
   flavour would move the `latest` tag onto a prerelease cut from `dev`. `latest`
   keeps meaning `main`, and a `v*` tag publishes `v0.0.1`, `0.0.1`, `0.0` and
   `sha-…`.
-- `ci.yml` also runs on `v*` tags, so nothing is released from a tree that has
-  not passed the gate.
+- `cargo update -p rustls` to 0.23.45: RUSTSEC-2026-0285 (TLS 1.3 handshake
+  messages accepted across encryption-level boundaries, published 2026-09-14)
+  affects 0.23.40, which is what the first `v0.0.1` build linked.
+- The MinIO e2e scripts pull from `quay.io/minio/…` at a pinned release.
+  Docker Hub's `minio/minio` and `minio/mc` now answer `pull access denied …
+  repository does not exist`, which took `s3_minio_test.sh` and the `s3` fault
+  group down with it — an image-registry change, not a code regression.
 - Workspace version set to `0.0.1` to match the tag.
 
 ## Unreleased — pre-staging review (2026-09-11)

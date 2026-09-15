@@ -49,7 +49,10 @@ dd if=/dev/urandom of="$work/seed/large.bin" bs=1M count=12 status=none
 touch "$work/seed/empty"
 
 start_minio() { # name host-port
-  docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null
+  # Docker Hub's `minio/minio` was withdrawn (`pull access denied ...
+  # repository does not exist`); quay.io is MinIO's own registry, and the
+  # release is pinned so the suite cannot decay under us again.
+  docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
   containers+=("$1")
 }
 start_minio "$src_name" 19000
@@ -65,7 +68,7 @@ for _ in {1..30}; do
 done
 (( minio_ready == 1 )) || { echo 'MinIO health checks did not become ready' >&2; exit 1; }
 mc() {
-  docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh minio/mc:latest -c \
+  docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
     'mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && mc alias set dst http://127.0.0.1:19001 minioadmin minioadmin >/dev/null && mc "$@"' sh "$@"
 }
 mc mb src/source >/dev/null

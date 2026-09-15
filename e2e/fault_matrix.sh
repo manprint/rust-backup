@@ -621,14 +621,14 @@ SQL
   start_minio() { # name port
     CONTAINERS+=("$1")
     docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin \
-      -e MINIO_ROOT_PASSWORD=minioadmin minio/minio:latest server /data >/dev/null || return 1
+      -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null || return 1
     minio_ready "$2"
   }
   # The two aliases are configured independently: chaining them with `&&` made a
   # source-only listing fail whenever the destination endpoint was the one
   # deliberately stopped, which reads as a source mutation that never happened.
   mc() { # run the MinIO client against both endpoints
-    docker run --rm --network host --entrypoint /bin/sh minio/mc:latest -c \
+    docker run --rm --network host --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
       "mc alias set src http://127.0.0.1:$s3_src_port minioadmin minioadmin >/dev/null 2>&1
        mc alias set dst http://127.0.0.1:$s3_dst_port minioadmin minioadmin >/dev/null 2>&1
        mc \"\$@\"" sh "$@"
@@ -639,7 +639,7 @@ SQL
     mc mb dst/destination >/dev/null || s3_seeded=0
     # Objects well over 2 × the 5 MiB part size, so the restore is genuinely
     # multipart and an interrupted upload can orphan parts.
-    docker run --rm --network host --entrypoint /bin/sh minio/mc:latest -c \
+    docker run --rm --network host --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
       "set -e
        mc alias set src http://127.0.0.1:$s3_src_port minioadmin minioadmin >/dev/null
        head -c 26214400 /dev/urandom >/tmp/big.bin
