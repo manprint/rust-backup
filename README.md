@@ -24,6 +24,15 @@ The transport uses a TCP/yamux relay and can upgrade carriers to direct
 UDP/QUIC. If direct setup is unavailable it falls back to the relay; an active
 stream is never transparently resumed after a connection loss.
 
+## Documentation of record
+
+**[`docs/usage/`](docs/usage/README.md) is the single source of truth for using
+this program** — one page per feature (server, transport, postgres, mongodb,
+filesystem, s3, YAML sessions, `plan`, Docker, environment variables, exit
+codes), each opening with its minimal working example and covering every flag.
+The guide is written in Italian; the sections below stay as a quick English
+overview, and `scripts/gates.sh` enforces that the guide and `--help` agree.
+
 ## Install
 
 Download a Linux `x86_64` or `aarch64` archive from
@@ -272,7 +281,8 @@ Pass credentials in the environment, not on the command line:
 `/proc/<pid>/cmdline` is world-readable on Linux, so a `--password` flag is
 visible to every local account for as long as the transfer runs, while
 `/proc/<pid>/environ` is readable only by the owning user. Every flag has a
-`RUST_BACKUP_<UPPER_SNAKE>` equivalent (`USAGE.md`).
+`RUST_BACKUP_<UPPER_SNAKE>` equivalent
+([docs/usage/10-variabili-ambiente.md](docs/usage/10-variabili-ambiente.md)).
 
 ```bash
 # Source
@@ -460,9 +470,22 @@ git push origin v0.1.0
 
 ## More documentation
 
-Operator-facing:
+Operator-facing — the usage guide in [docs/usage/](docs/usage/README.md) is the
+single source of truth for running the program (Italian):
 
-- [Complete CLI reference](USAGE.md)
+- [Usage guide index](docs/usage/README.md) —
+  [server](docs/usage/01-server.md) ·
+  [transport](docs/usage/02-trasporto.md) ·
+  [postgres](docs/usage/03-postgres.md) ·
+  [mongodb](docs/usage/04-mongodb.md) ·
+  [filesystem](docs/usage/05-filesystem.md) ·
+  [s3](docs/usage/06-s3.md) ·
+  [YAML sessions](docs/usage/07-sessioni-yaml.md) ·
+  [plan dry-run](docs/usage/08-plan.md) ·
+  [Docker](docs/usage/09-docker.md) ·
+  [environment variables](docs/usage/10-variabili-ambiente.md) ·
+  [exit codes](docs/usage/11-codici-uscita.md)
+- [USAGE.md](USAGE.md) — pointer to the pages above
 - [Transport and carrier contract](docs/TRANSPORT.md)
 - [Module-specific behavior](docs/modules/README.md) —
   [postgres](docs/modules/POSTGRES.md) ·

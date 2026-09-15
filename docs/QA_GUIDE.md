@@ -37,7 +37,7 @@ destination consumes it.
 Credentials belong in the environment, not in argv: `/proc/<pid>/cmdline` is
 world-readable for the whole run, `/proc/<pid>/environ` is not. Every module
 parameter has an env var (`RUST_BACKUP_PASSWORD`, `RUST_BACKUP_URI`,
-`RUST_BACKUP_SECRET_KEY`, …) — see `USAGE.md` for the full list.
+`RUST_BACKUP_SECRET_KEY`, …) — see `docs/usage/10-variabili-ambiente.md` for the full list.
 
 **postgres** — source needs a read-only account that can read the catalogs, the
 copied tables *and every sequence*; destination needs cluster administration
@@ -123,7 +123,7 @@ read-back of the persisted payload, never from writes having returned success.
 
 Exit codes: 0 success, 1 any other failure, 2 configuration, 3 preflight, 4 plan
 rejection, 5 integrity *or* apply *or* verify, 6 source mutation, 7
-transport/connect. The same table is in [USAGE.md](../USAGE.md#exit-codes).
+transport/connect. The same table is in [docs/usage/11-codici-uscita.md](usage/11-codici-uscita.md).
 
 ## When a run fails
 

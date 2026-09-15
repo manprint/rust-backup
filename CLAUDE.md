@@ -14,7 +14,7 @@ is staged to disk on either host** — all data streams.
 - `rust-backup <module> destination <PARAMS>` — validate + restore 1:1
 - `rust-backup server <OPTS>` — coordination server
 - `rust-backup run --config session.yml` — multi-target session
-- `rust-backup plan <module> source <PARAMS>` — dry-run: print plan only
+- `rust-backup plan <module> <PARAMS>` — dry-run: print plan only (no role positional)
 
 **Modules** (`module ∈ postgres | mongodb | filesystem | s3`): postgres (cluster
 fidelity, pg 10+ — minimum enforced, CI matrix 10..=18), mongodb (4..=8), filesystem (POSIX, ownership/perms on
