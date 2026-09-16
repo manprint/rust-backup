@@ -49,7 +49,7 @@ that state as `wip(<id>): <what remains>`.
 - **Phase:** —
 - **Next action:** plan complete — run `/plan-execute-verify verify`
 - **Assigned:** `agent:opus`
-- **Repo state:** phases 0-4 committed on dev; 5.1 closed and uncommitted (phase 5 commits at its end)
+- **Repo state:** every phase committed on `dev`, nothing pushed: 0-3 earlier, 4 `4d1b5e7`, 5 `0c33adb`, 6 `2e0a2d3` (each followed by its ledger commit). Working tree clean
 
 ## 2. Feature context (self-contained recap)
 
@@ -669,9 +669,9 @@ A `SKIPPED` sub-phase or phase keeps its row and carries the reason.
 | T-FS-MATRIX | e2e | `PARTIAL` | `e2e/filesystem_matrix.sh` written and lint-clean; its unprivileged half is proven here (21 rows + sparse content + 4 refusal rows, 0 fail). The root pass needs passwordless sudo (§ 9) (§ 5.3) |
 | T-FS-TOCTOU | unit | `PASS` | both in `crates/rb-filesystem/src/lib.rs`: the planted symlink is refused Apply-phase and nothing is written through it; a symlinked destination root is refused Validate-phase (§ 5.4) |
 | T-DOCS-PARITY | gate | `PASS` | `bash scripts/gates.sh` runs `scripts/docs_parity.sh` and its `--selftest`: 0 mismatch on the tree, both selftest cases detected (§ 6.1-6.4) |
-| T-PG-MATRIX, T-PG-IMMUT, T-PG-INTROSPECT | e2e (existing) | `TODO` (re-run per phase) | regression guards; must stay green after every postgres sub-phase |
-| T-FS-OWN, T-FS-IMMUT, T-FS-ENOSPC | e2e (existing) | `TODO` (re-run per phase) | regression guards for the filesystem module |
-| T-E2E0, T-SESSION-2, T-FAULT, T-MONGO-MATRIX, T-MONGO-IMMUT, T-S3-MINIO, T-S3-IMMUT | e2e (existing) | `TODO` (re-run per phase) | cross-module regression guards |
+| T-PG-MATRIX, T-PG-IMMUT, T-PG-INTROSPECT | e2e (existing) | `PASS` (last re-run: phase 4 guard) | `bash e2e/postgres_matrix.sh 10 16 18` = 106/0, 117/0, 119/0; phases 5 and 6 touch no postgres code path |
+| T-FS-OWN, T-FS-IMMUT, T-FS-ENOSPC | e2e (existing) | `BLOCKED` | all three need passwordless sudo, which this host does not have (§ 9). The filesystem changes of phase 5 are covered here by the unprivileged matrix pass, the unit tests and T-E2E0; CI's `filesystem-privileged` job runs them |
+| T-E2E0, T-SESSION-2, T-FAULT, T-MONGO-MATRIX, T-MONGO-IMMUT, T-S3-MINIO, T-S3-IMMUT | e2e (existing) | `PASS` (last re-run: T-E2E0 in the phase 6 guard, the rest in the phase 4 guard) | T-E2E0 5/0 and T-SESSION-2 green after phase 5; mongodb 4 6/0 and MinIO green after phase 4 |
 
 ### Docs
 
@@ -687,15 +687,15 @@ other docs get their own rows.
 | README.md | 4 | `DONE` | "Source safety": the read-only source and the audit on every exit path, the least-privilege account per backend, the writable-role warning, the atime rule with its refusal message and both remedies (§ 4.9) |
 | README.md | 5 | `DONE` | what round-trips (incl. FIFOs and device nodes) and what is refused (sockets, non-UTF-8 names, depth > 1024, xattrs), sparse files restored dense, the `CAP_CHOWN` / `CAP_MKNOD` rule and three troubleshooting messages with remedies (§ 5.6) |
 | README.md | 6 | `DONE` | requirements and capabilities, the exit-code paragraph, what postgres and mongodb refuse, the access-time example, the fidelity-matrix link (§ 6.5) |
-| docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6 and already correct for the filesystem rows, whose seeders § 5.2 wrote to match it; reconciled § 6.3 |
-| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", the printed proof, "Runtime model and guardrails", "Connections, timeouts and keepalives", "The source fingerprint" and "Failure behaviour" written (§ 1.3-1.5, 2.1-2.3, 3.1-3.5); Limits reconciled in § 6.3 |
-| docs/modules/FILESYSTEM.md | 4, 5, 6 | `IN_PROGRESS` | the atime rule, its message and its remedies written, plus the guarantees-table row (§ 4.5); special files and their two messages written (§ 5.1); the TOCTOU guarantee (§ 5.4) and the three-reads fingerprint cost with the scope limits (§ 5.5) written; reconciled § 6.3 |
-| docs/modules/MONGODB.md | 4, 6 | `IN_PROGRESS` | "Immutability" rewritten for the typed client, the command allowlist and the pinned read settings (§ 4.3); reconciled § 6.3 |
-| docs/modules/README.md | 4, 6 | `IN_PROGRESS` | the module-author checklist states that `fingerprint` runs after a failed or panicked run too (§ 4.8); reconciled § 6.3 |
-| docs/modules/S3.md | 4, 6 | `IN_PROGRESS` | "Immutability" names `ReadOnlyS3`, the eight read operations and the one-file read side (§ 4.4); reconciled § 6.3 |
-| docs/IMMUTABILITY.md | 4, 6 | `IN_PROGRESS` | created § 4.1; PostgreSQL (§ 4.2), MongoDB (§ 4.3), S3 (§ 4.4) and the filesystem atime row (§ 4.5) carry their guard class and evidence IDs; the MongoDB and S3 least-privilege recipes are final and every "evidence lands in" marker is gone (§ 4.7); the fingerprint contract states the panic path (§ 4.8); reconciled § 6.3 |
-| docs/usage/03-postgres.md, 05-filesystem.md, 07-sessioni-yaml.md, 10-variabili-ambiente.md, 11-codici-uscita.md | 1, 2, 4, 5, 6 | `IN_PROGRESS` | `--extension-version` rows, the configuration-table paragraph, "Cosa stampa la verifica" and the exit-code note landed (§ 1.4-1.5, 2.1-2.3); test hook and filesystem rows still owed; full audit § 6.2 |
-| docs/QA_GUIDE.md, e2e/README.md, e2e/fixtures/postgres/README.md | 0, 1, 3, 5, 6 | `IN_PROGRESS` | § 0.1 matrix links; § 0.2 helper table + fixture naming rule; scripts/jobs/gates still to reconcile in § 6 |
+| docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `DONE` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6 and already correct for the filesystem rows, whose seeders § 5.2 wrote to match it; § 6.3 verified 86 + 32 catalogue rows with no empty `Fixture`/`Expected` cell and no execution status |
+| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `DONE` | supported objects, "Extension versions", the printed proof, "Runtime model and guardrails", "Connections, timeouts and keepalives", "The source fingerprint" and "Failure behaviour" written (§ 1.3-1.5, 2.1-2.3, 3.1-3.5); § 6.3 checked the refusal list against the 15 probes of `unsupported_probes` plus the 18-only NOT NULL probe, `reg*` and dotted identifiers, and kept the `pgsql_tmp` bullet because the data stream still sorts |
+| docs/modules/FILESYSTEM.md | 4, 5, 6 | `DONE` | the atime rule, its message and its remedies written, plus the guarantees-table row (§ 4.5); special files and their two messages written (§ 5.1); the TOCTOU guarantee (§ 5.4) and the three-reads fingerprint cost with the scope limits (§ 5.5) written; § 6.3 read it against the shipped module |
+| docs/modules/MONGODB.md | 4, 6 | `DONE` | "Immutability" rewritten for the typed client, the command allowlist and the pinned read settings (§ 4.3); § 6.3 checked the Limits and privilege sections against the code |
+| docs/modules/README.md | 4, 6 | `DONE` | the module-author checklist states that `fingerprint` runs after a failed or panicked run too (§ 4.8); § 6.2 checked the version column against `version_support()` |
+| docs/modules/S3.md | 4, 6 | `DONE` | "Immutability" names `ReadOnlyS3` and the one-file read side (§ 4.4); § 6.3 reconciled the read surface — seven operations issued, eight exposed by the wrapper |
+| docs/IMMUTABILITY.md | 4, 6 | `DONE` | created § 4.1; PostgreSQL (§ 4.2), MongoDB (§ 4.3), S3 (§ 4.4) and the filesystem atime row (§ 4.5) carry their guard class and evidence IDs; the MongoDB and S3 least-privilege recipes are final and every "evidence lands in" marker is gone (§ 4.7); the fingerprint contract states the panic path (§ 4.8); § 6.3 removed the last plan marker and corrected the S3 read-surface row |
+| docs/usage/03-postgres.md, 05-filesystem.md, 07-sessioni-yaml.md, 10-variabili-ambiente.md, 11-codici-uscita.md | 1, 2, 4, 5, 6 | `DONE` | `--extension-version` rows, the configuration-table paragraph, "Cosa stampa la verifica" and the exit-code note landed (§ 1.4-1.5, 2.1-2.3); the filesystem rows landed with phase 5; § 6.2 audited every table row against the code and fixed the `--udp` default |
+| docs/QA_GUIDE.md, e2e/README.md, e2e/fixtures/postgres/README.md | 0, 1, 3, 5, 6 | `DONE` | § 0.1 matrix links; § 0.2 helper table + fixture naming rule; § 6.3 added `env_inventory.sh`, `docs_parity.sh` and the `filesystem-privileged` job, § 6.4 the gate chain |
 | CLAUDE.md | 4, 6 | `DONE` | the gate line lists `crate_invariants.sh`, `source_readonly_lint.sh` (+ `--selftest`), `help_parity.sh` (§ 4.6) and `docs_parity.sh` (+ `--selftest`) (§ 6.4) |
 
 ### Audits
