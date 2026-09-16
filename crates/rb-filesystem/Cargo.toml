@@ -10,7 +10,10 @@ description = "rust-backup filesystem module"
 rb-core = { path = "../rb-core" }
 async-trait.workspace = true
 blake3.workspace = true
-nix = { workspace = true, features = ["fs", "user"] }
+# `resource` is read by the walk's descriptor-budget test only: it lowers
+# RLIMIT_NOFILE so a tree deeper than the limit proves the walk holds no
+# directory descriptor across its recursion.
+nix = { workspace = true, features = ["fs", "resource", "user"] }
 tracing.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true

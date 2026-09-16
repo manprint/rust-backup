@@ -110,6 +110,13 @@ backend.
   unix socket cannot be reproduced". A `special_files` preflight check refuses
   device nodes without root or `CAP_MKNOD` before anything is written, and the
   fingerprint hashes `rdev`, so a changed device number is drift.
+- **A deep tree exhausted the process's file descriptors instead of walking.**
+  Linux's `DirEntry` holds an `Arc` on the directory stream it came from, so the
+  children of one level, kept alive while the walk recursed into them, pinned
+  one descriptor per level. A tree deeper than `RLIMIT_NOFILE` failed with
+  "Too many open files" — and `MAX_WALK_DEPTH` could never be reached to report
+  the refusal it exists for. The walk keeps names now, not entries; the entry's
+  type has always come from `symlink_metadata`, so nothing else changes.
 - **A symlink can no longer redirect a restore.** Directories are created one
   level at a time behind a `symlink_metadata` check instead of `create_dir_all`,
   which follows a symlink to a directory: a planted symlink is refused in Apply
@@ -157,6 +164,11 @@ backend.
   which is why the plain matrices only flaked where the PostGIS ones failed
   outright. Readiness is now a TCP probe plus a `SELECT 1`, which the init-time
   server cannot answer, and `e2e/fault_matrix.sh` probes the same way.
+- **`M-FS-32` snapshotted the source access times before reading every file.**
+  `rb_tree_digest` opens and hashes each regular file, so taking the atime
+  manifest first recorded the digest's own reads as drift the run had caused.
+  The order matches every other immutability case now: content digest first,
+  atimes last.
 - **The `T-FS-OWN` non-root cases ran the source as the unprivileged account
   too.** Their fixture tree is deliberately root-owned — that is what makes the
   exact restore impossible for a non-root destination — so the access-time guard

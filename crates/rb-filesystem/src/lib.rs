@@ -981,6 +981,56 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // A `DirEntry` keeps an `Arc` on the directory stream it came from, so
+    // holding the children of one level while the walk recurses into them
+    // pinned one descriptor per level: a tree deeper than `RLIMIT_NOFILE` died
+    // with "Too many open files" and `MAX_WALK_DEPTH` could never report its
+    // own refusal. Walk a tree deeper than a deliberately small descriptor
+    // budget; the limit is restored before the test returns, and 512 leaves
+    // ample room for whatever else the test binary has open.
+    #[test]
+    fn walk_holds_no_descriptor_per_directory_level() {
+        use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+        const DEPTH: usize = 600;
+        const BUDGET: u64 = 512;
+
+        let root = tempdir("walk-fd-budget");
+        let mut deep = root.clone();
+        for _ in 0..DEPTH {
+            deep.push("d");
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("bottom.txt"), b"m29").unwrap();
+
+        let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        if soft <= BUDGET {
+            // The ambient budget is already at or under what the tree needs to
+            // prove anything; lowering it further would test nothing.
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        setrlimit(Resource::RLIMIT_NOFILE, BUDGET, hard).unwrap();
+        // `visit` recurses, and a test thread's default stack is far smaller
+        // than the main thread's: run the walk with room to reach the bottom,
+        // so the test measures descriptors rather than stack.
+        let walk_root = root.clone();
+        let walked = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || crate::walk::collect(&walk_root))
+            .unwrap()
+            .join()
+            .unwrap();
+        setrlimit(Resource::RLIMIT_NOFILE, soft, hard).unwrap();
+
+        let plan = walked.expect("a tree deeper than the descriptor budget must still walk");
+        assert!(
+            plan.entries.iter().any(|entry| entry.kind == "file"),
+            "the walk reached the bottom of the tree"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn roundtrip_restores_contents_links_and_mode() {
         let source_root = tempdir("roundtrip-source");

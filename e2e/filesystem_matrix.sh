@@ -230,8 +230,11 @@ rb_seed_filesystem_fixture "$atime_src" $((64 * 1024))
 chown -R 0:0 "$atime_src"
 chmod -R a+rX "$atime_src"
 find "$atime_src" -type f -exec chmod 0644 {} +
-before_atime=$(rb_atime_manifest "$atime_src")
+# Order matters: `rb_tree_digest` opens and reads every regular file, so it
+# moves their access times. Snapshot the atimes AFTER it, or the comparison
+# below reports the digest's own reads as drift caused by the run.
 before_tree=$(rb_tree_digest "$atime_src")
+before_atime=$(rb_atime_manifest "$atime_src")
 port=$(rb_free_port)
 start_server "$port" "$work/atime-server.log"
 atime_rc=0

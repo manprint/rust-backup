@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
@@ -103,15 +104,24 @@ fn visit(
             ),
         ));
     }
-    let mut children: Vec<_> = fs::read_dir(&dir)
+    // Keep the NAMES, not the `DirEntry`s. On Linux a `DirEntry` holds an `Arc`
+    // on the directory stream it came from, so a `Vec<DirEntry>` alive across
+    // the recursive call below pins that directory's file descriptor for the
+    // whole subtree — one descriptor per level. A tree deeper than
+    // `RLIMIT_NOFILE` then died with "Too many open files" instead of walking,
+    // and `MAX_WALK_DEPTH` could never be reached to report its own refusal.
+    // Nothing is lost: the entry's type comes from `symlink_metadata` below,
+    // never from the `DirEntry`.
+    let mut names: Vec<OsString> = fs::read_dir(&dir)
         .map_err(|e| io_error(Phase::Analyze, &dir, e))?
+        .map(|child| child.map(|c| c.file_name()))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| io_error(Phase::Analyze, &dir, e))?;
-    children.sort_by_key(|child| child.file_name());
+    names.sort();
 
-    for child in children {
-        let path = child.path();
-        let child_rel = rel.join(child.file_name());
+    for name in names {
+        let path = dir.join(&name);
+        let child_rel = rel.join(&name);
         // A POSIX name is an arbitrary byte string. Recording it lossily
         // renamed the entry (invalid bytes became U+FFFD), the destination
         // created the renamed path, and verification compared mangled against
