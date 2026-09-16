@@ -57,12 +57,35 @@ still refused.
 
 ## Completion proof
 
-The destination reconnects after apply, re-introspects the complete restorable
-catalog, and compares it with the normalized source plan. It then reads every
-table through deterministic binary `COPY` and must reproduce every item and the
-whole-payload BLAKE3. Only after this proof and the source's full post-run
+The source counts the rows of every plan item — in exactly the scope the item
+streams, `FROM ONLY` for an inheritance parent and restricted to its condition
+for an extension configuration table — and of every populated materialized view.
+While applying, the destination compares each count with the rows its `COPY`
+actually wrote, and after the refresh statements it counts every populated
+materialized view on its own side. A difference is an integrity failure. The
+BLAKE3 commitments prove that what arrived is what was sent; only the counts
+prove that nothing was left behind, and a plan that carries no counts is
+restored with one warning saying the row check was skipped.
+
+A constraint is compared in full: its definition, its comment, and the state
+`pg_constraint` records — `convalidated`, `condeferrable`, `condeferred`. A
+`NOT VALID` constraint stays `NOT VALID`, because the rows that violate it are
+legal state on the source and a validated copy would have had to reject them;
+the same plan is refused outright when a constraint's recorded state and its
+definition text disagree.
+
+The destination then reconnects after apply, re-introspects the complete
+restorable catalog, and compares it with the normalized source plan. It reads
+every table through deterministic binary `COPY` and must reproduce every item and
+the whole-payload BLAKE3. Only after this proof and the source's full post-run
 catalog/data fingerprint audit do both commands exit successfully. A database
 that merely accepted DDL or rows cannot produce `RESTORE VERIFIED`.
+
+What it proved is printed under that record: `rows verified: <t> from tables,
+<m> from materialized views, <n> rows` and `constraints: <c> (validated <v>,
+not valid <nv>)`, plus one `deviation: ...` line per declared departure. The
+same numbers leave the module as fields of the `PostgreSQL destination
+read-back verified` event.
 
 ## A failed restore removes what it created
 

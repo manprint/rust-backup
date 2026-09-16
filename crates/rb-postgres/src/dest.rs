@@ -243,7 +243,7 @@ pub async fn stream_in(
     params: &PostgresParams,
     plan: &BackupPlan,
     src: &mut dyn ChunkSource,
-) -> Result<()> {
+) -> Result<RestoredRows> {
     let payload: PgPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
 
@@ -269,14 +269,25 @@ pub async fn stream_in(
     let preexisting = existing_target_databases(&boot.client, &payload).await?;
     let outcome = async {
         run_statements(&boot.client, &ddl.databases).await?;
-        restore_databases(params, &ddl, plan, src).await
+        restore_databases(params, &ddl, &payload, plan, src).await
     }
     .await;
-    if let Err(error) = outcome {
-        remove_partially_restored(&boot.client, &payload, &preexisting).await;
-        return Err(error);
+    match outcome {
+        Err(error) => {
+            remove_partially_restored(&boot.client, &payload, &preexisting).await;
+            Err(error)
+        }
+        Ok(rows) => Ok(rows),
     }
-    Ok(())
+}
+
+/// What the restore actually wrote, per origin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoredRows {
+    /// Rows written by `COPY … FROM STDIN`.
+    pub table_rows: u64,
+    /// Rows a `REFRESH MATERIALIZED VIEW` produced on this side.
+    pub derived_rows: u64,
 }
 
 /// Steps 2–4 of the restore. Split out of [`stream_in`] so every `?` funnels
@@ -285,9 +296,10 @@ pub async fn stream_in(
 async fn restore_databases(
     params: &PostgresParams,
     ddl: &crate::ddl::ClusterDdl,
+    payload: &PgPlanPayload,
     plan: &BackupPlan,
     src: &mut dyn ChunkSource,
-) -> Result<()> {
+) -> Result<RestoredRows> {
     // 2. Per-database structure; keep each connection for the data load.
     let mut conns: HashMap<String, PgConnection> = HashMap::new();
     for dbddl in &ddl.per_database {
@@ -299,7 +311,7 @@ async fn restore_databases(
     // 3. Bulk data: one linear pass over the chunk stream, each item routed to a
     //    COPY … FROM STDIN on its database connection.
     let metas = item_metas(plan)?;
-    apply_data(&conns, &metas, src).await?;
+    let table_rows = apply_data(&conns, &metas, src).await?;
 
     // 4. Per-database post_data.
     for dbddl in &ddl.per_database {
@@ -307,7 +319,55 @@ async fn restore_databases(
             run_statements(&conn.client, &dbddl.post_data).await?;
         }
     }
-    Ok(())
+
+    // 5. A populated materialized view's rows are produced here, by the
+    //    `REFRESH` in post_data, not streamed — so the source's count is the
+    //    only evidence that the refresh reproduced them.
+    let derived_rows = check_matview_rows(&conns, payload).await?;
+    Ok(RestoredRows {
+        table_rows,
+        derived_rows,
+    })
+}
+
+/// Count every populated materialized view on the destination and compare it
+/// with the count the source took.
+async fn check_matview_rows(
+    conns: &HashMap<String, PgConnection>,
+    payload: &PgPlanPayload,
+) -> Result<u64> {
+    let mut total: u64 = 0;
+    for db in &payload.databases {
+        let Some(conn) = conns.get(&db.name) else {
+            continue;
+        };
+        for schema in &db.schemas {
+            for view in &schema.views {
+                let Some(expected) = view.expected_rows else {
+                    continue;
+                };
+                let sql = crate::introspect::count_sql(&view.schema, &view.name, false, None);
+                let row = conn.client.query_one(&sql, &[]).await.map_err(|e| {
+                    BackupError::phase_src(
+                        Phase::Verify,
+                        format!(
+                            "count rows of materialized view {}.{}",
+                            view.schema, view.name
+                        ),
+                        e,
+                    )
+                })?;
+                let actual = row.get::<_, i64>(0).max(0) as u64;
+                check_expected_rows(
+                    &format!("materialized view {}.{}", view.schema, view.name),
+                    Some(expected.max(0) as u64),
+                    actual,
+                )?;
+                total = total.saturating_add(actual);
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Target database names that already exist on the destination.
@@ -386,7 +446,7 @@ async fn remove_partially_restored(
 /// Re-introspect every restored database plus the selected cluster-global
 /// objects and compare them with the source plan. Planner estimates and server
 /// version strings are normalized because they are not restored state.
-pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Result<Vec<String>> {
+pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Result<CatalogProof> {
     let mut expected: PgPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
     let role_names: HashSet<_> = expected
@@ -478,7 +538,41 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
             ),
         ));
     }
-    Ok(deviations)
+    Ok(CatalogProof {
+        constraints: count_constraints(&expected),
+        constraints_not_valid: count_constraints_not_valid(&expected),
+        deviations,
+    })
+}
+
+/// What the catalog read-back established, beyond "the two payloads are equal".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogProof {
+    /// Integrity constraints compared on both sides.
+    pub constraints: u64,
+    /// How many of them are `NOT VALID` on both sides.
+    pub constraints_not_valid: u64,
+    /// One line per accepted, reported difference (extension versions).
+    /// Notes, without the `deviation: ` prefix — the prefix belongs to the
+    /// place that prints them, so a note is never labelled twice.
+    pub deviations: Vec<String>,
+}
+
+fn count_constraints(payload: &PgPlanPayload) -> u64 {
+    constraints(payload).count() as u64
+}
+
+fn count_constraints_not_valid(payload: &PgPlanPayload) -> u64 {
+    constraints(payload).filter(|c| !c.validated).count() as u64
+}
+
+fn constraints(payload: &PgPlanPayload) -> impl Iterator<Item = &crate::model::PgConstraint> {
+    payload
+        .databases
+        .iter()
+        .flat_map(|db| db.schemas.iter())
+        .flat_map(|schema| schema.tables.iter())
+        .flat_map(|table| table.constraints.iter())
 }
 
 /// Accept a different installed extension version under
@@ -506,7 +600,7 @@ fn reconcile_extension_versions(
                     continue;
                 }
                 deviations.push(format!(
-                    "deviation: extension {} restored at version {} (source {})",
+                    "extension {} restored at version {} (source {})",
                     actual_extension.name, actual_extension.version, expected_extension.version
                 ));
                 actual_extension.version = expected_extension.version.clone();
@@ -818,11 +912,20 @@ fn normalize_catalog(payload: &mut PgPlanPayload) {
         // faithful copies of the same rows.
         for config in &mut database.extension_configs {
             config.estimated_bytes = 0;
+            // Counted on the source during `analyze` and checked while applying
+            // and refreshing; the destination's re-introspection never counts,
+            // so comparing the field here would report every restore as a
+            // difference.
+            config.expected_rows = None;
         }
         for schema in &mut database.schemas {
+            for view in &mut schema.views {
+                view.expected_rows = None;
+            }
             for table in &mut schema.tables {
                 table.estimated_rows = 0;
                 table.estimated_bytes = 0;
+                table.expected_rows = None;
                 // `ordinal` is `pg_attribute.attnum`, which keeps counting the
                 // columns a table has dropped: a source table that lost four
                 // columns numbers its 58th live column 62, while a logical
@@ -1044,13 +1147,52 @@ fn copy_in_sql(meta: &ItemMeta) -> String {
     }
 }
 
+/// Compare the rows the source counted with the rows this side actually wrote.
+///
+/// The BLAKE3 commitments prove that every byte that arrived is the byte that
+/// was sent; they say nothing about rows that never left, or that a `COPY`
+/// silently dropped. `expected` is absent in a plan written before this check
+/// existed, and an absent count is not a failure — it is an unverified restore,
+/// and the caller says so once per run.
+fn check_expected_rows(name: &str, expected: Option<u64>, actual: u64) -> Result<()> {
+    match expected {
+        Some(expected) if expected != actual => Err(BackupError::Integrity(format!(
+            "{name}: source counted {expected} rows, destination COPY wrote {actual}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 async fn apply_data(
     conns: &HashMap<String, PgConnection>,
     metas: &HashMap<u32, ItemMeta>,
     src: &mut dyn ChunkSource,
-) -> Result<()> {
+) -> Result<u64> {
     // The open COPY sink for the item currently being loaded.
     let mut current: Option<ActiveCopy> = None;
+    let mut rows_total: u64 = 0;
+    // An older plan carries no counts. That is not a failure, but the operator
+    // must know the restore was not row-verified.
+    let mut unverified = false;
+
+    // Close the open COPY and hold its row count against the source's.
+    macro_rules! close_and_check {
+        () => {
+            if let Some((closed_id, rows)) = finish_current(&mut current).await? {
+                rows_total = rows_total.saturating_add(rows);
+                if let Some(meta) = metas.get(&closed_id) {
+                    if meta.expected_rows.is_none() {
+                        unverified = true;
+                    }
+                    check_expected_rows(
+                        &format!("{}.{}", meta.schema, meta.table),
+                        meta.expected_rows,
+                        rows,
+                    )?;
+                }
+            }
+        };
+    }
 
     loop {
         match src.next().await? {
@@ -1060,7 +1202,7 @@ async fn apply_data(
                     .map(|(id, _, _)| *id != item_id)
                     .unwrap_or(true);
                 if reopen {
-                    finish_current(&mut current).await?;
+                    close_and_check!();
                     let meta = metas.get(&item_id).ok_or_else(|| {
                         BackupError::phase(Phase::Apply, format!("data for unknown item {item_id}"))
                     })?;
@@ -1105,27 +1247,34 @@ async fn apply_data(
                         format!("ItemEnd item={item_id} does not match open item={open_id} bytes={received}"),
                     ));
                 }
-                finish_current(&mut current).await?
+                close_and_check!();
             }
             ChunkEvent::End => {
-                finish_current(&mut current).await?;
+                close_and_check!();
                 break;
             }
         }
     }
-    Ok(())
+    if unverified {
+        tracing::warn!("plan carries no expected_rows; row-count verification skipped");
+    }
+    Ok(rows_total)
 }
 
 type ActiveCopy = (u32, u64, Pin<Box<CopyInSink<Bytes>>>);
 
-async fn finish_current(current: &mut Option<ActiveCopy>) -> Result<()> {
-    if let Some((_, _, mut sink)) = current.take() {
-        sink.as_mut()
+/// Close the open `COPY` and return `(item_id, rows written)`, so the caller can
+/// hold the count against the source's own.
+async fn finish_current(current: &mut Option<ActiveCopy>) -> Result<Option<(u32, u64)>> {
+    if let Some((item_id, _, mut sink)) = current.take() {
+        let rows = sink
+            .as_mut()
             .finish()
             .await
             .map_err(|e| BackupError::phase_src(Phase::Apply, "copy_in finish", e))?;
+        return Ok(Some((item_id, rows)));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1436,6 +1585,67 @@ mod tests {
         );
     }
 
+    /// The read-back must name the constraint and the field that differs: a
+    /// restore that dropped `NOT VALID` differs in one boolean, and "the
+    /// catalogs differ" would not be actionable.
+    #[test]
+    fn constraint_state_mismatch_is_reported_by_name() {
+        let expected = crate::model::test_fixture();
+        let mut actual = expected.clone();
+        let constraint = actual.databases[0].schemas[0].tables[0]
+            .constraints
+            .first_mut()
+            .expect("the fixture table has a constraint");
+        let name = constraint.name.clone();
+        constraint.validated = false;
+
+        let differences = catalog_differences(&expected, &actual);
+        assert!(
+            differences.iter().any(|d| d.contains(&name)
+                && d.contains("validated")
+                && d.contains("source=true")
+                && d.contains("destination=false")),
+            "{differences:?}"
+        );
+
+        // The same for deferrability.
+        let mut actual = expected.clone();
+        actual.databases[0].schemas[0].tables[0].constraints[0].initially_deferred = true;
+        let differences = catalog_differences(&expected, &actual);
+        assert!(
+            differences
+                .iter()
+                .any(|d| d.contains(&name) && d.contains("initially_deferred")),
+            "{differences:?}"
+        );
+    }
+
+    /// A byte-for-byte commitment is computed over the rows that arrived: rows
+    /// that never left the source, or that the destination `COPY` dropped, are
+    /// invisible to it. The count is the other half of the proof.
+    #[test]
+    fn expected_rows_mismatch_is_an_integrity_error() {
+        let err = check_expected_rows("app.accounts", Some(1_000), 999)
+            .expect_err("a short restore is an integrity failure");
+        assert!(
+            matches!(&err, BackupError::Integrity(m)
+                if m == "app.accounts: source counted 1000 rows, destination COPY wrote 999"),
+            "unexpected error: {err}"
+        );
+        // Too many rows is just as wrong: it means the item was applied twice.
+        assert!(check_expected_rows("app.accounts", Some(1_000), 1_001).is_err());
+        check_expected_rows("app.accounts", Some(1_000), 1_000).expect("an exact match passes");
+        check_expected_rows("app.empty", Some(0), 0).expect("an empty table passes");
+    }
+
+    /// A plan written before the count existed carries none. That is an
+    /// unverified restore, not a failed one — the caller warns once per run.
+    #[test]
+    fn missing_expected_rows_skips_the_check() {
+        check_expected_rows("app.accounts", None, 0).expect("no count, no check");
+        check_expected_rows("app.accounts", None, 12_345).expect("no count, no check");
+    }
+
     /// `CREATE EXTENSION … VERSION '1.0'` on a destination that only ships 1.1
     /// is an error, and it happens after roles and databases already exist. The
     /// preflight decides it instead, and names what the destination does have.
@@ -1524,7 +1734,7 @@ mod tests {
             reconcile_extension_versions(&expected, &mut actual, ExtensionVersionPolicy::Default);
         assert_eq!(
             deviations,
-            vec!["deviation: extension pgcrypto restored at version 1.4 (source 1.3)".to_string()]
+            vec!["extension pgcrypto restored at version 1.4 (source 1.3)".to_string()]
         );
         assert_eq!(actual, expected, "only the version is reconciled");
     }
@@ -1539,6 +1749,7 @@ mod tests {
             columns: vec!["id".into(), "email".into()],
             only: false,
             condition: None,
+            expected_rows: None,
         };
         assert_eq!(
             copy_in_sql(&m),
@@ -1567,6 +1778,7 @@ mod tests {
             columns: vec![],
             only: false,
             condition: Some("WHERE k >= 1000".into()),
+            expected_rows: None,
         };
         assert_eq!(
             pre_copy_sql(&m).as_deref(),
@@ -1597,6 +1809,7 @@ mod tests {
             columns: vec![],
             only: false,
             condition: None,
+            expected_rows: None,
         };
         assert_eq!(
             pre_copy_sql(&m).as_deref(),

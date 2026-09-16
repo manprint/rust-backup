@@ -115,8 +115,12 @@ Per il modulo `s3`, quando `--access-key`/`--secret-key` non sono impostate,
 valgono le variabili standard della catena AWS (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`, ruolo dell'istanza).
 
-`RUST_BACKUP_S3_TEST_FAIL_AFTER_PART` è un aggancio di test usato dagli script
-e2e: non fa parte della superficie di configurazione supportata.
+`RUST_BACKUP_S3_TEST_FAIL_AFTER_PART` e
+`RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA` sono agganci di test usati dagli
+script e2e: non fanno parte della superficie di configurazione supportata. Il
+secondo altera di proposito, sulla sola sorgente, il numero di righe scritto nel
+piano, così l'e2e può dimostrare che la destinazione rifiuta davvero un
+ripristino incompleto.
 
 ## Usarle bene
 

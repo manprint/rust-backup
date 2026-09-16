@@ -27,6 +27,7 @@ use tokio_postgres::Client;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
 
+use crate::ddl::quote_qualified;
 use crate::model::*;
 use crate::{PgConnection, PostgresParams};
 
@@ -286,6 +287,7 @@ async fn gather_extension_configs(client: &Client) -> Result<Vec<PgExtensionConf
     Ok(rows
         .iter()
         .map(|r| PgExtensionConfig {
+            expected_rows: None,
             extension: r.get(0),
             schema: r.get(1),
             table: r.get(2),
@@ -410,6 +412,7 @@ async fn gather_tables(client: &Client) -> Result<Vec<(i64, String, PgTable)>> {
                 bound: partition_bound.unwrap_or_default(),
             });
             let table = PgTable {
+                expected_rows: None,
                 schema: schema.clone(),
                 name: r.get(2),
                 owner: r.get(3),
@@ -494,7 +497,8 @@ const CONSTRAINTS_QUERY: &str = "SELECT con.conrelid::int8, con.conname::text, c
                   FROM pg_catalog.pg_class fc \
                   JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
                   WHERE fc.oid = con.confrelid) END, \
-            pg_catalog.obj_description(con.oid, 'pg_constraint')::text \
+            pg_catalog.obj_description(con.oid, 'pg_constraint')::text, \
+            con.convalidated, con.condeferrable, con.condeferred \
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -518,6 +522,9 @@ async fn gather_constraints(client: &Client) -> Result<HashMap<i64, Vec<PgConstr
             definition: r.get(3),
             references: r.get(4),
             comment: r.get(5),
+            validated: r.get(6),
+            deferrable: r.get(7),
+            initially_deferred: r.get(8),
         });
     }
     Ok(map)
@@ -693,6 +700,7 @@ async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
         .map(|r| {
             let schema: String = r.get(0);
             let view = PgView {
+                expected_rows: None,
                 schema: schema.clone(),
                 name: r.get(1),
                 owner: r.get(2),
@@ -1089,6 +1097,104 @@ fn report_unsupported(found: Vec<UnsupportedClass>, allowed: bool) -> Result<()>
     ))
 }
 
+// --- row counts --------------------------------------------------------------
+
+/// Test-only hook: shifts every counted value so the e2e can prove the
+/// destination really fails on a mismatch. Read once, on the source only.
+fn expected_rows_delta() -> i64 {
+    std::env::var("RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// The `count(*)` statement for one item's scope. `only` is the inheritance
+/// parent rule the item's `COPY` uses; `condition` is an extension
+/// configuration table's registered `WHERE …`.
+pub(crate) fn count_sql(schema: &str, table: &str, only: bool, condition: Option<&str>) -> String {
+    let qual = quote_qualified(schema, table);
+    let scope = if only { format!("ONLY {qual}") } else { qual };
+    match condition {
+        Some(condition) => format!("SELECT count(*)::int8 FROM {scope} {condition}"),
+        None => format!("SELECT count(*)::int8 FROM {scope}"),
+    }
+}
+
+/// Exact row counts for everything the destination must reproduce: one per
+/// streamed item and one per populated materialized view.
+///
+/// A byte-for-byte commitment proves that what arrived is what was sent; it
+/// cannot prove that nothing was left behind. The count is the other half, and
+/// it is taken on the source's read-only connection during `analyze`, in
+/// exactly the scope the item streams.
+pub async fn gather_row_counts(params: &PostgresParams, payload: &mut PgPlanPayload) -> Result<()> {
+    let delta = expected_rows_delta();
+    let shift = |value: i64| Some(value.saturating_add(delta).max(0));
+
+    for db in &mut payload.databases {
+        let parents: HashSet<String> = db
+            .schemas
+            .iter()
+            .flat_map(|s| s.tables.iter())
+            .flat_map(|t| t.inherits.iter().cloned())
+            .collect();
+        let conn = PgConnection::connect_read_only(params, &db.name).await?;
+
+        for schema in &mut db.schemas {
+            for table in &mut schema.tables {
+                // A partition's rows ride its parent's item, so it has no item
+                // and nothing to compare a count with.
+                if table.partition_of.is_some() {
+                    continue;
+                }
+                let qual = format!("{}.{}", table.schema, table.name);
+                let only = table.kind != "p" && parents.contains(&qual);
+                let sql = count_sql(&table.schema, &table.name, only, None);
+                let row =
+                    conn.client.query_one(&sql, &[]).await.map_err(|e| {
+                        analyze_err(&format!("count rows of {qual} in {}", db.name), e)
+                    })?;
+                table.expected_rows = shift(row.get::<_, i64>(0));
+            }
+            for view in &mut schema.views {
+                // Only a populated materialized view holds rows, and they are
+                // produced by `REFRESH` on the destination rather than streamed.
+                if !view.materialized || !view.populated {
+                    continue;
+                }
+                let sql = count_sql(&view.schema, &view.name, false, None);
+                let row = conn.client.query_one(&sql, &[]).await.map_err(|e| {
+                    analyze_err(
+                        &format!("count rows of {}.{} in {}", view.schema, view.name, db.name),
+                        e,
+                    )
+                })?;
+                view.expected_rows = shift(row.get::<_, i64>(0));
+            }
+        }
+
+        for config in &mut db.extension_configs {
+            let sql = count_sql(
+                &config.schema,
+                &config.table,
+                false,
+                config.condition.as_deref(),
+            );
+            let row = conn.client.query_one(&sql, &[]).await.map_err(|e| {
+                analyze_err(
+                    &format!(
+                        "count configuration rows of {}.{} in {}",
+                        config.schema, config.table, db.name
+                    ),
+                    e,
+                )
+            })?;
+            config.expected_rows = shift(row.get::<_, i64>(0));
+        }
+    }
+    Ok(())
+}
+
 // --- plan assembly (pure) ----------------------------------------------------
 
 /// Build a self-contained [`BackupPlan`] from the payload. One data-stream item
@@ -1149,6 +1255,7 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                         "table": table.name,
                         "columns": cols,
                         "only": table.kind != "p" && inheritance_parents.contains(qual.as_str()),
+                        "expected_rows": table.expected_rows,
                     }),
                 });
             }
@@ -1174,6 +1281,7 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                     "condition": config.condition,
                     "columns": Vec::<String>::new(),
                     "only": false,
+                    "expected_rows": config.expected_rows,
                 }),
             });
         }
@@ -1345,6 +1453,30 @@ mod tests {
         assert_eq!(back, payload);
     }
 
+    /// The count must be taken in exactly the scope the item streams, or the
+    /// comparison it feeds is meaningless: `ONLY` for an inheritance parent
+    /// (whose children are their own items) and the registered condition for an
+    /// extension configuration table.
+    #[test]
+    fn count_sql_uses_only_and_condition() {
+        assert_eq!(
+            count_sql("app", "accounts", false, None),
+            "SELECT count(*)::int8 FROM \"app\".\"accounts\""
+        );
+        assert_eq!(
+            count_sql("app", "log", true, None),
+            "SELECT count(*)::int8 FROM ONLY \"app\".\"log\""
+        );
+        assert_eq!(
+            count_sql("public", "rbtest_cfg", false, Some("WHERE k >= 1000")),
+            "SELECT count(*)::int8 FROM \"public\".\"rbtest_cfg\" WHERE k >= 1000"
+        );
+        assert_eq!(
+            count_sql("public", "spatial_ref_sys", false, None),
+            "SELECT count(*)::int8 FROM \"public\".\"spatial_ref_sys\""
+        );
+    }
+
     /// An extension configuration table is a data item of its own: the relation
     /// is recreated by `CREATE EXTENSION`, its matching rows are user data.
     /// An object an extension owns is recreated verbatim by `CREATE EXTENSION`
@@ -1385,6 +1517,7 @@ mod tests {
     fn build_plan_emits_an_extension_config_item() {
         let mut payload = crate::model::test_fixture();
         payload.databases[0].extension_configs = vec![PgExtensionConfig {
+            expected_rows: None,
             extension: "rbtest".to_string(),
             schema: "public".to_string(),
             table: "rbtest_cfg".to_string(),

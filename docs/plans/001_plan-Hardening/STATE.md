@@ -2,7 +2,7 @@
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan
 > file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-16 | **By:** `agent:opus` | **Session:** 2026-09-16
+> **Last updated:** 2026-09-16 | **By:** `agent:opus` | **Session:** None-09-16
 
 ## 0. Protocol
 
@@ -43,13 +43,13 @@ that state as `wip(<id>): <what remains>`.
 ## 1. Current unit
 
 - **Type:** `sub-phase`
-- **ID:** 2.1
+- **ID:** 3.1
 - **Status:** `none`
-- **Intent:** the destination proves it restored every row the source streamed
-- **Phase:** phase_03.md (phase 2)
-- **Next action:** open § 2.1 in phase_03.md: expected_rows on table and extension_config items, check_expected_rows, RESTORE VERIFIED rows line
+- **Intent:** formal review checklist and runtime-model documentation for the postgres module
+- **Phase:** phase_04.md — Phase 3
+- **Next action:** open 3.1 per phase_04.md: review checklist, docs/modules/POSTGRES.md runtime model
 - **Assigned:** `agent:opus`
-- **Repo state:** branch `dev` | working tree: phase 1 committed | last commit: see §4
+- **Repo state:** phase 2 committed on dev
 
 ## 2. Feature context (self-contained recap)
 
@@ -130,6 +130,10 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | 11 | sub-phase | 1.6 | `agent:opus` | PostGIS matrix green on every major and on the cross pair 12:16; extension-owned objects no longer refuse a cluster | introspect.rs, postgres_matrix.sh, lib.sh, POSTGRES_MATRIX.md, e2e/README.md | gates.sh PASS; postgis 10-18 => 901 pass, 0 fail; postgis 16 => 115 pass, 0 fail; postgis 12:16 => 114 pass, 0 fail | `9b570b9` |
 | 12 | sub-phase | 1.7 | `agent:opus` | CI: PostGIS jobs added, PostgreSQL e2e timeouts raised to 80 minutes | .github/workflows/e2e.yml, docs/QA_GUIDE.md | actionlint 1.7.12 clean; gates.sh PASS | `9b570b9` |
 | 13 | sub-phase | 1.8 | `agent:opus` | README documents extension configuration tables, the extension-version policy and the PostGIS e2e invocation | README.md | gates.sh PASS; help_parity PASS | `9b570b9` |
+| 14 | sub-phase | 2.1 | `agent:opus` | source counts rows per item and per populated matview; the destination refuses a restore whose COPY or REFRESH produced a different number | model.rs, introspect.rs, source.rs, dest.rs, lib.rs, verification.rs, postgres_matrix.sh, fault_matrix.sh, POSTGRES.md, 03-postgres.md, 10-variabili-ambiente.md, 11-codici-uscita.md | gates.sh PASS; postgres_matrix.sh 16 => 111 pass, 0 fail (ROWS-VERIFIED green); fault_matrix.sh postgres => CASES=4 PASS=11 FAIL=0 | uncommitted |
+| 15 | sub-phase | 2.2 | `agent:opus` | constraint validity, deferrability and comment captured, emitted verbatim and compared; a state/definition disagreement is refused | model.rs, introspect.rs, ddl.rs, dest.rs, verification.rs, postgres_matrix.sh, POSTGRES.md | gates.sh PASS; postgres_matrix.sh 16 12 => 224 pass, 0 fail (CONSTR-STATE, CONSTR-NOT-VALID-ROW green) | uncommitted |
+| 16 | sub-phase | 2.3 | `agent:opus` | the destination prints what it proved under RESTORE VERIFIED: rows verified, constraints, one line per declared deviation; same facts as structured fields | verification.rs, session.rs, lib.rs, dest.rs, postgres_matrix.sh, 03-postgres.md, 11-codici-uscita.md, POSTGRES.md | gates.sh PASS; postgres_matrix.sh 16 => 115 pass, 0 fail (ROWS-LINE, CONSTR-LINE, EXT-08 green); relay_smoke PASS=5 FAIL=0; session_two_targets PASS | uncommitted |
+| 17 | sub-phase | 2.4 | `agent:opus` | README documents the verification lines and the row-count refusal; CONSTR-STATE stops comparing partition FK clone names across majors | README.md, postgres_matrix.sh | gates.sh PASS; full_matrix.sh (RUST_BACKUP_FULL_DB_MATRIX=1) 12 pass 1 fail => after the fix postgres_matrix.sh 16:18 12:16 => 228/0 and 10:18 14:17 => 217/0 | uncommitted |
 
 ## 5. Files touched
 
@@ -186,6 +190,32 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | `.github/workflows/e2e.yml` | postgres/postgres-cross-version timeout 80; new postgres-postgis and postgres-postgis-cross-version jobs | 1.7 |
 | `docs/QA_GUIDE.md` | PostGIS invocation and the two new CI jobs | 1.7 |
 | `README.md` | PostgreSQL backup section: config tables, the refusal message, --extension-version default example and the deviation line; PostGIS e2e command | 1.8 |
+| `crates/rb-postgres/src/model.rs` | expected_rows on PgTable, PgView and PgExtensionConfig (serde-defaulted) | 2.1 |
+| `crates/rb-postgres/src/introspect.rs` | count_sql + gather_row_counts (test hook RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA); counts carried in the item meta | 2.1 |
+| `crates/rb-postgres/src/source.rs` | ItemMeta.expected_rows | 2.1 |
+| `crates/rb-postgres/src/dest.rs` | check_expected_rows on every closed COPY, check_matview_rows after post-data, RestoredRows, normalization | 2.1 |
+| `crates/rb-postgres/src/lib.rs` | analyze counts rows; the destination carries the totals from stream_in into the report | 2.1 |
+| `crates/rb-core/src/verification.rs` | VerificationReport.table_rows_verified / derived_rows_verified + with_rows/rows_total | 2.1 |
+| `e2e/postgres_matrix.sh` | ROWS-VERIFIED row (no row-count warning in the destination log) | 2.1 |
+| `e2e/fault_matrix.sh` | pg-row-count-mismatch case (T-PG-ROWS-NEG) | 2.1 |
+| `docs/modules/POSTGRES.md, docs/usage/03-postgres.md, 10-variabili-ambiente.md, 11-codici-uscita.md` | row-count verification, the test hook and the integrity exit code | 2.1 |
+| `crates/rb-postgres/src/model.rs` | PgConstraint.validated / deferrable / initially_deferred (serde-defaulted) | 2.2 |
+| `crates/rb-postgres/src/introspect.rs` | CONSTRAINTS_QUERY reads convalidated, condeferrable, condeferred | 2.2 |
+| `crates/rb-postgres/src/ddl.rs` | add_constraint returns Result and refuses a state/definition disagreement | 2.2 |
+| `crates/rb-postgres/src/dest.rs` | verify_catalog returns CatalogProof with the constraint counters | 2.2 |
+| `crates/rb-core/src/verification.rs` | VerificationReport.constraints_verified / constraints_not_valid + with_constraints | 2.2 |
+| `e2e/postgres_matrix.sh` | CONSTR-STATE and CONSTR-NOT-VALID-ROW rows | 2.2 |
+| `docs/modules/POSTGRES.md` | constraint state among the compared facts | 2.2 |
+| `crates/rb-core/src/verification.rs` | VerificationReport.deviations + with_deviations + extra_lines() | 2.3 |
+| `crates/rb-core/src/session.rs` | log_verification_extras() after both RESTORE VERIFIED records | 2.3 |
+| `crates/rb-postgres/src/lib.rs` | verify() attaches the deviations and logs the facts as fields | 2.3 |
+| `crates/rb-postgres/src/dest.rs` | reconcile_extension_versions stores the note without the `deviation: ` prefix | 2.3 |
+| `e2e/postgres_matrix.sh` | ROWS-LINE and CONSTR-LINE rows | 2.3 |
+| `docs/usage/03-postgres.md` | new section "Cosa stampa la verifica" with a real block | 2.3 |
+| `docs/usage/11-codici-uscita.md` | the extra lines named in the success section | 2.3 |
+| `docs/modules/POSTGRES.md` | the printed lines documented under the read-back proof | 2.3 |
+| `README.md` | the verification block gained the rows/constraints lines and the row-count mismatch remedy | 2.4 |
+| `e2e/postgres_matrix.sh` | CONSTR-STATE excludes partition FK clones (cross-major naming) | 2.4 |
 
 ## 6. In-flight work
 none — tree consistent
@@ -212,6 +242,15 @@ none — tree consistent
 | § 1.7 actionlint | docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 | PASS — no findings | 2026-09-16 |
 | phase 1 closing matrix | `bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18 10:18 12:16 14:17 16:18` | PASS — 1396 pass, 0 fail, 149 skip | 2026-09-16 |
 | phase 1 closing matrix (PostGIS) | RB_PG_IMAGE_REPO=postgis/postgis bash e2e/postgres_matrix.sh 10..18 + 12:16 | PASS — 901 pass, 0 fail (majors) plus 115/0 on 16 and 114/0 on 12:16 | 2026-09-16 |
+| § 2.1 rows | `bash e2e/postgres_matrix.sh 16` + `bash e2e/fault_matrix.sh postgres` | PASS — 111 pass/0 fail with ROWS-VERIFIED; fault group CASES=4 PASS=11 FAIL=0 including pg-row-count-mismatch (exit 5, database removed) | 2026-09-16 |
+| § 2.2 gates | `bash scripts/gates.sh` | PASS (96 rb-postgres unit tests) | 2026-09-16 |
+| § 2.2 matrix | `bash e2e/postgres_matrix.sh 16 12` then `10 18` | PASS — 224 pass, 0 fail (16+12) and 217 pass, 0 fail (10+18); CONSTR-STATE and CONSTR-NOT-VALID-ROW green on every major | 2026-09-16 |
+| § 2.3 gates | `bash scripts/gates.sh` | PASS (99 rb-postgres + 17 rb-core unit tests) | 2026-09-16 |
+| § 2.3 matrix | `bash e2e/postgres_matrix.sh 16` | PASS — 115 pass, 0 fail, 9 skip (ROWS-LINE, CONSTR-LINE, M-PG-EXT-08 green) | 2026-09-16 |
+| § 2.3 block compatibility | `bash e2e/relay_smoke.sh` + `bash e2e/session_two_targets.sh` | PASS — T-E2E0 PASS=5 FAIL=0; T-SESSION-2 passed | 2026-09-16 |
+| § 2.4 full matrix | RUST_BACKUP_FULL_DB_MATRIX=1 `bash e2e/full_matrix.sh` | 12 passed, 1 failed — the single failure was CONSTR-STATE on 16:18 (partition FK clone naming); after the fix `postgres_matrix.sh 16:18 12:16` => 228 pass, 0 fail | 2026-09-16 |
+| § 2.4 cross pairs | bash e2e/postgres_matrix.sh 10:18 14:17 | PASS — 217 pass, 0 fail (the other two pairs after the CONSTR-STATE clone fix) | 2026-09-16 |
+| § 2.4 gates | bash scripts/gates.sh | PASS | 2026-09-16 |
 
 **Failing output (verbatim, trimmed to the error):**
 ```
@@ -247,6 +286,15 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 | 19 | § 1.6 touches postgres_matrix.sh and the fixtures | also hardened e2e/lib.sh and run_transfer | a multi-line statement is logged as a prefixed line plus unprefixed continuations, so the PostGIS spatial_ref_sys COPY looked like a write; and a destination that dies before the handshake left run_transfer waiting on the source forever | harness-only; both are prerequisites for the phase 4 least-privilege log assertions |
 | 20 | README anchors: Modules -> PostgreSQL, the environment-variable table at README.md:136, Limitations | everything went into the PostgreSQL backup section | the README has no Limitations section and its only variable table describes compose.yml, not module flags; the module section already states that every flag has a RUST_BACKUP_ equivalent and links the variables page | none — 6.1-6.4 audit the README against the same rule |
 | 21 | the oracle compares every constraint | constraints cloned into a partition (conparentid <> 0) are excluded, and OVERWRITE compares through normalize_counts | the server names a partitioned FK's clones itself and changed the algorithm in 17 (c_con_07_1 vs t_con_07_child_ref_ref_ts_fkey), so a faithful 16:18 restore failed ORACLE-DATA, M-PG-CON-07 and OVERWRITE; OVERWRITE additionally compared raw oracle output across majors | harness-only; the parent constraint is still compared in full |
+| 22 | count rows inside analyze() for every table data item, and extension_config items with FROM ONLY | a separate gather_row_counts pass after introspection; configuration tables are counted without ONLY | introspect_cluster also runs on both fingerprint audits and on the destination read-back, none of which needs a second full scan; and the config item streams without ONLY, so counting with it would compare two different scopes | none — the counts land in the same meta key the plan specifies |
+| 23 | add totals tables_rows_verified, matviews_rows_verified, rows_total to the report | table_rows_verified and derived_rows_verified, with rows_total() derived | the two numbers have different provenance (streamed vs produced by REFRESH) and every other module can leave them at zero; a stored total would be a third field that can disagree with the two | 2.3 prints rows_total() and the two components |
+| 24 | report counters constraints_total, constraints_validated, constraints_not_valid | constraints_verified and constraints_not_valid; validated = verified - not_valid | a stored third counter can disagree with the other two; the destination counts what it re-introspected, and 'verified' is what every other counter in VerificationReport is named | 2.3 prints 'constraints: <verified> (validated <verified-not_valid>, not valid <not_valid>)' |
+| 25 | positive control: a scratch database where the fixture runs ALTER TABLE ... VALIDATE CONSTRAINT | no scratch database; the CON fixtures already mix validated and NOT VALID constraints and CONSTR-STATE compares convalidated/condeferrable/condeferred per name on both sides | the mixed fixture is the stronger control — it proves validated=true is carried AND validated=false is not silently validated, in the same run, on every major | none — T-PG-CONSTR asserts both polarities; CONSTR-NOT-VALID-ROW additionally proves the violating row survived |
+| 26 | the line reads `rows verified: <t> tables, <m> materialized views, <n> rows` | rows verified: <t> from tables, <m> from materialized views, <n> rows | the two numbers are rows by origin, not object counts; the plan wording reads as "3 tables" and would misreport 103590 tables | none — README (2.4) and the e2e assertion use the shipped wording |
+| 27 | append every `deviation: ...` note from § 1.5 to the block | VerificationReport gained a serde-defaulted `deviations: Vec<String>`; the note is stored bare and the printer adds the `deviation: ` prefix, while `detail` keeps carrying the notes | the note was already prefixed inside `detail` (deviation 15), so printing it through a prefixing line produced `deviation: deviation: ...`; detail keeps them because the source peer reads the report, not the destination lines | none — the e2e grep on the full note text still matches; additive serde field, older peers deserialize |
+| 28 | verification_block_existing_lines_unchanged does a golden string comparison of the pre-existing lines | it asserts the four pre-existing report fields (items, bytes, blake3, detail) verbatim and that extra_lines() is empty for a module that counts none of the new facts | the headline record is a tracing event with structured fields; capturing it would mean adding tracing-subscriber as a dev-dependency of rb-core to prove a call site the change never edited | none — relay_smoke and session_two_targets prove the block format live |
+| 29 | README "Troubleshooting" gains the row-count message | the message went into the "PostgreSQL backup" section, next to the extension-version refusal it sits beside operationally | the README has no Troubleshooting section (same finding as deviation 20 for "Limitations"); inventing one for a single message would fragment the module section | none — 6.1-6.4 audit the README against the sections it actually has |
+| 30 | § 2.2 CONSTR-STATE compares every c_con_% constraint on both sides | it excludes partition FK clones (conparentid <> 0), like the § 1.3 oracle already did | PostgreSQL >= 17 names a partitioned FK clone <parent>_<n> (c_con_07_1), which matches the fixture prefix, while <= 16 names it after the table; the 16:18 pair failed on names the server chose, not on state | none — the parent constraint is still compared in full; found by the phase 2 regression run, fixed in § 2.4 |
 
 ## 9. Blockers and open questions
 
@@ -295,7 +343,7 @@ disagree with §1 and §4.
 |-------|------|--------|-------|
 | 0 — Harness foundation | phase_01.md | `DONE` | 0.1-0.5 closed; harness additive, nothing wired into gates.sh yet |
 | 1 — PostgreSQL fidelity matrix | phase_02.md | `DONE` | 1.1-1.8 closed; plain matrix 1396 pass / 0 fail and PostGIS 901 pass / 0 fail |
-| 2 — Restore validation | phase_03.md | `TODO` | 2.1-2.4 |
+| 2 — Restore validation | phase_03.md | `DONE` | 2.1-2.4 closed; matrix 0 fail on 10,12,14,16,18 and every cross pair; full_matrix green after the CONSTR-STATE clone fix |
 | 3 — PostgreSQL latent defects | phase_04.md | `TODO` | 3.1-3.6 |
 | 4 — Source immutability guardrails | phase_05.md | `TODO` | 4.1-4.9 |
 | 5 — Filesystem deep verification | phase_06.md | `TODO` | 5.1-5.6 |
@@ -316,9 +364,9 @@ A `SKIPPED` sub-phase or phase keeps its row and carries the reason.
 | T-PG-EXTCFG | e2e | `PASS` | `rbtest_cfg` k=1000 (M-PG-EXT-07) and `spatial_ref_sys` 990001 (M-PG-GIS-04) both round-trip (§ 1.4, 1.6) |
 | T-PG-EXTVER | e2e | `PASS` | M-PG-EXT-08 green on 16: 1.0 refused at preflight with no database created, `--extension-version default` restores and prints the deviation line (§ 1.5) |
 | T-PG-GIS | e2e | `PASS` | PostGIS matrix `0 fail` on 10-18 (901 pass) and on `12:16` (114 pass, GIS-06 green) (§ 1.6) |
-| T-PG-ROWS | e2e | `TODO` | destination prints `rows verified:` and `constraints:`; no `skipped` warning (§ 2.1, 2.3) |
-| T-PG-ROWS-NEG | e2e | `TODO` | `RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA=1` => Integrity exit code, database removed (§ 2.1) |
-| T-PG-CONSTR | e2e | `TODO` | `convalidated`/deferrable state identical; NOT VALID FK stays NOT VALID with violating row (§ 2.2) |
+| T-PG-ROWS | e2e | `PASS` | no `row-count verification skipped` warning and the destination prints `rows verified:` / `constraints:` (§ 2.1, 2.3) |
+| T-PG-ROWS-NEG | e2e | `PASS` | `fault_matrix.sh postgres` case `pg-row-count-mismatch`: exit 5, `source counted` in the destination log, database removed (§ 2.1) |
+| T-PG-CONSTR | e2e | `PASS` | `convalidated`/deferrable state identical; NOT VALID FK stays NOT VALID with violating row (§ 2.2) |
 | T-PG-CONN | e2e | `TODO` | `<= 3` source connections per single-database run (§ 3.2) |
 | T-PG-TIMEOUT | e2e | `TODO` | exclusively locked table => phase-tagged `lock timeout` failure within 90 s (§ 3.2) |
 | T-PG-FP2 | e2e | `TODO` | zero `temporary file` lines on the source during the matrix run (§ 3.3) |
@@ -348,17 +396,17 @@ other docs get their own rows.
 |-----|-------|--------|-------|
 | README.md | 0 | `DONE (no user-visible change)` | no user-visible change — verify accuracy (§ 0.5) |
 | README.md | 1 | `DONE` | extension configuration tables, the version refusal message, `--extension-version default` example and the reported deviation, PostGIS e2e command (§ 1.8) |
-| README.md | 2 | `TODO` | verification block, troubleshooting row-count message (§ 2.4) |
+| README.md | 2 | `DONE` | the `rows verified:` / `constraints:` lines with their meaning, and the row-count refusal with its remedy (§ 2.4) |
 | README.md | 3 | `TODO` | lock timeout, connections, fingerprint cost (§ 3.6) |
 | README.md | 4 | `TODO` | source safety section, least-privilege recipes, `--allow-atime-updates` (§ 4.9) |
 | README.md | 5 | `TODO` | filesystem entries preserved/refused, capabilities, troubleshooting (§ 5.6) |
 | README.md | 6 | `TODO` | final full read (§ 6.5) |
 | docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6/5.2; reconciled § 6.3 |
-| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects and "Extension versions" written (§ 1.3-1.5); verification, runtime model and Limits still owed by phases 2, 3 and 6 |
+| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", row counts, constraint state and the printed proof written (§ 1.3-1.5, 2.1-2.3); runtime model and Limits still owed by phases 3 and 6 |
 | docs/modules/FILESYSTEM.md | 4, 5, 6 | `TODO` | atime rule, special files, TOCTOU guarantee, fingerprint cost |
 | docs/modules/MONGODB.md, S3.md | 4, 6 | `TODO` | Immutability paragraphs |
 | docs/IMMUTABILITY.md | 4, 6 | `TODO` | created § 4.1; evidence markers removed § 4.7; reconciled § 6.3 |
-| docs/usage/03-postgres.md, 05-filesystem.md, 07-sessioni-yaml.md, 10-variabili-ambiente.md, 11-codici-uscita.md | 1, 2, 4, 5, 6 | `IN_PROGRESS` | `--extension-version` flag/env/YAML rows and the configuration-table paragraph landed (§ 1.4-1.5); verification, test hook and exit codes still owed; full audit § 6.2 |
+| docs/usage/03-postgres.md, 05-filesystem.md, 07-sessioni-yaml.md, 10-variabili-ambiente.md, 11-codici-uscita.md | 1, 2, 4, 5, 6 | `IN_PROGRESS` | `--extension-version` rows, the configuration-table paragraph, "Cosa stampa la verifica" and the exit-code note landed (§ 1.4-1.5, 2.1-2.3); test hook and filesystem rows still owed; full audit § 6.2 |
 | docs/QA_GUIDE.md, e2e/README.md, e2e/fixtures/postgres/README.md | 0, 1, 3, 5, 6 | `IN_PROGRESS` | § 0.1 matrix links; § 0.2 helper table + fixture naming rule; scripts/jobs/gates still to reconcile in § 6 |
 | CLAUDE.md | 4, 6 | `TODO` | gate line gains the two new scripts |
 

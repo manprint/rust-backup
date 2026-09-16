@@ -460,13 +460,27 @@ pub fn add_identity(t: &PgTable, c: &PgColumn, seq: Option<&PgSequence>) -> Opti
 }
 
 /// `ALTER TABLE … ADD CONSTRAINT … <def>;` (def from `pg_get_constraintdef`).
-pub fn add_constraint(t: &PgTable, c: &PgConstraint) -> String {
-    format!(
+pub fn add_constraint(t: &PgTable, c: &PgConstraint) -> Result<String> {
+    // `pg_get_constraintdef` already renders NOT VALID, DEFERRABLE and
+    // INITIALLY DEFERRED, so the definition is emitted verbatim — but only
+    // after the two descriptions of the same fact are checked against each
+    // other. A `validated: false` constraint whose text lost `NOT VALID` would
+    // be rebuilt as validated, and the destination would then reject rows the
+    // source legally holds (or, worse, accept the table and silently enforce
+    // more than the source did).
+    let says_not_valid = c.definition.to_ascii_uppercase().contains("NOT VALID");
+    if says_not_valid == c.validated {
+        return Err(BackupError::PlanRejected(format!(
+            "constraint {}: state and definition disagree (validated={}, definition={:?})",
+            c.name, c.validated, c.definition
+        )));
+    }
+    Ok(format!(
         "ALTER TABLE {} ADD CONSTRAINT {} {};",
         quote_qualified(&t.schema, &t.name),
         quote_ident(&c.name),
         c.definition
-    )
+    ))
 }
 
 /// `COMMENT ON CONSTRAINT … ON …;` when the constraint carries one. A comment
@@ -916,13 +930,13 @@ fn build_database_ddl(
     // already have the keys they reference.
     for t in &tables {
         for c in t.constraints.iter().filter(|c| c.kind != "f") {
-            post.push(add_constraint(t, c));
+            post.push(add_constraint(t, c)?);
             post.extend(comment_on_constraint(t, c));
         }
     }
     for t in &tables {
         for c in t.constraints.iter().filter(|c| c.kind == "f") {
-            post.push(add_constraint(t, c));
+            post.push(add_constraint(t, c)?);
             post.extend(comment_on_constraint(t, c));
         }
     }
@@ -1643,6 +1657,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: " SELECT day, count(*) FROM app.events GROUP BY day;".into(),
             materialized: true,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -1661,6 +1676,7 @@ mod tests {
         );
         let v = PgView {
             materialized: false,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             ..m
@@ -1776,6 +1792,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT 1;".into(),
             materialized: false,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -1858,6 +1875,9 @@ mod tests {
             ..Default::default()
         };
         let pk = PgConstraint {
+            validated: true,
+            deferrable: false,
+            initially_deferred: false,
             name: "accounts_pkey".into(),
             kind: "p".into(),
             definition: "PRIMARY KEY (id)".into(),
@@ -1865,7 +1885,7 @@ mod tests {
             comment: None,
         };
         assert_eq!(
-            add_constraint(&t, &pk),
+            add_constraint(&t, &pk).expect("a validated constraint"),
             "ALTER TABLE \"app\".\"accounts\" ADD CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id);"
         );
 
@@ -2086,6 +2106,9 @@ mod tests {
             comment: None,
         };
         let constraint = PgConstraint {
+            validated: true,
+            deferrable: false,
+            initially_deferred: false,
             name: "c_con_18".into(),
             kind: "u".into(),
             definition: "UNIQUE NULLS NOT DISTINCT (tag)".into(),
@@ -2108,7 +2131,9 @@ mod tests {
             name: "t_con_18".into(),
             ..Default::default()
         };
-        assert!(add_constraint(&table, &constraint_back).contains("UNIQUE NULLS NOT DISTINCT"));
+        assert!(add_constraint(&table, &constraint_back)
+            .expect("a validated constraint")
+            .contains("UNIQUE NULLS NOT DISTINCT"));
     }
 
     #[test]
@@ -2142,6 +2167,9 @@ mod tests {
             ..Default::default()
         };
         let commented = PgConstraint {
+            validated: true,
+            deferrable: false,
+            initially_deferred: false,
             name: "accounts_email_key".into(),
             kind: "u".into(),
             definition: "UNIQUE (email)".into(),
@@ -2168,6 +2196,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: " SELECT id FROM app.accounts WHERE id < 100;".into(),
             materialized: false,
+            expected_rows: None,
             options: vec![
                 "security_barrier=true".to_string(),
                 "check_option=cascaded".to_string(),
@@ -2186,6 +2215,7 @@ mod tests {
 
         let materialized = PgView {
             materialized: true,
+            expected_rows: None,
             options: vec!["fillfactor=70".to_string()],
             ..base.clone()
         };
@@ -2203,6 +2233,87 @@ mod tests {
         assert!(!create_view(&plain).contains("WITH ("));
     }
 
+    /// A `NOT VALID` foreign key is enforced for new rows only. The rows that
+    /// violate it are legal state on the source, so the destination must add the
+    /// constraint in the same state — validating it would reject them.
+    #[test]
+    fn not_valid_constraint_keeps_not_valid_in_model_and_ddl() {
+        let table = PgTable {
+            schema: "mx".into(),
+            name: "t_con_06_child".into(),
+            ..Default::default()
+        };
+        let constraint = PgConstraint {
+            name: "c_con_06".into(),
+            kind: "f".into(),
+            definition: "FOREIGN KEY (parent) REFERENCES mx.t_con_01(id) NOT VALID".into(),
+            references: Some("mx.t_con_01".into()),
+            comment: None,
+            validated: false,
+            deferrable: false,
+            initially_deferred: false,
+        };
+        let sql = add_constraint(&table, &constraint).expect("state matches the definition");
+        assert_eq!(
+            sql,
+            "ALTER TABLE \"mx\".\"t_con_06_child\" ADD CONSTRAINT \"c_con_06\" \
+             FOREIGN KEY (parent) REFERENCES mx.t_con_01(id) NOT VALID;"
+        );
+
+        // A deferred constraint is likewise emitted verbatim.
+        let deferred = PgConstraint {
+            name: "c_con_12".into(),
+            kind: "f".into(),
+            definition:
+                "FOREIGN KEY (parent) REFERENCES mx.t_con_01(id) DEFERRABLE INITIALLY DEFERRED"
+                    .into(),
+            validated: true,
+            deferrable: true,
+            initially_deferred: true,
+            ..constraint
+        };
+        assert!(add_constraint(&table, &deferred)
+            .expect("validated")
+            .contains("DEFERRABLE INITIALLY DEFERRED"));
+    }
+
+    /// The two descriptions of the same fact must agree. A `NOT VALID`
+    /// constraint whose text lost the clause would be rebuilt as validated, and
+    /// the restore would reject rows the source holds — silently, because the
+    /// catalog read-back compares the same wrong state on both sides.
+    #[test]
+    fn constraint_state_and_definition_disagreement_is_rejected() {
+        let table = PgTable {
+            schema: "mx".into(),
+            name: "t_con_06_child".into(),
+            ..Default::default()
+        };
+        let broken = PgConstraint {
+            name: "c_con_06".into(),
+            kind: "f".into(),
+            definition: "FOREIGN KEY (parent) REFERENCES mx.t_con_01(id)".into(),
+            references: None,
+            comment: None,
+            validated: false,
+            deferrable: false,
+            initially_deferred: false,
+        };
+        let err = add_constraint(&table, &broken).expect_err("the two disagree");
+        assert!(
+            matches!(&err, BackupError::PlanRejected(m) if m.starts_with("constraint c_con_06: state and definition disagree")),
+            "unexpected error: {err}"
+        );
+        // And the other direction: a validated constraint whose text says NOT VALID.
+        let broken = PgConstraint {
+            definition: "FOREIGN KEY (parent) REFERENCES mx.t_con_01(id) NOT VALID".into(),
+            validated: true,
+            ..broken
+        };
+        assert!(add_constraint(&table, &broken).is_err());
+    }
+
+    /// The plan calls this `unpopulated_matview_has_no_expected_rows_and_no_refresh`;
+    /// it is the same assertion, extended with the row count.
     #[test]
     fn unpopulated_matview_is_not_refreshed() {
         let populated = PgView {
@@ -2211,6 +2322,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: " SELECT count(*) FROM app.accounts;".into(),
             materialized: true,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -2230,6 +2342,9 @@ mod tests {
         };
         assert_eq!(refresh_view(&unpopulated), None);
         assert!(create_view(&unpopulated).ends_with("WITH NO DATA;"));
+        // And it carries no row count: there is nothing on the source to count,
+        // so the destination has nothing to compare and nothing to refresh.
+        assert_eq!(unpopulated.expected_rows, None);
     }
 
     #[test]
@@ -2240,6 +2355,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: " SELECT count(*) FROM app.accounts;".into(),
             materialized: true,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -2280,6 +2396,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT count(*) FROM app.accounts;".into(),
             materialized: true,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![PgIndex {
@@ -2336,6 +2453,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT count(*) FROM app.accounts".into(),
             materialized: true,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -2349,6 +2467,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT id FROM app.accounts".into(),
             materialized: false,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],
@@ -2385,6 +2504,9 @@ mod tests {
         let mut payload = crate::model::test_fixture();
         let schema = &mut payload.databases[0].schemas[0];
         schema.tables[0].constraints.push(PgConstraint {
+            validated: true,
+            deferrable: false,
+            initially_deferred: false,
             name: "accounts_pkey".into(),
             kind: "p".into(),
             definition: "PRIMARY KEY (id)".into(),
@@ -2397,6 +2519,7 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT a.id, a.email FROM app.accounts a GROUP BY a.id".into(),
             materialized: false,
+            expected_rows: None,
             options: Vec::new(),
             populated: true,
             indexes: vec![],

@@ -78,12 +78,46 @@ dall'estensione (`DELETE` con la sua condizione, `TRUNCATE` se non ne ha
 registrata una) e vi carica le righe della sorgente. Le righe inserite da
 `CREATE EXTENSION` vengono quindi sostituite, non sommate a quelle di origine.
 
+Durante l'analisi la sorgente conta le righe di ogni elemento del piano e di
+ogni vista materializzata popolata. La destinazione confronta quei numeri con
+quelli che ha davvero scritto (`COPY`) o prodotto (`REFRESH`): una differenza è
+un errore di integrità e il ripristino fallisce. I digest BLAKE3 dimostrano che
+i byte arrivati sono quelli inviati; il conteggio dimostra che non ne sono
+rimasti indietro.
+
 Le **password dei ruoli non vengono mai lette né ripristinate**: dopo il restore i
 ruoli esistono ma vanno riconfigurati con le credenziali.
 
 Il contratto completo, con il dettaglio di partizionamento, ereditarietà,
 `reg*`, ACL e determinismo della rilettura, è in
 [docs/modules/POSTGRES.md](../modules/POSTGRES.md).
+
+## Cosa stampa la verifica
+
+Alla fine la destinazione stampa la riga formale di verifica e, solo per
+PostgreSQL, le righe che dicono **che cosa** ha dimostrato:
+
+```text
+RESTORE VERIFIED: persisted destination matches source  items=51 bytes=212265935 blake3=0a91dd66…
+rows verified: 103590 from tables, 1137 from materialized views, 104727 rows
+constraints: 32 (validated 30, not valid 2)
+deviation: extension rbtest restored at version 1.1 (source 1.0)
+```
+
+- `rows verified:` — righe scritte con `COPY` (tabelle e tabelle di
+  configurazione delle estensioni), righe prodotte da `REFRESH MATERIALIZED
+  VIEW` e totale. Sono le stesse righe contate sulla sorgente durante l'analisi:
+  se non coincidono il ripristino fallisce con codice `5` invece di certificare
+  una copia parziale.
+- `constraints:` — vincoli riletti dal catalogo della destinazione e confrontati
+  con quelli della sorgente; `not valid` conta quelli `NOT VALID`, che restano
+  tali (una destinazione che li avesse validati avrebbe dovuto rifiutare righe
+  che la sorgente contiene legittimamente).
+- `deviation:` — compare solo quando qualcosa è stato ricostruito in modo
+  dichiaratamente non identico; oggi solo con `--extension-version default`.
+
+Le stesse informazioni escono anche come campi strutturati dell'evento
+`PostgreSQL destination read-back verified`, per chi raccoglie i log.
 
 ## Oggetti che fanno fallire l'analisi (di proposito)
 

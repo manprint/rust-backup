@@ -776,6 +776,60 @@ for CASE in "${CASES[@]}"; do
   else
     fail_row "IMMUT-READONLY-LOG" "the source issued a non-read statement"
   fi
+  # Constraint state: validity and deferrability are restored state, not
+  # cosmetics. A NOT VALID constraint that came back validated would have had to
+  # reject the very rows the source legally holds, and a restore that dropped
+  # DEFERRABLE changes when the destination enforces it.
+  # Clones (`conparentid <> 0`) are excluded: the server names a partitioned
+  # FK's clones itself and changed the algorithm in 17, so a faithful 16:18
+  # restore legitimately shows `c_con_07_1` where the source shows
+  # `t_con_07_child_ref_ref_ts_fkey`. The parent is still compared in full.
+  # `to_jsonb` reads the column by name because `conparentid` only exists from
+  # PostgreSQL 11.
+  constraint_state() { # container
+    docker exec "$1" psql -U postgres -d "$DATABASE" -At -F'|' -c \
+      "SELECT conname, convalidated, condeferrable, condeferred
+         FROM pg_constraint con WHERE conname LIKE 'c\\_con\\_%'
+           AND coalesce(to_jsonb(con) ->> 'conparentid', '0') = '0' ORDER BY 1"
+  }
+  if diff -u <(constraint_state "$SRC") <(constraint_state "$DST") >"$WORK/constraints.diff"; then
+    pass_row "CONSTR-STATE"
+  else
+    fail_row "CONSTR-STATE" "constraint state differs after the restore"
+    head -20 "$WORK/constraints.diff"
+  fi
+  # CON-06's whole point: the row that violates the NOT VALID foreign key is on
+  # the destination too, which is only possible if the constraint stayed NOT
+  # VALID there.
+  violating=$(docker exec "$DST" psql -U postgres -d "$DATABASE" -At -c \
+    "SELECT count(*) FROM mx.t_con_06_child c
+      WHERE NOT EXISTS (SELECT 1 FROM mx.t_con_01 p WHERE p.id = c.parent)")
+  if [[ "$violating" == "1" ]]; then
+    pass_row "CONSTR-NOT-VALID-ROW"
+  else
+    fail_row "CONSTR-NOT-VALID-ROW" "the destination holds $violating violating rows, expected 1"
+  fi
+
+  # The destination must have had a row count for every item it applied: a plan
+  # without them still restores, but the restore is not row-verified.
+  if grep -q 'row-count verification skipped' "$WORK/dst.log"; then
+    fail_row "ROWS-VERIFIED" "the plan carried no expected_rows"
+  else
+    pass_row "ROWS-VERIFIED"
+  fi
+
+  # § 2.3 — the operator must be able to read the proof, not only trust it.
+  if rb_strip_ansi <"$WORK/dst.log" | grep -qE 'rows verified: [0-9]+ from tables, [0-9]+ from materialized views, [0-9]+ rows'; then
+    pass_row "ROWS-LINE"
+  else
+    fail_row "ROWS-LINE" "the destination printed no 'rows verified:' line"
+  fi
+  if rb_strip_ansi <"$WORK/dst.log" | grep -qE 'constraints: [0-9]+ \(validated [0-9]+, not valid [0-9]+\)'; then
+    pass_row "CONSTR-LINE"
+  else
+    fail_row "CONSTR-LINE" "the destination printed no 'constraints:' line"
+  fi
+
   # I-NOTEMP: the source must not spill. Today's source sorts every COPY, which
   # spills on the TOAST-heavy row with the fixture's 4 MB work_mem; the
   # commutative fingerprint of phase 3 § 3.3 removes that sort. Until it lands

@@ -117,11 +117,16 @@ fn normalize(p: &mut PgPlanPayload) {
     for db in &mut p.databases {
         for config in &mut db.extension_configs {
             config.estimated_bytes = 0;
+            config.expected_rows = None;
         }
         for s in &mut db.schemas {
+            for v in &mut s.views {
+                v.expected_rows = None;
+            }
             for t in &mut s.tables {
                 t.estimated_rows = 0;
                 t.estimated_bytes = 0;
+                t.expected_rows = None;
             }
         }
     }

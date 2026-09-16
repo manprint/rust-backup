@@ -95,6 +95,21 @@ BACKUP VERIFIED: source unchanged; destination read-back matches
 RESTORE VERIFIED: persisted destination matches source
 ```
 
+For PostgreSQL the destination also prints, under that record, what it proved:
+
+```text
+rows verified: 103590 from tables, 1137 from materialized views, 104727 rows
+constraints: 32 (validated 30, not valid 2)
+```
+
+The first line counts the rows `COPY` wrote and the rows `REFRESH MATERIALIZED
+VIEW` produced; they are the numbers the source counted while analyzing, so a
+restore that loses rows fails instead of certifying itself. The second counts
+the constraints re-read from the destination catalog and compared with the
+source, `not valid` being those that legitimately stay `NOT VALID`. A
+`deviation: ...` line is added for anything deliberately restored differently,
+such as an extension installed at the destination's own version.
+
 Both messages include the same payload BLAKE3. Apply, catalog, data read-back,
 source audit, timeout, or acknowledgement failures produce a non-zero exit and
 never print verified completion. See each module document for the exact
@@ -337,11 +352,22 @@ RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
   --extension-version default
 ```
 
-The restore then reports what it substituted on its verified line —
+The restore then reports what it substituted under its verified record —
 `deviation: extension postgis restored at version 3.5.3 (source 3.4.4)` — so the
 difference is recorded rather than silent. The same choice is available as
 `RUST_BACKUP_EXTENSION_VERSION`, and its default, `source`, is the refusal
 above. An extension the destination does not have at all is always refused.
+
+A restore that ends with
+
+```text
+app.accounts: source counted 1000 rows, destination COPY wrote 999
+```
+
+wrote fewer rows than the source counted and refused to certify the result: it
+exits `5` and drops the databases it created, so nothing half-restored is left
+to be mistaken for a copy. Re-run it; if the message comes back, report it with
+both logs, which carry the expected and the written count.
 
 Use `-P sslrootcert=/run/secrets/postgres-ca.pem` for a private CA. See
 [PostgreSQL fidelity and privileges](docs/modules/POSTGRES.md).

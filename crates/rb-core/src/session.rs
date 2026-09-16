@@ -950,6 +950,7 @@ where
                 detail = %report.detail,
                 "RESTORE VERIFIED: persisted destination matches source"
             );
+            log_verification_extras(&report);
         }
         Some(ControlFrame::Abort { reason }) => {
             return Err(BackupError::phase(
@@ -965,6 +966,15 @@ where
         }
     }
     Ok(plan)
+}
+
+/// Print what the module proved beyond bytes, one line each, under the
+/// `RESTORE VERIFIED` record it belongs to (I-OBSERV). The record itself is
+/// untouched, and a module that counts none of these prints nothing new.
+fn log_verification_extras(report: &VerificationReport) {
+    for line in report.extra_lines() {
+        info!("{line}");
+    }
 }
 
 /// Destination payload path for the negotiated separate-data layout. Reader
@@ -1126,6 +1136,7 @@ async fn destination_stream_multi(
                 carriers = channel.carriers(),
                 "RESTORE VERIFIED: persisted destination matches source"
             );
+            log_verification_extras(&report);
         }
         Some(ControlFrame::Abort { reason }) => {
             return Err(BackupError::phase(

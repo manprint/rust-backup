@@ -495,9 +495,55 @@ SQL
         backend) assert_phase "$label" "$dlog" 'Apply|Transfer|Verify' ;;
       esac
     }
+    # T-PG-ROWS-NEG: no fault is injected — the source simply plans one row more
+    # than it holds (test hook). The destination must refuse the restore on the
+    # row count alone, since every byte it received was correct.
+    pg_rows_case() {
+      local label=pg-row-count-mismatch
+      case_begin "$label"
+      local slog="$work/$label-source.log" dlog="$work/$label-destination.log"
+      local before; before=$(pg_source_checksum)
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+      start_server "$work/$label-server.log" || { fail "$label server did not start"; return; }
+      local port=$RB_SERVER_PORT server_pid=$RB_SERVER_PID
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA=1 \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog" 2>&1 &
+      local source_pid=$!; PIDS+=("$source_pid")
+      sleep .5
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres destination --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --yes --admin --overwrite --host 127.0.0.1 --port "$pg_dst_port" \
+        --user postgres --sslmode disable >"$dlog" 2>&1 &
+      local destination_pid=$!; PIDS+=("$destination_pid")
+
+      local source_rc destination_rc
+      reap "$source_pid"; source_rc=$REAP_RC
+      reap "$destination_pid"; destination_rc=$REAP_RC
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+
+      assert_source_unchanged "$label" "$before" "$(pg_source_checksum)"
+
+      local state; state=$(pg_dest_state)
+      if (( destination_rc != 5 )); then
+        fail "$label [B] destination exited $destination_rc, expected the integrity code 5"
+      elif ! grep -q 'source counted' "$dlog"; then
+        fail "$label [B] the destination did not report a row-count mismatch"
+      elif [[ "$state" != absent ]]; then
+        fail "$label [B] the refused database survived ($state)"
+      elif ! no_false_success "$slog" "$dlog"; then
+        fail "$label [B] a peer printed verified completion for a refused restore"
+      else
+        pass "$label [B] a row-count mismatch fails the restore and removes the database"
+      fi
+    }
     pg_case pg-source-kill  source
     pg_case pg-relay-reset  server
     pg_case pg-backend-stop backend
+    pg_rows_case
   else
     fail 'postgres fault group could not start its containers'
   fi

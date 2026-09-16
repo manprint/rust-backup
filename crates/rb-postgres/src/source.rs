@@ -49,6 +49,11 @@ pub(crate) struct ItemMeta {
     /// `WHERE`. `None` means the whole relation is configuration data.
     #[serde(default)]
     pub(crate) condition: Option<String>,
+    /// Rows the source counted in this item's scope during `analyze`. Absent in
+    /// a plan written before the count existed, which the destination reports
+    /// as an unverified restore rather than treating as zero.
+    #[serde(default)]
+    pub(crate) expected_rows: Option<u64>,
 }
 
 fn default_kind() -> String {
@@ -229,6 +234,7 @@ mod tests {
             columns: vec!["id".into(), "email".into()],
             only: false,
             condition: None,
+            expected_rows: None,
         };
         assert_eq!(
             copy_out_sql(&m),
@@ -257,6 +263,7 @@ mod tests {
             columns: vec![],
             only: true,
             condition: None,
+            expected_rows: None,
         };
         assert_eq!(
             copy_out_sql(&m),
@@ -277,6 +284,7 @@ mod tests {
             columns: vec![],
             only: false,
             condition: Some("WHERE k >= 1000".into()),
+            expected_rows: None,
         };
         assert_eq!(
             copy_out_sql(&m),
@@ -305,6 +313,7 @@ mod tests {
             columns: vec!["id".into()],
             only: true,
             condition: None,
+            expected_rows: None,
         };
         assert_eq!(
             copy_out_sql(&m),

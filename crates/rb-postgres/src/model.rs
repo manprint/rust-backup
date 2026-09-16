@@ -144,6 +144,10 @@ pub struct PgExtensionConfig {
     /// `relpages * 8192`, for the plan's byte estimate only.
     #[serde(default)]
     pub estimated_bytes: i64,
+    /// Exact `count(*)` of the rows the condition selects, taken on the source
+    /// during `analyze`. The destination must write exactly this many.
+    #[serde(default)]
+    pub expected_rows: Option<i64>,
 }
 
 /// A schema (namespace) and its contained objects.
@@ -194,6 +198,13 @@ pub struct PgTable {
     pub estimated_rows: i64,
     /// `pg_total_relation_size` estimate in bytes.
     pub estimated_bytes: i64,
+    /// Exact `count(*)` in the scope this table's plan item streams (`FROM
+    /// ONLY` for an inheritance parent), taken on the source during `analyze`.
+    /// The destination compares it with the rows its `COPY` actually wrote:
+    /// a restore that dropped rows is otherwise invisible to a byte-for-byte
+    /// commitment that was computed over the rows that did arrive.
+    #[serde(default)]
+    pub expected_rows: Option<i64>,
 }
 
 /// Partition attachment info (parent + bound expression).
@@ -266,6 +277,19 @@ pub struct PgConstraint {
     /// `obj_description(oid, 'pg_constraint')`.
     #[serde(default)]
     pub comment: Option<String>,
+    /// `convalidated`. A `NOT VALID` constraint is enforced for new rows only:
+    /// the existing rows that violate it are legal state on the source, and a
+    /// destination that validated the constraint would have had to reject them.
+    /// Defaults to `true` so a plan written before the field deserializes as
+    /// the overwhelmingly common case.
+    #[serde(default = "default_true")]
+    pub validated: bool,
+    /// `condeferrable` — the constraint can be deferred to commit time.
+    #[serde(default)]
+    pub deferrable: bool,
+    /// `condeferred` — it is deferred by default (`INITIALLY DEFERRED`).
+    #[serde(default)]
+    pub initially_deferred: bool,
 }
 
 /// An index (`pg_get_indexdef`-rendered).
@@ -335,6 +359,12 @@ pub struct PgView {
     /// requires one.
     #[serde(default)]
     pub indexes: Vec<PgIndex>,
+    /// Exact `count(*)` of a populated materialized view on the source. Its
+    /// rows are produced by `REFRESH` on the destination, not streamed, so this
+    /// is the only number that can prove the refresh reproduced them.
+    /// `None` for an ordinary view and for an unpopulated materialized one.
+    #[serde(default)]
+    pub expected_rows: Option<i64>,
     /// Schema-qualified views/materialized views this one reads. Restore order
     /// follows these edges: catalog name order does not (`app.active` selecting
     /// from `app.zombies` sorts first and would fail to resolve).
@@ -432,6 +462,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                     comment: None,
                     acl: vec!["app_owner=UC/app_owner".to_string()],
                     tables: vec![PgTable {
+                        expected_rows: None,
                         schema: "app".to_string(),
                         name: "accounts".to_string(),
                         owner: "app_owner".to_string(),
@@ -464,6 +495,9 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                             },
                         ],
                         constraints: vec![PgConstraint {
+                            validated: true,
+                            deferrable: false,
+                            initially_deferred: false,
                             name: "accounts_pkey".to_string(),
                             kind: "p".to_string(),
                             definition: "PRIMARY KEY (id)".to_string(),
@@ -514,6 +548,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                         owner: "app_owner".to_string(),
                         definition: "SELECT id, email FROM app.accounts;".to_string(),
                         materialized: false,
+                        expected_rows: None,
                         options: Vec::new(),
                         populated: true,
                         indexes: vec![],
@@ -574,12 +609,67 @@ mod tests {
         assert_eq!(back.databases[0].icu_rules, None);
     }
 
+    /// A plan written before constraint state was captured says nothing about
+    /// validity or deferrability. It must deserialize as the common case — a
+    /// validated, non-deferrable constraint — not as a `NOT VALID` one.
+    #[test]
+    fn constraint_model_deserializes_without_new_fields() {
+        let json = serde_json::json!({
+            "name": "accounts_pkey",
+            "kind": "p",
+            "definition": "PRIMARY KEY (id)",
+            "references": null
+        });
+        let back: PgConstraint = serde_json::from_value(json).expect("legacy constraint");
+        assert!(back.validated, "an absent convalidated means validated");
+        assert!(!back.deferrable);
+        assert!(!back.initially_deferred);
+        assert_eq!(back.comment, None);
+    }
+
+    /// A materialized view's row count travels in the payload, and a plan
+    /// written before it existed must still deserialize — as "not counted",
+    /// never as zero rows.
+    #[test]
+    fn matview_expected_rows_roundtrips_in_payload() {
+        let mut payload = super::test_fixture();
+        let view = payload.databases[0].schemas[0]
+            .views
+            .first_mut()
+            .expect("the fixture has a view");
+        view.materialized = true;
+        view.expected_rows = Some(42);
+
+        let json = serde_json::to_value(&payload).expect("serialize");
+        let back: PgPlanPayload = serde_json::from_value(json.clone()).expect("deserialize");
+        assert_eq!(back, payload);
+
+        let mut legacy = json;
+        for view in legacy["databases"][0]["schemas"][0]["views"]
+            .as_array_mut()
+            .expect("views array")
+        {
+            view.as_object_mut()
+                .expect("view object")
+                .remove("expected_rows");
+        }
+        let back: PgPlanPayload = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(
+            back.databases[0].schemas[0]
+                .views
+                .iter()
+                .all(|v| v.expected_rows.is_none()),
+            "an absent count is not zero rows"
+        );
+    }
+
     /// A plan written before extension configuration tables were captured has no
     /// `extension_configs` key: it must still deserialize, as an empty list.
     #[test]
     fn payload_without_extension_configs_deserializes() {
         let mut payload = super::test_fixture();
         payload.databases[0].extension_configs = vec![PgExtensionConfig {
+            expected_rows: None,
             extension: "rbtest".to_string(),
             schema: "public".to_string(),
             table: "rbtest_cfg".to_string(),

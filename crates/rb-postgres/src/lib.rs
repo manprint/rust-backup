@@ -21,6 +21,7 @@ mod source;
 pub use connect::{parse_major, PgConnection, MIN_PG_MAJOR};
 pub use model::PgPlanPayload;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -155,7 +156,11 @@ impl BackupModule for Module {
 
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>> {
         let pg_params: PostgresParams = params.deserialize()?;
-        Ok(Box::new(PostgresDestination { params: pg_params }))
+        Ok(Box::new(PostgresDestination {
+            params: pg_params,
+            table_rows: AtomicU64::new(0),
+            derived_rows: AtomicU64::new(0),
+        }))
     }
 }
 
@@ -167,7 +172,12 @@ struct PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     async fn analyze(&self) -> Result<BackupPlan> {
-        let payload = introspect::introspect_cluster(&self.params).await?;
+        let mut payload = introspect::introspect_cluster(&self.params).await?;
+        // Counted here and not inside `introspect_cluster`: the same
+        // introspection runs on both fingerprint audits and on the
+        // destination's read-back, and none of those needs a second full scan
+        // of every table.
+        introspect::gather_row_counts(&self.params, &mut payload).await?;
         Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
     }
 
@@ -183,6 +193,11 @@ impl Source for PostgresSource {
 /// PostgreSQL destination (restore).
 struct PostgresDestination {
     params: PostgresParams,
+    /// Rows written by the restore, handed from `stream_in` to `verify` — the
+    /// trait hands the report back in a later call, and these are counted while
+    /// applying. Atomics rather than a mutex: two counters, no poisoning.
+    table_rows: AtomicU64,
+    derived_rows: AtomicU64,
 }
 
 #[async_trait]
@@ -192,7 +207,11 @@ impl Destination for PostgresDestination {
     }
 
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
-        dest::stream_in(&self.params, plan, src).await
+        let rows = dest::stream_in(&self.params, plan, src).await?;
+        self.table_rows.store(rows.table_rows, Ordering::Relaxed);
+        self.derived_rows
+            .store(rows.derived_rows, Ordering::Relaxed);
+        Ok(())
     }
 
     async fn verify(
@@ -200,7 +219,7 @@ impl Destination for PostgresDestination {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport> {
-        let deviations = dest::verify_catalog(&self.params, plan).await?;
+        let catalog = dest::verify_catalog(&self.params, plan).await?;
         let mut verifier = VerificationSink::new(evidence);
         source::stream_out(&self.params, plan, &mut verifier)
             .await
@@ -217,11 +236,31 @@ impl Destination for PostgresDestination {
         // A deviation is not a failure, but it must reach the operator's
         // `RESTORE VERIFIED` line: the destination is 1:1 with the source
         // *except* for what is named here.
-        for deviation in &deviations {
-            detail.push_str("; ");
+        // Also on the headline record, because the source peer reads the report
+        // and never sees the destination's own lines.
+        for deviation in &catalog.deviations {
+            detail.push_str("; deviation: ");
             detail.push_str(deviation);
         }
-        verifier.report(detail)
+        let table_rows = self.table_rows.load(Ordering::Relaxed);
+        let derived_rows = self.derived_rows.load(Ordering::Relaxed);
+        // The same facts as structured fields: the `RESTORE VERIFIED` lines are
+        // for the operator reading a terminal, this is for whatever collects
+        // the module's own events (I-OBSERV).
+        tracing::info!(
+            table_rows,
+            derived_rows,
+            constraints = catalog.constraints,
+            constraints_not_valid = catalog.constraints_not_valid,
+            deviations = catalog.deviations.len(),
+            "PostgreSQL destination read-back verified"
+        );
+        verifier.report(detail).map(|report| {
+            report
+                .with_rows(table_rows, derived_rows)
+                .with_constraints(catalog.constraints, catalog.constraints_not_valid)
+                .with_deviations(catalog.deviations)
+        })
     }
 }
 

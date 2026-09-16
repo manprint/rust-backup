@@ -16,7 +16,7 @@ echo "exit=$?"     # 0 = copia verificata; qualunque altro valore = nessuna cert
 | `2` | configurazione | parametro mancante, incoerente o di tipo sbagliato; YAML non valido; modulo sconosciuto | correggere il comando o il file |
 | `3` | preflight | la destinazione non è in condizione di ricevere: database già presente senza `--overwrite`, root non vuota, privilegi insufficienti | sistemare la destinazione e ripetere |
 | `4` | piano rifiutato | l'operatore ha risposto qualcosa di diverso da `yes` al prompt (o stdin era chiuso) | usare `--yes` / `auto_accept: true` nelle esecuzioni non interattive |
-| `5` | integrità / apply / verify | un digest o la rilettura non coincidono, oppure l'applicazione è fallita | **il ripristino non è utilizzabile**: indagare e rieseguire da zero |
+| `5` | integrità / apply / verify | un digest o la rilettura non coincidono, il numero di righe ripristinate non coincide con quello contato sulla sorgente, oppure l'applicazione è fallita | **il ripristino non è utilizzabile**: indagare e rieseguire da zero |
 | `6` | sorgente modificata | l'impronta della sorgente è cambiata fra l'inizio e la fine | fermare le scritture sulla sorgente (o usare uno snapshot) e ripetere |
 | `7` | trasporto / connessione | coordinatore irraggiungibile, segreto errato, TLS fallito, peer assente | verificare rete, `--to`, `--channel`, segreto e certificati |
 
@@ -37,6 +37,12 @@ items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s  status="verified"
 
 Il programma non stampa mai quelle righe per una copia parziale. Una conferma di
 completamento priva della prova di rilettura viene rifiutata.
+
+Per PostgreSQL la destinazione aggiunge sotto quella riga ciò che ha verificato
+— `rows verified: …`, `constraints: …` e un `deviation: …` per ogni scostamento
+dichiarato. Sono diagnostica: non cambiano il codice di uscita, ma un conteggio
+di righe che non torna lo fa diventare `5`. Il dettaglio delle righe è in
+[03-postgres.md](03-postgres.md).
 
 ## Messaggi frequenti e loro causa
 
