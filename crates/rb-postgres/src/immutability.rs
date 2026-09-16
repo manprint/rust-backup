@@ -67,9 +67,25 @@ pub async fn fingerprint(params: &PostgresParams) -> Result<String> {
                 }
                 let qual = format!("{}.{}", t.schema, t.name);
                 let only = t.kind != "p" && inheritance_parents.contains(qual.as_str());
-                let stat = table_stat(&conn.client, &db.name, &t.schema, &t.name, only).await?;
+                let stat =
+                    table_stat(&conn.client, &db.name, &t.schema, &t.name, only, None).await?;
                 tables.push(stat);
             }
+        }
+        // Extension configuration tables hold user rows the plan streams, so
+        // they are part of the source's evidence too — restricted to the same
+        // scope the item streams.
+        for config in &db.extension_configs {
+            let stat = table_stat(
+                &conn.client,
+                &db.name,
+                &config.schema,
+                &config.table,
+                false,
+                config.condition.as_deref(),
+            )
+            .await?;
+            tables.push(stat);
         }
     }
 
@@ -99,6 +115,9 @@ pub fn compose(snap: &SourceFingerprint) -> String {
 /// is retained because it is restored state and any change is real source drift.
 fn normalize(p: &mut PgPlanPayload) {
     for db in &mut p.databases {
+        for config in &mut db.extension_configs {
+            config.estimated_bytes = 0;
+        }
         for s in &mut db.schemas {
             for t in &mut s.tables {
                 t.estimated_rows = 0;
@@ -122,6 +141,7 @@ async fn table_stat(
     schema: &str,
     table: &str,
     only: bool,
+    condition: Option<&str>,
 ) -> Result<TableStat> {
     let qual = quote_qualified(schema, table);
     let scope = if only {
@@ -129,9 +149,12 @@ async fn table_stat(
     } else {
         qual.clone()
     };
+    // An extension configuration table's condition (`WHERE …`, verbatim from
+    // `pg_extension.extcondition`); empty for an ordinary table.
+    let cond = condition.map(|c| format!(" {c}")).unwrap_or_default();
 
     let count_row = client
-        .query_one(&format!("SELECT count(*)::int8 FROM {scope}"), &[])
+        .query_one(&format!("SELECT count(*)::int8 FROM {scope}{cond}"), &[])
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {qual}"), e))?;
     let rows: i64 = count_row.get(0);
@@ -139,7 +162,7 @@ async fn table_stat(
     // Stream hashes of all rows instead of aggregating them in server memory.
     // Sorting by row text is order-independent and duplicate rows remain visible.
     let copy_sql = format!(
-        "COPY (SELECT md5(t::text) FROM {scope} t ORDER BY t::text COLLATE \"C\") TO STDOUT"
+        "COPY (SELECT md5(t::text) FROM {scope} t{cond} ORDER BY t::text COLLATE \"C\") TO STDOUT"
     );
     let stream = client
         .copy_out(&copy_sql)

@@ -56,6 +56,7 @@ RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
 | `--sslmode <modo>` | `RUST_BACKUP_SSLMODE` | `prefer` | entrambi | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `--admin[=bool]` | `RUST_BACKUP_ADMIN` | falso | destinazione | dichiara che la connessione è amministrativa: serve per creare ruoli, database e applicare le proprietà |
 | `--overwrite[=bool]` | `RUST_BACKUP_OVERWRITE` | falso | destinazione | autorizza il ripristino sopra database già esistenti. Senza, il preflight fallisce |
+| `--extension-version <source\|default>` | `RUST_BACKUP_EXTENSION_VERSION` | `source` | destinazione | quale versione installare per ogni estensione della sorgente. `source`: esattamente quella della sorgente, e il preflight rifiuta il piano se la destinazione non ce l'ha. `default`: la versione predefinita della destinazione, registrata come `deviation:` nella riga `RESTORE VERIFIED` |
 | `-P sslrootcert=<file.pem>` | — | nessuno | entrambi | CA privata per `require`/`verify-ca`/`verify-full` |
 | `-P allow_unsupported_objects=true` | — | falso | sorgente | accetta una copia *consapevolmente parziale* di un cluster che contiene oggetti non riproducibili (vedi sotto) |
 
@@ -68,6 +69,14 @@ Ruoli e appartenenze, database (con encoding/collation/locale provider),
 schemi, tabelle (dati inclusi, via `COPY` binario), vincoli, indici, sequenze
 con il loro valore corrente, estensioni, proprietà e privilegi. L'ordine di
 ripristino è derivato dalle dipendenze, non da una lista fissa.
+
+Le tabelle di configurazione delle estensioni (quelle registrate con
+`pg_extension_config_dump`, per esempio `spatial_ref_sys` di PostGIS) sono
+copiate come i dati che sono: l'estensione viene ricreata con `CREATE
+EXTENSION`, poi la destinazione svuota esattamente l'ambito registrato
+dall'estensione (`DELETE` con la sua condizione, `TRUNCATE` se non ne ha
+registrata una) e vi carica le righe della sorgente. Le righe inserite da
+`CREATE EXTENSION` vengono quindi sostituite, non sommate a quelle di origine.
 
 Le **password dei ruoli non vengono mai lette né ripristinate**: dopo il restore i
 ruoli esistono ma vanno riconfigurati con le credenziali.

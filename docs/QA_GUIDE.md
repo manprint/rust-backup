@@ -157,6 +157,21 @@ sessions, the non-backend part of the fault matrix, and MinIO. Add
 `RUST_BACKUP_FULL_DB_MATRIX=1` for the Docker PostgreSQL/MongoDB matrices
 (PostgreSQL 10–18 including cross-major pairs, MongoDB 4–8).
 
+The PostgreSQL matrix also runs on PostGIS images, which is the only
+configuration that exercises the `M-PG-GIS-*` rows — an extension that owns
+rules and a relation registered with `pg_extension_config_dump`:
+
+```bash
+RB_PG_IMAGE_REPO=postgis/postgis bash e2e/postgres_matrix.sh 16
+RB_PG_IMAGE_REPO=postgis/postgis bash e2e/postgres_matrix.sh 12:16
+```
+
+A cross-major PostGIS pair ships two PostGIS versions, so the case runs with
+`--extension-version default` and `M-PG-GIS-06` first asserts that the same pair
+is refused at preflight without it. In CI this is jobs `postgres-postgis`
+(majors 10–18) and `postgres-postgis-cross-version` (`12:16`); the four
+PostgreSQL e2e jobs carry `timeout-minutes: 80`.
+
 MongoDB 8 needs a host kernel older than 6.19: every published MongoDB 8 image
 refuses to start above that (SERVER-121912). On a newer kernel
 `e2e/mongodb_matrix.sh 8` prints a `SKIP` naming the kernel and exits 77, which

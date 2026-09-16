@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::*;
+use crate::ExtensionVersionPolicy;
 use rb_core::error::{BackupError, Phase, Result};
 
 /// Cluster-wide DDL split by the connection it must run on.
@@ -278,13 +279,24 @@ pub fn alter_database_settings(d: &PgDatabase) -> Result<Vec<String>> {
 // --- per-database emitters ---------------------------------------------------
 
 /// `CREATE EXTENSION IF NOT EXISTS … WITH SCHEMA … VERSION …;`.
-pub fn create_extension(e: &PgExtension) -> String {
-    format!(
-        "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {} VERSION {};",
-        quote_ident(&e.name),
-        quote_ident(&e.schema),
-        quote_literal(&e.version)
-    )
+pub fn create_extension(e: &PgExtension, policy: ExtensionVersionPolicy) -> String {
+    // Under `Default` the version clause is omitted entirely rather than set to
+    // the destination's default: the destination is the only side that knows
+    // which version that is, and `CREATE EXTENSION` without `VERSION` installs
+    // it by definition.
+    match policy {
+        ExtensionVersionPolicy::Source => format!(
+            "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {} VERSION {};",
+            quote_ident(&e.name),
+            quote_ident(&e.schema),
+            quote_literal(&e.version)
+        ),
+        ExtensionVersionPolicy::Default => format!(
+            "CREATE EXTENSION IF NOT EXISTS {} WITH SCHEMA {};",
+            quote_ident(&e.name),
+            quote_ident(&e.schema)
+        ),
+    }
 }
 
 /// `CREATE SCHEMA … AUTHORIZATION …;` (public is created via IF NOT EXISTS).
@@ -457,6 +469,20 @@ pub fn add_constraint(t: &PgTable, c: &PgConstraint) -> String {
     )
 }
 
+/// `COMMENT ON CONSTRAINT … ON …;` when the constraint carries one. A comment
+/// on a constraint names both the constraint and its table, so it cannot be
+/// emitted by the generic `comment_on`.
+pub fn comment_on_constraint(t: &PgTable, c: &PgConstraint) -> Option<String> {
+    c.comment.as_ref().map(|comment| {
+        format!(
+            "COMMENT ON CONSTRAINT {} ON {} IS {};",
+            quote_ident(&c.name),
+            quote_qualified(&t.schema, &t.name),
+            quote_literal(comment)
+        )
+    })
+}
+
 /// `CREATE INDEX …;` — the full statement from `pg_get_indexdef`. Returns `None`
 /// for an index that backs a constraint (the constraint creates it).
 pub fn create_index(i: &PgIndex) -> Option<String> {
@@ -464,6 +490,15 @@ pub fn create_index(i: &PgIndex) -> Option<String> {
         return None;
     }
     Some(format!("{};", i.definition))
+}
+
+/// `COMMENT ON INDEX …;` when the index carries one. An index backing a
+/// constraint is created by that constraint, but it still exists under its own
+/// name and can still carry a comment of its own.
+pub fn comment_on_index(schema: &str, i: &PgIndex) -> Option<String> {
+    i.comment
+        .as_ref()
+        .map(|comment| comment_on("INDEX", &quote_qualified(schema, &i.name), comment))
 }
 
 /// `CREATE SEQUENCE …;` (without value/ownership — those go in post_data).
@@ -525,24 +560,36 @@ pub fn create_view(v: &PgView) -> String {
     } else {
         "VIEW"
     };
+    // `check_option` and `security_barrier` change what the view accepts and
+    // what it hides, so they belong in the CREATE statement itself: a view
+    // cannot be given them afterwards without being replaced.
+    let options = if v.options.is_empty() {
+        String::new()
+    } else {
+        format!(" WITH ({})", v.options.join(", "))
+    };
     let body = v.definition.trim_end();
     if v.materialized {
         let body = body.strip_suffix(';').unwrap_or(body);
         format!(
-            "CREATE {kind} {} AS {body} WITH NO DATA;",
+            "CREATE {kind} {}{options} AS {body} WITH NO DATA;",
             quote_qualified(&v.schema, &v.name)
         )
     } else {
         format!(
-            "CREATE {kind} {} AS {body}",
+            "CREATE {kind} {}{options} AS {body}",
             quote_qualified(&v.schema, &v.name)
         )
     }
 }
 
-/// `REFRESH MATERIALIZED VIEW …;` for a materialized view, `None` otherwise.
+/// `REFRESH MATERIALIZED VIEW …;` for a *populated* materialized view, `None`
+/// otherwise. A matview the source left unpopulated (`WITH NO DATA`, never
+/// refreshed) must stay unpopulated: a refresh here would hand the destination
+/// rows the source does not have and a `relispopulated` the source does not
+/// have either.
 pub fn refresh_view(v: &PgView) -> Option<String> {
-    v.materialized.then(|| {
+    (v.materialized && v.populated).then(|| {
         format!(
             "REFRESH MATERIALIZED VIEW {};",
             quote_qualified(&v.schema, &v.name)
@@ -657,7 +704,11 @@ pub fn grants_from_acl(objtype: &str, qual: &str, acl: &[String]) -> Vec<String>
 
 /// Assemble the full, ordered cluster DDL from the payload, adapting database
 /// locale syntax to the actual destination PostgreSQL major.
-pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Result<ClusterDdl> {
+pub fn build_cluster_ddl(
+    payload: &PgPlanPayload,
+    destination_major: u32,
+    extension_version: ExtensionVersionPolicy,
+) -> Result<ClusterDdl> {
     if destination_major < payload.server_major {
         return Err(BackupError::phase(
             Phase::Apply,
@@ -690,7 +741,7 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
     let per_database = payload
         .databases
         .iter()
-        .map(|database| build_database_ddl(database, destination_major))
+        .map(|database| build_database_ddl(database, destination_major, extension_version))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ClusterDdl {
@@ -700,7 +751,11 @@ pub fn build_cluster_ddl(payload: &PgPlanPayload, destination_major: u32) -> Res
     })
 }
 
-fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<DatabaseDdl> {
+fn build_database_ddl(
+    d: &PgDatabase,
+    destination_major: u32,
+    extension_version: ExtensionVersionPolicy,
+) -> Result<DatabaseDdl> {
     let mut pre = Vec::new();
     let mut post = Vec::new();
 
@@ -738,7 +793,7 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
         post.extend(grants_from_acl("SCHEMA", &quote_ident(&sc.name), &sc.acl));
     }
     for e in &d.extensions {
-        pre.push(create_extension(e));
+        pre.push(create_extension(e, extension_version));
     }
 
     // PostgreSQL creates an owned sequence itself for every IDENTITY column. Do
@@ -862,11 +917,13 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
     for t in &tables {
         for c in t.constraints.iter().filter(|c| c.kind != "f") {
             post.push(add_constraint(t, c));
+            post.extend(comment_on_constraint(t, c));
         }
     }
     for t in &tables {
         for c in t.constraints.iter().filter(|c| c.kind == "f") {
             post.push(add_constraint(t, c));
+            post.extend(comment_on_constraint(t, c));
         }
     }
 
@@ -912,6 +969,7 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
             if let Some(stmt) = create_index(i) {
                 post.push(stmt);
             }
+            post.extend(comment_on_index(&t.schema, i));
         }
     }
     for t in &tables {
@@ -934,6 +992,7 @@ fn build_database_ddl(d: &PgDatabase, destination_major: u32) -> Result<Database
             if let Some(stmt) = create_index(i) {
                 post.push(stmt);
             }
+            post.extend(comment_on_index(&v.schema, i));
         }
     }
 
@@ -1153,6 +1212,27 @@ fn priv_keyword(c: char) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// Under `--extension-version default` the destination installs whatever it
+    /// defaults to, so the statement must carry no `VERSION` clause at all —
+    /// naming a version the destination lacks is what the policy exists to
+    /// avoid.
+    #[test]
+    fn create_extension_omits_version_under_default_policy() {
+        let e = PgExtension {
+            name: "rbtest".to_string(),
+            version: "1.0".to_string(),
+            schema: "public".to_string(),
+        };
+        assert_eq!(
+            create_extension(&e, ExtensionVersionPolicy::Source),
+            "CREATE EXTENSION IF NOT EXISTS \"rbtest\" WITH SCHEMA \"public\" VERSION '1.0';"
+        );
+        assert_eq!(
+            create_extension(&e, ExtensionVersionPolicy::Default),
+            "CREATE EXTENSION IF NOT EXISTS \"rbtest\" WITH SCHEMA \"public\";"
+        );
+    }
+
     #[test]
     fn idents_and_literals_quote() {
         assert_eq!(quote_ident("foo"), "\"foo\"");
@@ -1181,7 +1261,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let ddl = build_database_ddl(&db, 16).expect("database ddl");
+        let ddl =
+            build_database_ddl(&db, 16, ExtensionVersionPolicy::Source).expect("database ddl");
         let schema_at = ddl
             .pre_data
             .iter()
@@ -1562,6 +1643,8 @@ mod tests {
             owner: "app_owner".into(),
             definition: " SELECT day, count(*) FROM app.events GROUP BY day;".into(),
             materialized: true,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![],
             depends_on: vec![],
             acl: vec![],
@@ -1578,6 +1661,8 @@ mod tests {
         );
         let v = PgView {
             materialized: false,
+            options: Vec::new(),
+            populated: true,
             ..m
         };
         assert_eq!(
@@ -1691,6 +1776,8 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT 1;".into(),
             materialized: false,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![],
             depends_on: depends_on.into_iter().map(String::from).collect(),
             acl: vec![],
@@ -1775,6 +1862,7 @@ mod tests {
             kind: "p".into(),
             definition: "PRIMARY KEY (id)".into(),
             references: None,
+            comment: None,
         };
         assert_eq!(
             add_constraint(&t, &pk),
@@ -1862,7 +1950,8 @@ mod tests {
     #[test]
     fn cluster_ddl_assembly_ordering() {
         let payload = crate::model::test_fixture();
-        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
 
         // Roles created, then memberships, then tablespaces.
         assert!(ddl.roles[0].starts_with("CREATE ROLE \"app_owner\""));
@@ -1936,7 +2025,8 @@ mod tests {
             "app_owner=rwU/app_owner".to_string(),
             "readers=r/app_owner".to_string(),
         ];
-        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
         let db = &ddl.per_database[0];
         assert!(
             db.pre_data
@@ -1962,6 +2052,226 @@ mod tests {
     }
 
     #[test]
+    fn identity_sequence_current_value_is_restored() {
+        // The identity column recreates the sequence itself, so the plan skips
+        // its CREATE — but not its value: skipping the setval too would restart
+        // every identity column at 1 and hand the next insert a duplicate key.
+        let payload = crate::model::test_fixture();
+        let sequence = &payload.databases[0].schemas[0].sequences[0];
+        assert_eq!(sequence.owned_by.as_deref(), Some("app.accounts.id"));
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        let setval = sequence_setval(sequence).expect("identity sequences carry a value");
+        assert!(
+            db.post_data.iter().any(|s| s == &setval),
+            "the identity-backed sequence must be set to the source value: {setval}"
+        );
+    }
+
+    #[test]
+    fn verbatim_definitions_survive_the_model_roundtrip() {
+        // `NULLS NOT DISTINCT` (PostgreSQL 15+) is carried verbatim from
+        // pg_get_indexdef/pg_get_constraintdef: nothing in this build parses it,
+        // so the only way it can be lost is a model that drops the text.
+        let index = PgIndex {
+            name: "t_idx_17".into(),
+            definition: "CREATE UNIQUE INDEX t_idx_17 ON mx.t_idx_17 USING btree (tag) \
+                         NULLS NOT DISTINCT"
+                .into(),
+            is_primary: false,
+            is_unique: true,
+            is_constraint: false,
+            attach_to: None,
+            comment: None,
+        };
+        let constraint = PgConstraint {
+            name: "c_con_18".into(),
+            kind: "u".into(),
+            definition: "UNIQUE NULLS NOT DISTINCT (tag)".into(),
+            references: None,
+            comment: None,
+        };
+        let index_back: PgIndex =
+            serde_json::from_str(&serde_json::to_string(&index).expect("index json"))
+                .expect("index back");
+        let constraint_back: PgConstraint =
+            serde_json::from_str(&serde_json::to_string(&constraint).expect("constraint json"))
+                .expect("constraint back");
+        assert_eq!(index_back, index);
+        assert_eq!(constraint_back, constraint);
+        assert!(create_index(&index_back)
+            .expect("index statement")
+            .contains("NULLS NOT DISTINCT"));
+        let table = PgTable {
+            schema: "mx".into(),
+            name: "t_con_18".into(),
+            ..Default::default()
+        };
+        assert!(add_constraint(&table, &constraint_back).contains("UNIQUE NULLS NOT DISTINCT"));
+    }
+
+    #[test]
+    fn index_comment_is_emitted() {
+        let index = PgIndex {
+            name: "accounts_email_idx".into(),
+            definition: "CREATE INDEX accounts_email_idx ON app.accounts USING btree (email)"
+                .into(),
+            is_primary: false,
+            is_unique: false,
+            is_constraint: false,
+            attach_to: None,
+            comment: Some("lookup by address".into()),
+        };
+        assert_eq!(
+            comment_on_index("app", &index).expect("comment"),
+            "COMMENT ON INDEX \"app\".\"accounts_email_idx\" IS 'lookup by address';"
+        );
+        let plain = PgIndex {
+            comment: None,
+            ..index
+        };
+        assert_eq!(comment_on_index("app", &plain), None);
+    }
+
+    #[test]
+    fn constraint_comment_is_emitted() {
+        let table = PgTable {
+            schema: "app".into(),
+            name: "accounts".into(),
+            ..Default::default()
+        };
+        let commented = PgConstraint {
+            name: "accounts_email_key".into(),
+            kind: "u".into(),
+            definition: "UNIQUE (email)".into(),
+            references: None,
+            comment: Some("one account per address".into()),
+        };
+        assert_eq!(
+            comment_on_constraint(&table, &commented).expect("comment"),
+            "COMMENT ON CONSTRAINT \"accounts_email_key\" ON \"app\".\"accounts\" \
+             IS 'one account per address';"
+        );
+        let plain = PgConstraint {
+            comment: None,
+            ..commented
+        };
+        assert_eq!(comment_on_constraint(&table, &plain), None);
+    }
+
+    #[test]
+    fn view_relation_options_are_emitted() {
+        let base = PgView {
+            schema: "app".into(),
+            name: "guarded".into(),
+            owner: "app_owner".into(),
+            definition: " SELECT id FROM app.accounts WHERE id < 100;".into(),
+            materialized: false,
+            options: vec![
+                "security_barrier=true".to_string(),
+                "check_option=cascaded".to_string(),
+            ],
+            populated: true,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: None,
+        };
+        assert_eq!(
+            create_view(&base),
+            "CREATE VIEW \"app\".\"guarded\" WITH (security_barrier=true, \
+             check_option=cascaded) AS  SELECT id FROM app.accounts WHERE id < 100;"
+        );
+
+        let materialized = PgView {
+            materialized: true,
+            options: vec!["fillfactor=70".to_string()],
+            ..base.clone()
+        };
+        assert_eq!(
+            create_view(&materialized),
+            "CREATE MATERIALIZED VIEW \"app\".\"guarded\" WITH (fillfactor=70) AS  \
+             SELECT id FROM app.accounts WHERE id < 100 WITH NO DATA;"
+        );
+
+        // A view without options must not grow an empty option list.
+        let plain = PgView {
+            options: vec![],
+            ..base
+        };
+        assert!(!create_view(&plain).contains("WITH ("));
+    }
+
+    #[test]
+    fn unpopulated_matview_is_not_refreshed() {
+        let populated = PgView {
+            schema: "app".into(),
+            name: "daily".into(),
+            owner: "app_owner".into(),
+            definition: " SELECT count(*) FROM app.accounts;".into(),
+            materialized: true,
+            options: Vec::new(),
+            populated: true,
+            indexes: vec![],
+            depends_on: vec![],
+            acl: vec![],
+            comment: None,
+        };
+        assert_eq!(
+            refresh_view(&populated).expect("refresh"),
+            "REFRESH MATERIALIZED VIEW \"app\".\"daily\";"
+        );
+
+        // `WITH NO DATA` on the source: refreshing here would invent rows.
+        let unpopulated = PgView {
+            populated: false,
+            ..populated
+        };
+        assert_eq!(refresh_view(&unpopulated), None);
+        assert!(create_view(&unpopulated).ends_with("WITH NO DATA;"));
+    }
+
+    #[test]
+    fn matview_refresh_follows_dependency_order() {
+        let matview = |name: &str, depends_on: Vec<&str>| PgView {
+            schema: "app".into(),
+            name: name.into(),
+            owner: "app_owner".into(),
+            definition: " SELECT count(*) FROM app.accounts;".into(),
+            materialized: true,
+            options: Vec::new(),
+            populated: true,
+            indexes: vec![],
+            depends_on: depends_on.into_iter().map(String::from).collect(),
+            acl: vec![],
+            comment: None,
+        };
+        let mut payload = crate::model::test_fixture();
+        // `a_totals` sorts first by name but reads `z_base`.
+        payload.databases[0].schemas[0]
+            .views
+            .push(matview("a_totals", vec!["app.z_base"]));
+        payload.databases[0].schemas[0]
+            .views
+            .push(matview("z_base", vec![]));
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
+        let db = &ddl.per_database[0];
+        let position = |needle: &str| {
+            db.post_data
+                .iter()
+                .position(|s| s == needle)
+                .unwrap_or_else(|| panic!("missing statement: {needle}"))
+        };
+        assert!(
+            position("REFRESH MATERIALIZED VIEW \"app\".\"z_base\";")
+                < position("REFRESH MATERIALIZED VIEW \"app\".\"a_totals\";"),
+            "a matview must be refreshed after the matview it reads"
+        );
+    }
+
+    #[test]
     fn a_materialized_view_is_refreshed_in_post_data_after_its_tables() {
         let mut payload = crate::model::test_fixture();
         payload.databases[0].schemas[0].views.push(PgView {
@@ -1970,6 +2280,8 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT count(*) FROM app.accounts;".into(),
             materialized: true,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![PgIndex {
                 name: "daily_idx".into(),
                 definition: "CREATE UNIQUE INDEX daily_idx ON app.daily USING btree (count)".into(),
@@ -1983,7 +2295,8 @@ mod tests {
             acl: vec![],
             comment: None,
         });
-        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
         let db = &ddl.per_database[0];
         let create = db
             .post_data
@@ -2023,6 +2336,8 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT count(*) FROM app.accounts".into(),
             materialized: true,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![],
             depends_on: vec![],
             acl: vec![],
@@ -2034,13 +2349,16 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT id FROM app.accounts".into(),
             materialized: false,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![],
             depends_on: vec![],
             acl: vec![],
             comment: Some("plain one".into()),
         });
 
-        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
         let db = &ddl.per_database[0];
         assert!(
             db.post_data
@@ -2071,6 +2389,7 @@ mod tests {
             kind: "p".into(),
             definition: "PRIMARY KEY (id)".into(),
             references: None,
+            comment: None,
         });
         schema.views.push(PgView {
             schema: "app".into(),
@@ -2078,13 +2397,16 @@ mod tests {
             owner: "app_owner".into(),
             definition: "SELECT a.id, a.email FROM app.accounts a GROUP BY a.id".into(),
             materialized: false,
+            options: Vec::new(),
+            populated: true,
             indexes: vec![],
             depends_on: vec![],
             acl: vec![],
             comment: None,
         });
 
-        let ddl = build_cluster_ddl(&payload, 16).expect("cluster DDL");
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
         let db = &ddl.per_database[0];
         assert!(
             !db.pre_data.iter().any(|s| s.contains("CREATE VIEW")),
@@ -2115,13 +2437,15 @@ mod tests {
         schema.owner = "app_owner".into();
         schema.acl = vec!["=U/app_owner".into()];
 
-        let pg14 = build_cluster_ddl(&payload, 14).expect("PostgreSQL 14 DDL");
+        let pg14 = build_cluster_ddl(&payload, 14, ExtensionVersionPolicy::Source)
+            .expect("PostgreSQL 14 DDL");
         let pre14 = &pg14.per_database[0].pre_data;
         assert!(pre14.contains(&"ALTER SCHEMA \"public\" OWNER TO \"app_owner\";".to_string()));
         assert!(pre14.contains(&"REVOKE ALL ON SCHEMA \"public\" FROM PUBLIC;".to_string()));
         assert!(pre14.iter().all(|sql| !sql.contains("pg_database_owner")));
 
-        let pg18 = build_cluster_ddl(&payload, 18).expect("PostgreSQL 18 DDL");
+        let pg18 = build_cluster_ddl(&payload, 18, ExtensionVersionPolicy::Source)
+            .expect("PostgreSQL 18 DDL");
         let db18 = &pg18.per_database[0];
         assert!(db18
             .pre_data

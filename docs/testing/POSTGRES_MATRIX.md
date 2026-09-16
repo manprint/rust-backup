@@ -146,24 +146,34 @@ left behind). `Oracle` names the external check that decides the row:
 | M-PG-EXT-03 | `hstore` with an hstore column and a GIN index | 10 | `70_extensions.sql` | round-trip | schema diff + row digest |
 | M-PG-EXT-04 | `citext` column | 10 | `70_extensions.sql` | round-trip | schema diff + row digest |
 | M-PG-EXT-05 | `uuid-ossp` with a `uuid_generate_v4()` column default | 10 | `70_extensions.sql` | round-trip | schema diff |
-| M-PG-EXT-06 | extension installed in a non-public schema (`CREATE EXTENSION hstore SCHEMA ext`) | 10 | `70_extensions.sql` | round-trip | catalog (`pg_extension.extnamespace`) |
+| M-PG-EXT-06 | extension installed in a non-public schema (`CREATE EXTENSION tablefunc SCHEMA ext`; `hstore` already occupies `public` for EXT-03) | 10 | `70_extensions.sql` | round-trip | catalog (`pg_extension.extnamespace`) |
 | M-PG-EXT-07 | custom extension `rbtest` with a config table registered by `pg_extension_config_dump`, custom row matching the condition | 10 | `71_rbtest_extension.sh`, `70_extensions.sql` | round-trip | row digest of `rbtest_cfg` (k = 1000 present, seeded rows not duplicated) |
-| M-PG-EXT-08 | extension whose exact version is missing on the destination | 10 | `71_rbtest_extension.sh` (version `1.1` on the destination) | refused before transfer without `--extension-version default`; round-trip with it | refusal, then catalog (`pg_extension.extversion`) plus a logged deviation line |
+| M-PG-EXT-08 | extension whose exact version is missing on the destination | 10 | `71_rbtest_extension.sh 1.1` on the destination | refused before transfer without `--extension-version default`; round-trip with it | refusal, then catalog (`pg_extension.extversion`) plus a logged deviation line |
 
 ## GIS — PostGIS
 
 Only run under `RB_PG_IMAGE_REPO=postgis/postgis`; otherwise every row prints
-`SKIP`. The image tag per major is resolved by the runner; a major with no
-resolvable PostGIS tag prints `SKIP` for the whole group.
+`SKIP`. The image tag per major is resolved by the runner (`postgis_tag`) and
+checked with `docker manifest inspect`; a major with no resolvable PostGIS tag
+prints `SKIP` for the whole group. Tags resolved on 2026-09-16 (R5):
+
+| major | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 |
+|-------|----|----|----|----|----|----|----|----|----|
+| tag | `10-2.5` | `11-3.3` | `12-3.4` | `13-3.5` | `14-3.5` | `15-3.5` | `16-3.5` | `17-3.5` | `18-3.6` |
+
+A cross-major PostGIS pair ships two different PostGIS versions, so the whole
+case runs with `--extension-version default`; M-PG-GIS-06 asserts both halves of
+that policy (refused without the flag, restored with it and the substitution
+reported as a `deviation:` line).
 
 | ID | Case | Min major | Fixture file | Expected | Oracle |
 |----|------|-----------|--------------|----------|--------|
-| M-PG-GIS-01 | `CREATE EXTENSION postgis` | 10 | `80_postgis.sql` | round-trip | catalog (`pg_extension`) |
-| M-PG-GIS-02 | table with `geometry(Point,4326)` and `geography` columns and rows | 10 | `80_postgis.sql` | round-trip | schema diff + row digest |
-| M-PG-GIS-03 | GiST index on the geometry column | 10 | `80_postgis.sql` | round-trip | idx def |
-| M-PG-GIS-04 | custom `spatial_ref_sys` row (srid 990001) | 10 | `80_postgis.sql` | round-trip | row digest of `spatial_ref_sys` restricted to the extension config condition |
-| M-PG-GIS-05 | view using `ST_AsText` | 10 | `80_postgis.sql` | round-trip | schema diff |
-| M-PG-GIS-06 | cross-major pair `12:16`, extension version differs | 12 | `80_postgis.sql` | refused before transfer without `--extension-version default`; round-trip with it | refusal, then schema diff |
+| M-PG-GIS-01 | `CREATE EXTENSION postgis` | 10 | `postgis/80_postgis.sql` | round-trip | catalog (`pg_extension`) |
+| M-PG-GIS-02 | table with `geometry(Point,4326)` and `geography` columns and rows | 10 | `postgis/80_postgis.sql` | round-trip | schema diff + row digest |
+| M-PG-GIS-03 | GiST index on the geometry column | 10 | `postgis/80_postgis.sql` | round-trip | idx def |
+| M-PG-GIS-04 | custom `spatial_ref_sys` row (srid 990001) | 10 | `postgis/80_postgis.sql` | round-trip | row digest of `spatial_ref_sys` restricted to the extension config condition |
+| M-PG-GIS-05 | view using `ST_AsText` | 10 | `postgis/80_postgis.sql` | round-trip | schema diff |
+| M-PG-GIS-06 | cross-major pair `12:16`, extension version differs | 12 | `postgis/80_postgis.sql` | refused before transfer without `--extension-version default`; round-trip with it | refusal, then schema diff |
 
 ## REF — refusals
 

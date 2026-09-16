@@ -27,6 +27,11 @@ use crate::{PgConnection, PostgresParams};
 /// consumed by both source `stream_out` and destination `stream_in`).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ItemMeta {
+    /// Item kind, mirrored from `PlanItem::kind` so the COPY shape is decided
+    /// from the meta alone. Older plans have no `kind` key and only ever
+    /// contained tables.
+    #[serde(default = "default_kind")]
+    pub(crate) kind: String,
     pub(crate) database: String,
     pub(crate) schema: String,
     pub(crate) table: String,
@@ -39,7 +44,21 @@ pub(crate) struct ItemMeta {
     /// child row twice.
     #[serde(default)]
     pub(crate) only: bool,
+    /// For `extension_config` items: the condition the extension registered
+    /// with `pg_extension_config_dump`, verbatim and including its leading
+    /// `WHERE`. `None` means the whole relation is configuration data.
+    #[serde(default)]
+    pub(crate) condition: Option<String>,
 }
+
+fn default_kind() -> String {
+    "table".to_string()
+}
+
+/// Item kinds this build can stream. Kept next to [`ItemMeta`] because both
+/// sides read it: the source to pick the COPY shape, the destination to refuse
+/// a plan written by a newer build (I-FAILCLOSED).
+pub(crate) const DATA_ITEM_KINDS: [&str; 2] = ["table", "extension_config"];
 
 /// Stream every data-bearing item of `plan` into `sink`. Does NOT close the sink
 /// (the session calls `finish` once all items are done).
@@ -53,7 +72,7 @@ pub async fn stream_out(
     let mut conn: Option<(String, PgConnection)> = None;
 
     for item in &plan.items {
-        if item.kind != "table" {
+        if !DATA_ITEM_KINDS.contains(&item.kind.as_str()) {
             continue;
         }
         let meta: ItemMeta = serde_json::from_value(item.meta.clone()).map_err(|e| {
@@ -88,6 +107,19 @@ pub async fn stream_out(
 /// unless none were captured.
 fn copy_out_sql(meta: &ItemMeta) -> String {
     let qual = quote_qualified(&meta.schema, &meta.table);
+    if meta.kind == "extension_config" {
+        // The relation belongs to the extension and is recreated by `CREATE
+        // EXTENSION`, so only the rows matching the registered condition are
+        // data. `extcondition` already carries its own `WHERE`, and the column
+        // list is the extension's, identical on both sides — so `SELECT *`
+        // matches the destination's column-less `COPY … FROM STDIN`.
+        let cond = meta
+            .condition
+            .as_deref()
+            .map(|c| format!(" {c}"))
+            .unwrap_or_default();
+        return format!("COPY (SELECT * FROM {qual}{cond}) TO STDOUT (FORMAT binary)");
+    }
     if meta.columns.is_empty() {
         // A table with no COPY-able columns (`CREATE TABLE t ();`) still has
         // rows and can still be a classic-inheritance parent. `COPY t TO` has no
@@ -190,11 +222,13 @@ mod tests {
     #[test]
     fn copy_sql_with_and_without_columns() {
         let m = ItemMeta {
+            kind: "table".into(),
             database: "d".into(),
             schema: "app".into(),
             table: "accounts".into(),
             columns: vec!["id".into(), "email".into()],
             only: false,
+            condition: None,
         };
         assert_eq!(
             copy_out_sql(&m),
@@ -216,15 +250,46 @@ mod tests {
     #[test]
     fn a_zero_column_inheritance_parent_is_still_read_with_only() {
         let m = ItemMeta {
+            kind: "table".into(),
             database: "d".into(),
             schema: "app".into(),
             table: "marker".into(),
             columns: vec![],
             only: true,
+            condition: None,
         };
         assert_eq!(
             copy_out_sql(&m),
             "COPY (SELECT FROM ONLY \"app\".\"marker\") TO STDOUT (FORMAT binary)"
+        );
+    }
+
+    /// An extension configuration table streams the rows matching the condition
+    /// the extension registered, and nothing else: the relation itself is
+    /// recreated by `CREATE EXTENSION` on the destination.
+    #[test]
+    fn extension_config_item_streams_conditioned_rows() {
+        let m = ItemMeta {
+            kind: "extension_config".into(),
+            database: "d".into(),
+            schema: "s".into(),
+            table: "t".into(),
+            columns: vec![],
+            only: false,
+            condition: Some("WHERE k >= 1000".into()),
+        };
+        assert_eq!(
+            copy_out_sql(&m),
+            "COPY (SELECT * FROM \"s\".\"t\" WHERE k >= 1000) TO STDOUT (FORMAT binary)"
+        );
+        // No condition registered: the whole relation is configuration data.
+        let all = ItemMeta {
+            condition: None,
+            ..m
+        };
+        assert_eq!(
+            copy_out_sql(&all),
+            "COPY (SELECT * FROM \"s\".\"t\") TO STDOUT (FORMAT binary)"
         );
     }
 
@@ -233,11 +298,13 @@ mod tests {
     #[test]
     fn an_inheritance_parent_is_read_with_only() {
         let m = ItemMeta {
+            kind: "table".into(),
             database: "d".into(),
             schema: "app".into(),
             table: "log".into(),
             columns: vec!["id".into()],
             only: true,
+            condition: None,
         };
         assert_eq!(
             copy_out_sql(&m),

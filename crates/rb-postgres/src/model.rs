@@ -114,6 +114,12 @@ pub struct PgDatabase {
     #[serde(default)]
     pub acl: Vec<String>,
     pub extensions: Vec<PgExtension>,
+    /// Relations an extension registered with `pg_extension_config_dump`. Their
+    /// matching rows are user data even though the relation belongs to the
+    /// extension (PostGIS `spatial_ref_sys` is the common case), so they are
+    /// streamed and restored while the rest of the extension's tables are not.
+    #[serde(default)]
+    pub extension_configs: Vec<PgExtensionConfig>,
     pub schemas: Vec<PgSchema>,
 }
 
@@ -123,6 +129,21 @@ pub struct PgExtension {
     pub name: String,
     pub version: String,
     pub schema: String,
+}
+
+/// A relation registered through `pg_extension_config_dump`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PgExtensionConfig {
+    pub extension: String,
+    pub schema: String,
+    pub table: String,
+    /// The condition registered with the table, verbatim and including its
+    /// leading `WHERE` (`pg_extension.extcondition`). `None` means the whole
+    /// relation is configuration data.
+    pub condition: Option<String>,
+    /// `relpages * 8192`, for the plan's byte estimate only.
+    #[serde(default)]
+    pub estimated_bytes: i64,
 }
 
 /// A schema (namespace) and its contained objects.
@@ -242,6 +263,9 @@ pub struct PgConstraint {
     pub definition: String,
     /// FK target table (`schema.name`) for restore ordering, when `kind == "f"`.
     pub references: Option<String>,
+    /// `obj_description(oid, 'pg_constraint')`.
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 /// An index (`pg_get_indexdef`-rendered).
@@ -295,6 +319,17 @@ pub struct PgView {
     /// `pg_get_viewdef(oid, true)` — the SELECT body.
     pub definition: String,
     pub materialized: bool,
+    /// `reloptions`: `check_option=cascaded` and `security_barrier=true` on an
+    /// ordinary view, storage parameters such as `fillfactor=70` on a
+    /// materialized one. They are restored state — a view that silently lost
+    /// `WITH CHECK OPTION` accepts writes the source rejected.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// `pg_class.relispopulated`. A materialized view created `WITH NO DATA`
+    /// and never refreshed must stay unpopulated: refreshing it on the
+    /// destination would invent rows the source does not have.
+    #[serde(default = "default_true")]
+    pub populated: bool,
     /// Indexes on a materialized view (an ordinary view cannot carry any). A
     /// unique index here is real restored state, and `REFRESH … CONCURRENTLY`
     /// requires one.
@@ -307,6 +342,12 @@ pub struct PgView {
     pub depends_on: Vec<String>,
     pub acl: Vec<String>,
     pub comment: Option<String>,
+}
+
+/// serde default for fields that are `true` unless a plan says otherwise; an
+/// older plan without the field describes a populated view.
+fn default_true() -> bool {
+    true
 }
 
 /// A function/procedure (`pg_get_functiondef`-rendered).
@@ -384,6 +425,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                     version: "1.3".to_string(),
                     schema: "public".to_string(),
                 }],
+                extension_configs: vec![],
                 schemas: vec![PgSchema {
                     name: "app".to_string(),
                     owner: "app_owner".to_string(),
@@ -426,6 +468,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                             kind: "p".to_string(),
                             definition: "PRIMARY KEY (id)".to_string(),
                             references: None,
+                            comment: None,
                         }],
                         indexes: vec![PgIndex {
                             name: "accounts_email_idx".to_string(),
@@ -471,6 +514,8 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                         owner: "app_owner".to_string(),
                         definition: "SELECT id, email FROM app.accounts;".to_string(),
                         materialized: false,
+                        options: Vec::new(),
+                        populated: true,
                         indexes: vec![],
                         depends_on: vec![],
                         acl: vec![],
@@ -527,5 +572,30 @@ mod tests {
         assert_eq!(back.databases[0].locale_provider, None);
         assert_eq!(back.databases[0].provider_locale, None);
         assert_eq!(back.databases[0].icu_rules, None);
+    }
+
+    /// A plan written before extension configuration tables were captured has no
+    /// `extension_configs` key: it must still deserialize, as an empty list.
+    #[test]
+    fn payload_without_extension_configs_deserializes() {
+        let mut payload = super::test_fixture();
+        payload.databases[0].extension_configs = vec![PgExtensionConfig {
+            extension: "rbtest".to_string(),
+            schema: "public".to_string(),
+            table: "rbtest_cfg".to_string(),
+            condition: Some("WHERE k >= 1000".to_string()),
+            estimated_bytes: 8192,
+        }];
+        let json = serde_json::to_value(&payload).expect("serialize");
+        let back: PgPlanPayload = serde_json::from_value(json.clone()).expect("deserialize");
+        assert_eq!(back, payload, "the new field roundtrips");
+
+        let mut legacy = json;
+        legacy["databases"][0]
+            .as_object_mut()
+            .expect("database object")
+            .remove("extension_configs");
+        let back: PgPlanPayload = serde_json::from_value(legacy).expect("legacy deserialize");
+        assert!(back.databases[0].extension_configs.is_empty());
     }
 }

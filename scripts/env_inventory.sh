@@ -116,8 +116,11 @@ with open(sys.argv[1], encoding="utf-8") as stream:
             continue
         if not in_options:
             continue
+        # A blank line does NOT end an option: clap separates the paragraphs of a
+        # long help with one, and `[env: …]` is printed after the last paragraph.
+        # Flushing here dropped the env var of every option whose help wrapped
+        # into paragraphs — silently, as a shrinking inventory.
         if not line.strip():
-            flush()
             continue
         if re.match(r"^\s{2,8}-", line):
             flush()

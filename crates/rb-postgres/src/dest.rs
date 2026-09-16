@@ -22,8 +22,8 @@ use rb_core::plan::{human_bytes, BackupPlan, Preflight};
 
 use crate::ddl::{build_cluster_ddl, create_database, quote_ident, quote_qualified};
 use crate::model::PgPlanPayload;
-use crate::source::ItemMeta;
-use crate::{PgConnection, PostgresParams};
+use crate::source::{ItemMeta, DATA_ITEM_KINDS};
+use crate::{ExtensionVersionPolicy, PgConnection, PostgresParams};
 
 /// Facts gathered from the destination needed to assess the plan.
 #[derive(Debug, Clone, Default)]
@@ -36,18 +36,23 @@ pub struct DestProbe {
     pub createrole: bool,
     /// Target database names that already exist on the destination.
     pub existing_databases: HashSet<String>,
+    /// `(extension, version)` pairs the destination can install, from
+    /// `pg_available_extension_versions`.
+    pub available_extensions: Vec<(String, String)>,
 }
 
 /// Preflight the plan against the destination (ADMIN connection).
 pub async fn validate(params: &PostgresParams, plan: &BackupPlan) -> Result<Preflight> {
     let payload: PgPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Validate, format!("bad plan payload: {e}")))?;
+    check_item_kinds(plan)?;
     let probe = probe_dest(params, &payload).await?;
     Ok(assess(
         &payload,
         &probe,
         params.overwrite,
         plan.estimated_bytes,
+        params.extension_version,
     ))
 }
 
@@ -57,6 +62,7 @@ pub fn assess(
     probe: &DestProbe,
     overwrite: bool,
     estimated_bytes: u64,
+    extension_version: ExtensionVersionPolicy,
 ) -> Preflight {
     let mut pf = Preflight::pass();
 
@@ -114,6 +120,52 @@ pub fn assess(
         }
     }
 
+    // An extension the destination cannot install fails the restore halfway
+    // through `pre_data`, after roles and databases have been created. The same
+    // is true of a version it does not carry: `CREATE EXTENSION … VERSION '1.0'`
+    // is an error, not a downgrade. Both are decided here, before anything is
+    // written.
+    for db in &payload.databases {
+        for extension in &db.extensions {
+            let exact = probe
+                .available_extensions
+                .iter()
+                .any(|(name, version)| name == &extension.name && version == &extension.version);
+            let any_version: Vec<&str> = probe
+                .available_extensions
+                .iter()
+                .filter(|(name, _)| name == &extension.name)
+                .map(|(_, version)| version.as_str())
+                .collect();
+            let relaxed = extension_version == ExtensionVersionPolicy::Default;
+            let ok = exact || (relaxed && !any_version.is_empty());
+            let detail = if exact {
+                format!(
+                    "extension {} version {} is available",
+                    extension.name, extension.version
+                )
+            } else if ok {
+                format!(
+                    "extension {} version {} is not available; will install the destination's \
+                     default version (--extension-version default)",
+                    extension.name, extension.version
+                )
+            } else {
+                let available = if any_version.is_empty() {
+                    "none".to_string()
+                } else {
+                    any_version.join(", ")
+                };
+                format!(
+                    "extension {} version {} is not available on the destination (available: \
+                     {available}); install it or pass --extension-version default",
+                    extension.name, extension.version
+                )
+            };
+            pf = pf.check(format!("extension:{}", extension.name), ok, detail);
+        }
+    }
+
     // Informational only: free disk is not visible over a SQL connection.
     pf = pf.check(
         "estimated_size",
@@ -153,12 +205,26 @@ async fn probe_dest(params: &PostgresParams, payload: &PgPlanPayload) -> Result<
         .map(|r| r.get::<_, String>(0))
         .collect();
 
+    let available_extensions = conn
+        .client
+        .query(
+            "SELECT name::text, version::text FROM pg_catalog.pg_available_extension_versions \
+             ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Validate, "probe available extensions", e))?
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect();
+
     Ok(DestProbe {
         dest_major: conn.server_major,
         is_super: row.get(0),
         createdb: row.get(1),
         createrole: row.get(2),
         existing_databases: existing,
+        available_extensions,
     })
 }
 
@@ -186,7 +252,7 @@ pub async fn stream_in(
     // run cluster DDL from a database that is not itself being replaced.
     let bootstrap = restore_bootstrap_database(params, &payload);
     let boot = PgConnection::connect(params, &bootstrap).await?;
-    let ddl = build_cluster_ddl(&payload, boot.server_major)?;
+    let ddl = build_cluster_ddl(&payload, boot.server_major, params.extension_version)?;
     run_statements(&boot.client, &ddl.roles).await?;
     if params.overwrite {
         for database in &payload.databases {
@@ -232,7 +298,7 @@ async fn restore_databases(
 
     // 3. Bulk data: one linear pass over the chunk stream, each item routed to a
     //    COPY … FROM STDIN on its database connection.
-    let metas = item_metas(plan);
+    let metas = item_metas(plan)?;
     apply_data(&conns, &metas, src).await?;
 
     // 4. Per-database post_data.
@@ -320,7 +386,7 @@ async fn remove_partially_restored(
 /// Re-introspect every restored database plus the selected cluster-global
 /// objects and compare them with the source plan. Planner estimates and server
 /// version strings are normalized because they are not restored state.
-pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Result<()> {
+pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Result<Vec<String>> {
     let mut expected: PgPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
     let role_names: HashSet<_> = expected
@@ -390,6 +456,11 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     }
     normalize_catalog(&mut expected);
     normalize_catalog(&mut actual);
+    // Under `--extension-version default` the restored version is allowed to
+    // differ from the source's — and only that. Every other extension field
+    // still has to match, so the comparison keeps the name and schema and
+    // reports each substitution as a named deviation rather than hiding it.
+    let deviations = reconcile_extension_versions(&expected, &mut actual, params.extension_version);
     if actual != expected {
         let differences = catalog_differences(&expected, &actual);
         let counted = if differences.len() >= MAX_REPORTED_DIFFERENCES {
@@ -407,7 +478,42 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
             ),
         ));
     }
-    Ok(())
+    Ok(deviations)
+}
+
+/// Accept a different installed extension version under
+/// [`ExtensionVersionPolicy::Default`], and name every substitution.
+///
+/// The version is copied from the expectation into the observation so the
+/// payload comparison that follows still checks everything else about the
+/// extension; each copy produces one `deviation:` line for the operator's
+/// `RESTORE VERIFIED` output.
+fn reconcile_extension_versions(
+    expected: &PgPlanPayload,
+    actual: &mut PgPlanPayload,
+    policy: ExtensionVersionPolicy,
+) -> Vec<String> {
+    let mut deviations = Vec::new();
+    if policy != ExtensionVersionPolicy::Default {
+        return deviations;
+    }
+    for (expected_db, actual_db) in expected.databases.iter().zip(actual.databases.iter_mut()) {
+        for expected_extension in &expected_db.extensions {
+            for actual_extension in actual_db.extensions.iter_mut() {
+                if actual_extension.name != expected_extension.name
+                    || actual_extension.version == expected_extension.version
+                {
+                    continue;
+                }
+                deviations.push(format!(
+                    "deviation: extension {} restored at version {} (source {})",
+                    actual_extension.name, actual_extension.version, expected_extension.version
+                ));
+                actual_extension.version = expected_extension.version.clone();
+            }
+        }
+    }
+    deviations
 }
 
 /// Privilege letters that exist only from the named PostgreSQL major onwards.
@@ -708,6 +814,11 @@ fn compact_json(value: &serde_json::Value) -> String {
 
 fn normalize_catalog(payload: &mut PgPlanPayload) {
     for database in &mut payload.databases {
+        // A planner estimate, not user state: `relpages` differs between two
+        // faithful copies of the same rows.
+        for config in &mut database.extension_configs {
+            config.estimated_bytes = 0;
+        }
         for schema in &mut database.schemas {
             for table in &mut schema.tables {
                 table.estimated_rows = 0;
@@ -849,17 +960,49 @@ async fn reallow_connections(client: &Client, name: &str) {
     }
 }
 
-/// Map `item.id` → its COPY descriptor (table-kind items only).
-fn item_metas(plan: &BackupPlan) -> HashMap<u32, ItemMeta> {
-    plan.items
+/// Reject a plan carrying an item kind this build cannot restore. A newer
+/// source may emit kinds an older destination has never heard of; silently
+/// skipping them would restore a database missing exactly the data the new kind
+/// was added to carry, and certify it as verified (I-FAILCLOSED).
+fn check_item_kinds(plan: &BackupPlan) -> Result<()> {
+    for item in &plan.items {
+        if !DATA_ITEM_KINDS.contains(&item.kind.as_str()) {
+            return Err(BackupError::PlanRejected(format!(
+                "unknown postgres item kind {}",
+                item.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Map `item.id` → its COPY descriptor (data-bearing items only).
+fn item_metas(plan: &BackupPlan) -> Result<HashMap<u32, ItemMeta>> {
+    check_item_kinds(plan)?;
+    Ok(plan
+        .items
         .iter()
-        .filter(|i| i.kind == "table")
         .filter_map(|i| {
             serde_json::from_value::<ItemMeta>(i.meta.clone())
                 .ok()
                 .map(|m| (i.id, m))
         })
-        .collect()
+        .collect())
+}
+
+/// Statement to run on the destination right before an item's `COPY … FROM
+/// STDIN`. `CREATE EXTENSION` has already inserted the extension's own rows
+/// into a configuration table, so the source's rows are loaded over a cleared
+/// scope — the same scope the source streamed — instead of on top of them.
+fn pre_copy_sql(meta: &ItemMeta) -> Option<String> {
+    if meta.kind != "extension_config" {
+        return None;
+    }
+    let qual = quote_qualified(&meta.schema, &meta.table);
+    Some(match meta.condition.as_deref() {
+        Some(condition) => format!("DELETE FROM {qual} {condition}"),
+        None => format!("TRUNCATE {qual}"),
+    })
 }
 
 async fn run_statements(client: &Client, stmts: &[String]) -> Result<()> {
@@ -927,6 +1070,11 @@ async fn apply_data(
                             format!("no connection for database '{}'", meta.database),
                         )
                     })?;
+                    if let Some(sql) = pre_copy_sql(meta) {
+                        conn.client.batch_execute(&sql).await.map_err(|e| {
+                            BackupError::phase_src(Phase::Apply, format!("pre-copy: {sql}"), e)
+                        })?;
+                    }
                     let sql = copy_in_sql(meta);
                     let sink = conn.client.copy_in::<_, Bytes>(&sql).await.map_err(|e| {
                         BackupError::phase_src(
@@ -991,6 +1139,9 @@ mod tests {
             createdb,
             createrole,
             existing_databases: HashSet::new(),
+            // The shared fixture installs pgcrypto 1.3; a probe that did not
+            // offer it would fail the extension check of every assess test.
+            available_extensions: vec![("pgcrypto".to_string(), "1.3".to_string())],
         }
     }
 
@@ -1006,6 +1157,7 @@ mod tests {
             sslrootcert: None,
             admin: true,
             overwrite: true,
+            extension_version: ExtensionVersionPolicy::Source,
         }
     }
 
@@ -1044,7 +1196,13 @@ mod tests {
     #[test]
     fn passes_on_clean_destination() {
         let payload = crate::model::test_fixture(); // source major 16, db "appdb"
-        let pf = assess(&payload, &probe(16, false, true, true), false, 1024);
+        let pf = assess(
+            &payload,
+            &probe(16, false, true, true),
+            false,
+            1024,
+            ExtensionVersionPolicy::Source,
+        );
         assert!(
             pf.ok,
             "clean newer destination should pass: {:?}",
@@ -1059,7 +1217,13 @@ mod tests {
     #[test]
     fn fails_when_destination_older() {
         let payload = crate::model::test_fixture();
-        let pf = assess(&payload, &probe(15, true, true, true), false, 0);
+        let pf = assess(
+            &payload,
+            &probe(15, true, true, true),
+            false,
+            0,
+            ExtensionVersionPolicy::Source,
+        );
         assert!(!pf.ok);
         assert!(pf
             .checks
@@ -1073,7 +1237,13 @@ mod tests {
         payload.databases[0].locale_provider = Some(crate::model::PgLocaleProvider::Icu);
         payload.databases[0].provider_locale = None;
 
-        let pf = assess(&payload, &probe(16, true, true, true), false, 0);
+        let pf = assess(
+            &payload,
+            &probe(16, true, true, true),
+            false,
+            0,
+            ExtensionVersionPolicy::Source,
+        );
         assert!(!pf.ok);
         assert!(pf
             .checks
@@ -1085,14 +1255,26 @@ mod tests {
     fn fails_without_creation_privileges() {
         let payload = crate::model::test_fixture();
         // not super, missing CREATEROLE
-        let pf = assess(&payload, &probe(16, false, true, false), false, 0);
+        let pf = assess(
+            &payload,
+            &probe(16, false, true, false),
+            false,
+            0,
+            ExtensionVersionPolicy::Source,
+        );
         assert!(!pf.ok);
         assert!(pf
             .checks
             .iter()
             .any(|c| c.name == "privileges" && !c.passed));
         // superuser alone suffices.
-        let pf2 = assess(&payload, &probe(16, true, false, false), false, 0);
+        let pf2 = assess(
+            &payload,
+            &probe(16, true, false, false),
+            false,
+            0,
+            ExtensionVersionPolicy::Source,
+        );
         assert!(pf2
             .checks
             .iter()
@@ -1254,14 +1436,109 @@ mod tests {
         );
     }
 
+    /// `CREATE EXTENSION … VERSION '1.0'` on a destination that only ships 1.1
+    /// is an error, and it happens after roles and databases already exist. The
+    /// preflight decides it instead, and names what the destination does have.
+    #[test]
+    fn assess_refuses_missing_extension_version() {
+        let payload = crate::model::test_fixture();
+        let mut dest = probe(16, true, true, true);
+        dest.available_extensions = vec![("pgcrypto".to_string(), "1.4".to_string())];
+
+        let pf = assess(&payload, &dest, false, 0, ExtensionVersionPolicy::Source);
+        let check = pf
+            .checks
+            .iter()
+            .find(|c| c.name == "extension:pgcrypto")
+            .expect("the extension is checked");
+        assert!(!check.passed, "1.3 is not available");
+        assert!(
+            check.detail.contains("available: 1.4")
+                && check.detail.contains("--extension-version default"),
+            "{}",
+            check.detail
+        );
+        assert!(!pf.ok, "the plan is refused");
+
+        // An extension the destination does not carry at all reports `none`.
+        dest.available_extensions.clear();
+        let pf = assess(&payload, &dest, false, 0, ExtensionVersionPolicy::Source);
+        let check = pf
+            .checks
+            .iter()
+            .find(|c| c.name == "extension:pgcrypto")
+            .expect("the extension is checked");
+        assert!(check.detail.contains("available: none"), "{}", check.detail);
+    }
+
+    /// Under `--extension-version default` a different available version passes,
+    /// and the check says which version will be installed instead.
+    #[test]
+    fn assess_accepts_default_policy_with_note() {
+        let payload = crate::model::test_fixture();
+        let mut dest = probe(16, true, true, true);
+        dest.available_extensions = vec![("pgcrypto".to_string(), "1.4".to_string())];
+
+        let pf = assess(&payload, &dest, false, 0, ExtensionVersionPolicy::Default);
+        let check = pf
+            .checks
+            .iter()
+            .find(|c| c.name == "extension:pgcrypto")
+            .expect("the extension is checked");
+        assert!(check.passed, "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("will install the destination's default version"),
+            "{}",
+            check.detail
+        );
+        assert!(pf.ok, "the plan passes preflight");
+
+        // The policy relaxes the version, never the extension itself.
+        dest.available_extensions.clear();
+        let pf = assess(&payload, &dest, false, 0, ExtensionVersionPolicy::Default);
+        assert!(!pf.ok, "a missing extension is still refused");
+    }
+
+    /// The version substitution is reported, not hidden: the read-back accepts
+    /// the installed version and the operator sees one `deviation:` line.
+    #[test]
+    fn a_substituted_extension_version_is_reported_as_a_deviation() {
+        let expected = crate::model::test_fixture();
+        let mut actual = expected.clone();
+        actual.databases[0].extensions[0].version = "1.4".to_string();
+
+        // Under the default policy the versions must match exactly: nothing is
+        // reconciled, so the payload comparison still sees the difference.
+        let mut untouched = actual.clone();
+        assert!(reconcile_extension_versions(
+            &expected,
+            &mut untouched,
+            ExtensionVersionPolicy::Source
+        )
+        .is_empty());
+        assert_ne!(untouched, expected);
+
+        let deviations =
+            reconcile_extension_versions(&expected, &mut actual, ExtensionVersionPolicy::Default);
+        assert_eq!(
+            deviations,
+            vec!["deviation: extension pgcrypto restored at version 1.4 (source 1.3)".to_string()]
+        );
+        assert_eq!(actual, expected, "only the version is reconciled");
+    }
+
     #[test]
     fn copy_in_sql_mirrors_copy_out() {
         let m = ItemMeta {
+            kind: "table".into(),
             database: "appdb".into(),
             schema: "app".into(),
             table: "accounts".into(),
             columns: vec!["id".into(), "email".into()],
             only: false,
+            condition: None,
         };
         assert_eq!(
             copy_in_sql(&m),
@@ -1277,11 +1554,86 @@ mod tests {
         );
     }
 
+    /// The destination clears the scope the source streamed before loading it:
+    /// `CREATE EXTENSION` has already inserted the extension's own rows into the
+    /// configuration table, and they are not the source's rows.
+    #[test]
+    fn extension_config_destination_deletes_matching_rows_before_copy() {
+        let m = ItemMeta {
+            kind: "extension_config".into(),
+            database: "appdb".into(),
+            schema: "public".into(),
+            table: "rbtest_cfg".into(),
+            columns: vec![],
+            only: false,
+            condition: Some("WHERE k >= 1000".into()),
+        };
+        assert_eq!(
+            pre_copy_sql(&m).as_deref(),
+            Some("DELETE FROM \"public\".\"rbtest_cfg\" WHERE k >= 1000")
+        );
+        assert_eq!(
+            copy_in_sql(&m),
+            "COPY \"public\".\"rbtest_cfg\" FROM STDIN (FORMAT binary)"
+        );
+        // An ordinary table is loaded into a database that was just created, so
+        // there is nothing to clear.
+        let table = ItemMeta {
+            kind: "table".into(),
+            ..m
+        };
+        assert_eq!(pre_copy_sql(&table), None);
+    }
+
+    /// With no registered condition the whole relation is configuration data,
+    /// so the whole relation is cleared.
+    #[test]
+    fn extension_config_without_condition_truncates() {
+        let m = ItemMeta {
+            kind: "extension_config".into(),
+            database: "appdb".into(),
+            schema: "public".into(),
+            table: "spatial_ref_sys".into(),
+            columns: vec![],
+            only: false,
+            condition: None,
+        };
+        assert_eq!(
+            pre_copy_sql(&m).as_deref(),
+            Some("TRUNCATE \"public\".\"spatial_ref_sys\"")
+        );
+    }
+
+    /// A newer source may plan an item kind this build cannot restore. Skipping
+    /// it would produce a database missing exactly that data and still report a
+    /// verified restore, so both preflight and the data pass refuse the plan.
+    #[test]
+    fn unknown_item_kind_is_rejected_at_validate_and_apply() {
+        let payload = crate::model::test_fixture();
+        let mut plan = crate::introspect::build_plan(&payload, "t".to_string());
+        plan.items[0].kind = "large_object".to_string();
+
+        // The check `validate` runs before probing the destination.
+        let err = check_item_kinds(&plan).expect_err("unknown kind");
+        assert!(
+            matches!(&err, BackupError::PlanRejected(m) if m == "unknown postgres item kind large_object"),
+            "unexpected error: {err}"
+        );
+        // The same check on the apply path, so an older binary handed the plan
+        // by a peer that skipped preflight still refuses it.
+        let err = item_metas(&plan).expect_err("unknown kind");
+        assert!(matches!(err, BackupError::PlanRejected(_)), "{err}");
+
+        // Both kinds this build does restore are accepted.
+        plan.items[0].kind = "extension_config".to_string();
+        check_item_kinds(&plan).expect("extension_config is restorable");
+    }
+
     #[test]
     fn item_metas_indexes_table_items_by_id() {
         let payload = crate::model::test_fixture();
         let bp = crate::introspect::build_plan(&payload, "t".to_string());
-        let metas = item_metas(&bp);
+        let metas = item_metas(&bp).expect("known item kinds");
         assert_eq!(metas.len(), 1);
         let m = metas.get(&0).expect("item 0");
         assert_eq!(m.database, "appdb");
@@ -1296,14 +1648,14 @@ mod tests {
         let mut p = probe(16, true, true, true);
         p.existing_databases.insert("appdb".to_string());
 
-        let blocked = assess(&payload, &p, false, 0);
+        let blocked = assess(&payload, &p, false, 0, ExtensionVersionPolicy::Source);
         assert!(!blocked.ok, "existing db must block without --overwrite");
         assert!(blocked
             .checks
             .iter()
             .any(|c| c.name == "database:appdb" && !c.passed));
 
-        let allowed = assess(&payload, &p, true, 0);
+        let allowed = assess(&payload, &p, true, 0, ExtensionVersionPolicy::Source);
         assert!(
             allowed.ok,
             "--overwrite must allow restoring over existing db"

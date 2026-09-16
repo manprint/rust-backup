@@ -314,6 +314,35 @@ docker run --rm --network host \
   --host 127.0.0.1 --port 55432 --user postgres --admin --yes
 ```
 
+Extensions are restored at the version the source runs, and the rows an
+extension registered as configuration data travel with them — a custom PostGIS
+`spatial_ref_sys` entry or a tuned configuration table arrives on the
+destination instead of being replaced by whatever `CREATE EXTENSION` inserts.
+
+A destination that does not carry that exact version is refused before anything
+is written:
+
+```text
+extension postgis version 3.4.4 is not available on the destination
+(available: 3.5.3); install it or pass --extension-version default
+```
+
+Install the missing version, or accept the destination's own:
+
+```bash
+RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
+  --to coordinator.example:7835 --channel pg-prod --secret-file /run/secrets/rb \
+  --host pg-destination.internal --port 5432 --user postgres \
+  --database postgres --sslmode require --admin --yes \
+  --extension-version default
+```
+
+The restore then reports what it substituted on its verified line —
+`deviation: extension postgis restored at version 3.5.3 (source 3.4.4)` — so the
+difference is recorded rather than silent. The same choice is available as
+`RUST_BACKUP_EXTENSION_VERSION`, and its default, `source`, is the refusal
+above. An extension the destination does not have at all is always refused.
+
 Use `-P sslrootcert=/run/secrets/postgres-ca.pem` for a private CA. See
 [PostgreSQL fidelity and privileges](docs/modules/POSTGRES.md).
 
@@ -413,6 +442,8 @@ sudo -n "$PWD/e2e/bandwidth_netem.sh"
 bash e2e/postgres_introspect.sh 16
 bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18
 bash e2e/postgres_matrix.sh 10:18 12:16 14:17 16:18
+# The same matrix on PostGIS images, which adds the spatial rows.
+RB_PG_IMAGE_REPO=postgis/postgis bash e2e/postgres_matrix.sh 16 12:16
 
 # MongoDB same-major and cross-major restores.
 bash e2e/mongodb_matrix.sh 4 5 6 7 8

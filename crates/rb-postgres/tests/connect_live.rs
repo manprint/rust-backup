@@ -5,7 +5,7 @@
 //! the honest pattern for an optional-DB test — the pure-logic coverage lives in
 //! the `connect` unit tests (`parse_major`, sslmode gate), which always run.
 
-use rb_postgres::{PgConnection, PostgresParams, MIN_PG_MAJOR};
+use rb_postgres::{ExtensionVersionPolicy, PgConnection, PostgresParams, MIN_PG_MAJOR};
 
 fn params_from_env() -> Option<PostgresParams> {
     let host = std::env::var("RUST_BACKUP_PG_HOST").ok()?;
@@ -23,6 +23,7 @@ fn params_from_env() -> Option<PostgresParams> {
         sslrootcert: None,
         admin: false,
         overwrite: false,
+        extension_version: ExtensionVersionPolicy::Source,
     })
 }
 

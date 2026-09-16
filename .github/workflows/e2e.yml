@@ -80,7 +80,7 @@ jobs:
   postgres:
     name: PostgreSQL ${{ matrix.version }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +104,7 @@ jobs:
   postgres-cross-version:
     name: PostgreSQL ${{ matrix.pair }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +121,64 @@ jobs:
             ~/.cargo/git/db
             target/release
           key: ${{ runner.os }}-${{ runner.arch }}-e2e-pg-cross-${{ matrix.pair }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_PAIR: ${{ matrix.pair }}
+        run: bash e2e/postgres_matrix.sh "$DATABASE_PAIR"
+
+  # The same matrix on PostGIS images: it is the only configuration that
+  # exercises the M-PG-GIS-* rows, an extension that owns rules and a relation
+  # registered with pg_extension_config_dump (spatial_ref_sys).
+  postgres-postgis:
+    name: PostGIS ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [10, 11, 12, 13, 14, 15, 16, 17, 18]
+    env:
+      RB_PG_IMAGE_REPO: postgis/postgis
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-gis-${{ matrix.version }}-${{ hashFiles('Cargo.lock') }}
+      - env:
+          DATABASE_VERSION: ${{ matrix.version }}
+        run: bash e2e/postgres_matrix.sh "$DATABASE_VERSION"
+
+  # A cross-major PostGIS pair also ships two PostGIS versions, which is what
+  # M-PG-GIS-06 asserts (refused without --extension-version default, restored
+  # with it and the substitution reported).
+  postgres-postgis-cross-version:
+    name: PostGIS ${{ matrix.pair }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: ['12:16']
+    env:
+      RB_PG_IMAGE_REPO: postgis/postgis
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-gis-cross-${{ matrix.pair }}-${{ hashFiles('Cargo.lock') }}
       - env:
           DATABASE_PAIR: ${{ matrix.pair }}
         run: bash e2e/postgres_matrix.sh "$DATABASE_PAIR"

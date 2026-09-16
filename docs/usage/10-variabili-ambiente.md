@@ -83,6 +83,7 @@ vince sul default compilato nel programma.
 | `RUST_BACKUP_SECRET_KEY` | `--secret-key` | s3 |
 | `RUST_BACKUP_PATH_STYLE` | `--path-style` | s3 |
 | `RUST_BACKUP_OVERWRITE` | `--overwrite` | postgres, mongodb, s3 (destinazione) |
+| `RUST_BACKUP_EXTENSION_VERSION` | `--extension-version` | postgres (destinazione) |
 
 I parametri senza flag dedicato (`sslrootcert`, `allow_unsupported_objects`,
 `allow_skipped_namespaces`, `create_bucket`, `preserve_ownership`) **non** hanno

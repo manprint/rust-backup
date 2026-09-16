@@ -32,6 +32,26 @@ use rb_core::module::{BackupModule, Destination, Source, TargetParams};
 use rb_core::plan::{BackupPlan, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 
+/// What to install when the destination cannot provide the exact version of an
+/// extension the source has.
+///
+/// An extension's version is part of what it *does* — a newer one can add a
+/// function the restored data depends on, an older one can lack it — so
+/// installing a different version silently is a change of behaviour the catalog
+/// read-back would also have to accept. The choice is therefore explicit: refuse
+/// (the default), or accept the destination's default version and say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionVersionPolicy {
+    /// Install the source's exact version; refuse the plan when the destination
+    /// does not have it.
+    #[default]
+    Source,
+    /// Install whatever version the destination defaults to, and record the
+    /// difference as a deviation in the verification report.
+    Default,
+}
+
 /// PostgreSQL connection parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresParams {
@@ -69,6 +89,12 @@ pub struct PostgresParams {
     /// Without it, preflight fails when a target database is present.
     #[serde(default)]
     pub overwrite: bool,
+
+    /// Destination-only: which version of each source extension to install.
+    /// Defaults to the source's exact version, which is refused at preflight
+    /// when the destination does not carry it.
+    #[serde(default)]
+    pub extension_version: ExtensionVersionPolicy,
 
     /// Source-only: proceed even though the cluster holds object classes this
     /// build cannot reproduce (triggers, row-level security policies,
@@ -174,7 +200,7 @@ impl Destination for PostgresDestination {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport> {
-        dest::verify_catalog(&self.params, plan).await?;
+        let deviations = dest::verify_catalog(&self.params, plan).await?;
         let mut verifier = VerificationSink::new(evidence);
         source::stream_out(&self.params, plan, &mut verifier)
             .await
@@ -186,7 +212,16 @@ impl Destination for PostgresDestination {
                 )
             })?;
         verifier.finish().await?;
-        verifier.report("PostgreSQL catalog and deterministic binary COPY read-back match")
+        let mut detail =
+            "PostgreSQL catalog and deterministic binary COPY read-back match".to_string();
+        // A deviation is not a failure, but it must reach the operator's
+        // `RESTORE VERIFIED` line: the destination is 1:1 with the source
+        // *except* for what is named here.
+        for deviation in &deviations {
+            detail.push_str("; ");
+            detail.push_str(deviation);
+        }
+        verifier.report(detail)
     }
 }
 

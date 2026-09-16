@@ -447,7 +447,14 @@ SELECT 'con', n.nspname || '.' || rel.relname || '.' || con.conname,
   FROM pg_constraint con
   JOIN pg_class rel ON rel.oid = con.conrelid
   JOIN pg_namespace n ON n.oid = rel.relnamespace
- WHERE n.nspname NOT IN ('pg_catalog', 'information_schema');
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+   -- A foreign key on a partitioned table is cloned into every partition by the
+   -- server, which also chooses the clone's name: PostgreSQL 16 derives it from
+   -- the child table, 18 from the parent constraint. The clone is implied by the
+   -- constraint that is compared, so comparing its server-chosen name would fail
+   -- a faithful cross-major restore. `conparentid` is PostgreSQL 11+, hence the
+   -- `to_jsonb` probe instead of a direct column reference.
+   AND coalesce(to_jsonb(con) ->> 'conparentid', '0') = '0';
 SELECT 'idx', schemaname || '.' || indexname, indexdef
   FROM pg_indexes
  WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
@@ -462,11 +469,15 @@ SQL
 }
 
 # I-IMMUT evidence from the server's own log: every statement the source role
-# issued must be a read. Extended-protocol statements are logged as
+# issued must be a read. `since` (any timestamp `docker logs --since` accepts)
+# narrows the window to one run, which matters while the source still connects
+# as the same superuser the harness itself uses to seed the fixtures. Extended-protocol statements are logged as
 # `execute <name>: <sql>`; continuation lines of a multi-line statement carry no
 # prefix and are therefore not re-checked.
-rb_pg_assert_readonly_log() { # container user
-  local container=$1 user=$2 statement checked=0 offenders=0
+rb_pg_assert_readonly_log() { # container user [since]
+  local container=$1 user=$2 since=${3:-} statement checked=0 offenders=0
+  local -a log_args=()
+  [[ -n $since ]] && log_args+=(--since "$since")
   while IFS= read -r statement; do
     checked=$((checked + 1))
     if ! printf '%s\n' "$statement" | grep -Eq \
@@ -474,10 +485,20 @@ rb_pg_assert_readonly_log() { # container user
       echo "FAIL: non-read statement from $user: $statement" >&2
       offenders=$((offenders + 1))
     fi
-  done < <(docker logs "$container" 2>&1 \
-    | grep -E "^${user}@[^|]*\|" \
+    # A multi-line statement is logged as one prefixed line plus continuation
+    # lines carrying no prefix (PostGIS registers `spatial_ref_sys` with a
+    # multi-line condition, so the source's own COPY spans four log lines).
+    # Rejoining them first is what keeps `… TO STDOUT` on the same line as the
+    # `COPY` that opens it — otherwise every wrapped read looks like a write.
+  done < <(docker logs "${log_args[@]}" "$container" 2>&1 \
+    | awk '
+        $0 ~ /^[^|]*@[^|]*\|[0-9]/ { if (line != "") print line; line = $0; next }
+        { if (line != "") line = line " " $0 }
+        END { if (line != "") print line }' \
+    | grep -E "$(printf '^%s@[^|]*\\|' "$user")" \
     | grep -E 'statement: |execute [^:]*: ' \
-    | sed -E 's/^.*(statement: |execute [^:]*: )//')
+    | sed -E 's/^.*(statement: |execute [^:]*: )//' \
+    | sed -E 's/[[:space:]]+/ /g')
   if (( offenders > 0 )); then
     echo "FAIL: $offenders non-read statements from $user" >&2
     return 1

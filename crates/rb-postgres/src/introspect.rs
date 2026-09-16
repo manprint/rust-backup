@@ -52,6 +52,7 @@ pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload
     for db in &mut databases {
         let conn = PgConnection::connect_read_only(params, &db.name).await?;
         db.extensions = gather_extensions(&conn.client).await?;
+        db.extension_configs = gather_extension_configs(&conn.client).await?;
         db.schemas = gather_schemas(&conn.client, server_major).await?;
         let unsupported = find_unsupported_objects(&conn.client, &db.name, server_major).await?;
         report_unsupported(unsupported, params.allow_unsupported_objects)?;
@@ -233,6 +234,7 @@ async fn gather_databases_meta(
                 config: r.get::<_, Option<Vec<String>>>(13).unwrap_or_default(),
                 acl: r.get::<_, Option<Vec<String>>>(14).unwrap_or_default(),
                 extensions: Vec::new(),
+                extension_configs: Vec::new(),
                 schemas: Vec::new(),
             })
         })
@@ -258,6 +260,37 @@ async fn gather_extensions(client: &Client) -> Result<Vec<PgExtension>> {
             name: r.get(0),
             version: r.get(1),
             schema: r.get(2),
+        })
+        .collect())
+}
+
+/// Relations registered with `pg_extension_config_dump`. `pg_dump` copies the
+/// rows of these relations that match the registered condition; everything else
+/// the extension owns is recreated by `CREATE EXTENSION`. Skipping them loses
+/// real user data — a custom PostGIS `spatial_ref_sys` row, a tuned
+/// configuration table — with nothing in the catalog read-back to notice.
+async fn gather_extension_configs(client: &Client) -> Result<Vec<PgExtensionConfig>> {
+    let rows = client
+        .query(
+            "SELECT e.extname::text, n.nspname::text, c.relname::text, \
+                    nullif(u.cond, '')::text, (c.relpages::int8 * 8192) \
+             FROM pg_catalog.pg_extension e \
+             CROSS JOIN LATERAL unnest(e.extconfig, e.extcondition) AS u(reloid, cond) \
+             JOIN pg_catalog.pg_class c ON c.oid = u.reloid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             ORDER BY 1, 2, 3",
+            &[],
+        )
+        .await
+        .map_err(|e| analyze_err("extension configuration tables", e))?;
+    Ok(rows
+        .iter()
+        .map(|r| PgExtensionConfig {
+            extension: r.get(0),
+            schema: r.get(1),
+            table: r.get(2),
+            condition: r.get(3),
+            estimated_bytes: r.get(4),
         })
         .collect())
 }
@@ -460,7 +493,8 @@ const CONSTRAINTS_QUERY: &str = "SELECT con.conrelid::int8, con.conname::text, c
                  (SELECT (fn.nspname || '.' || fc.relname)::text \
                   FROM pg_catalog.pg_class fc \
                   JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace \
-                  WHERE fc.oid = con.confrelid) END \
+                  WHERE fc.oid = con.confrelid) END, \
+            pg_catalog.obj_description(con.oid, 'pg_constraint')::text \
      FROM pg_catalog.pg_constraint con \
      JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -483,6 +517,7 @@ async fn gather_constraints(client: &Client) -> Result<HashMap<i64, Vec<PgConstr
             kind: r.get(2),
             definition: r.get(3),
             references: r.get(4),
+            comment: r.get(5),
         });
     }
     Ok(map)
@@ -641,7 +676,7 @@ async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
                        AND dep.refclassid = 'pg_class'::regclass \
                        AND rw.ev_class = c.oid AND sc.oid <> c.oid \
                        AND sc.relkind IN ('v', 'm')), \
-                    c.oid::int8 \
+                    c.oid::int8, c.reloptions::text[], c.relispopulated \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('v', 'm') \
@@ -663,6 +698,8 @@ async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
                 owner: r.get(2),
                 definition: r.get(3),
                 materialized: r.get(4),
+                options: r.get::<_, Option<Vec<String>>>(9).unwrap_or_default(),
+                populated: r.get(10),
                 indexes: Vec::new(),
                 depends_on: r.get::<_, Option<Vec<String>>>(7).unwrap_or_default(),
                 acl: r.get::<_, Option<Vec<String>>>(5).unwrap_or_default(),
@@ -740,8 +777,41 @@ async fn find_unsupported_objects(
     database: &str,
     major: u32,
 ) -> Result<Vec<UnsupportedClass>> {
+    let mut found = Vec::new();
+    for (what, sql) in unsupported_probes(major) {
+        let rows = client
+            .query(&format!("{sql} ORDER BY 1"), &[])
+            .await
+            .map_err(|e| analyze_err(&format!("probe {what} in {database}"), e))?;
+        if rows.is_empty() {
+            continue;
+        }
+        found.push(UnsupportedClass {
+            what,
+            names: rows
+                .iter()
+                .take(MAX_REPORTED)
+                .map(|r| r.get::<_, String>(0))
+                .collect(),
+            total: rows.len(),
+        });
+    }
+    Ok(found)
+}
+
+/// The probe table, pure so its shape is unit-testable without a server.
+fn unsupported_probes(major: u32) -> Vec<(&'static str, &'static str)> {
     // `(what, name expression, from/where clause)`. The name expression is
     // `text`; the query is wrapped so every probe shares one code path.
+    //
+    // Every probe ignores objects an extension owns (`pg_depend.deptype = 'e'`).
+    // The refusal exists for objects this build would have to carry itself and
+    // cannot: an extension-owned one is recreated verbatim on the destination by
+    // the same `CREATE EXTENSION`, so nothing is lost. PostGIS alone brings
+    // three rules on `public.geometry_columns`, which would otherwise make every
+    // PostGIS cluster unbackupable. A rule, a trigger and a policy carry no
+    // extension edge of their own — `pg_depend` records only their auto
+    // dependency on the relation — so those probes test the *relation* too.
     let mut probes: Vec<(&'static str, &'static str)> = vec![
         (
             "triggers",
@@ -750,7 +820,13 @@ async fn find_unsupported_objects(
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE NOT t.tgisinternal \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_trigger'::regclass \
+                                    AND d.objid = t.oid AND d.deptype = 'e') \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_class'::regclass \
+                                    AND d.objid = c.oid AND d.deptype = 'e')",
         ),
         (
             "row-level security policies",
@@ -758,7 +834,13 @@ async fn find_unsupported_objects(
              FROM pg_catalog.pg_policy p \
              JOIN pg_catalog.pg_class c ON c.oid = p.polrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+             WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_policy'::regclass \
+                                    AND d.objid = p.oid AND d.deptype = 'e') \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_class'::regclass \
+                                    AND d.objid = c.oid AND d.deptype = 'e')",
         ),
         (
             "tables with row-level security enabled",
@@ -766,7 +848,10 @@ async fn find_unsupported_objects(
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE (c.relrowsecurity OR c.relforcerowsecurity) \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_class'::regclass \
+                                    AND d.objid = c.oid AND d.deptype = 'e')",
         ),
         (
             "user-defined types (enum, domain, composite or range)",
@@ -797,15 +882,10 @@ async fn find_unsupported_objects(
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'f' \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
-        ),
-        (
-            "view options such as WITH CHECK OPTION or security_barrier",
-            "SELECT (n.nspname || '.' || c.relname)::text \
-             FROM pg_catalog.pg_class c \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('v', 'm') AND c.reloptions IS NOT NULL \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_class'::regclass \
+                                    AND d.objid = c.oid AND d.deptype = 'e')",
         ),
         (
             "column-level privileges",
@@ -859,7 +939,13 @@ async fn find_unsupported_objects(
              JOIN pg_catalog.pg_class c ON c.oid = r.ev_class \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE r.rulename <> '_RETURN' \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'",
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_rewrite'::regclass \
+                                    AND d.objid = r.oid AND d.deptype = 'e') \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_class'::regclass \
+                                    AND d.objid = c.oid AND d.deptype = 'e')",
         ),
         (
             "reg* columns, whose binary COPY representation is a raw OID that \
@@ -876,7 +962,10 @@ async fn find_unsupported_objects(
         ),
         (
             "logical-replication publications",
-            "SELECT p.pubname::text FROM pg_catalog.pg_publication p",
+            "SELECT p.pubname::text FROM pg_catalog.pg_publication p \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_publication'::regclass \
+                                    AND d.objid = p.oid AND d.deptype = 'e')",
         ),
         (
             "logical-replication subscriptions",
@@ -886,7 +975,10 @@ async fn find_unsupported_objects(
         ),
         (
             "event triggers",
-            "SELECT e.evtname::text FROM pg_catalog.pg_event_trigger e",
+            "SELECT e.evtname::text FROM pg_catalog.pg_event_trigger e \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                  WHERE d.classid = 'pg_event_trigger'::regclass \
+                                    AND d.objid = e.oid AND d.deptype = 'e')",
         ),
         (
             "identifiers containing a dot, which this build's qualified \
@@ -918,10 +1010,29 @@ async fn find_unsupported_objects(
     // named, validated* constraint without the read-back noticing: an
     // operator-chosen constraint name, and a NOT VALID not-null constraint
     // (which does not actually forbid existing NULLs).
+    //
+    // The name test is an exact comparison with the name the server would
+    // choose itself (`<table>_<column>_not_null`, truncated to 63 characters),
+    // not a suffix test: `ALTER TABLE t ADD CONSTRAINT other_not_null NOT NULL
+    // id` ends in `_not_null` too and would otherwise be rebuilt under a
+    // different name.
     if major >= 18 {
         probes.push((
             "NOT NULL constraints that are named or NOT VALID (PostgreSQL 18+)",
-            "SELECT (n.nspname || '.' || c.relname || '.' || co.conname                      || CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END)::text              FROM pg_catalog.pg_constraint co              JOIN pg_catalog.pg_class c ON c.oid = co.conrelid              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace              WHERE co.contype = 'n' AND co.conislocal                AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_'                AND (NOT co.convalidated OR co.conname !~ '_not_null$')",
+            "SELECT (n.nspname || '.' || c.relname || '.' || co.conname \
+                     || CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END)::text \
+             FROM pg_catalog.pg_constraint co \
+             JOIN pg_catalog.pg_class c ON c.oid = co.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE co.contype = 'n' AND co.conislocal \
+               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+               AND (NOT co.convalidated \
+                    OR co.conname IS DISTINCT FROM \
+                       left(c.relname || '_' \
+                            || (SELECT a.attname FROM pg_catalog.pg_attribute a \
+                                 WHERE a.attrelid = co.conrelid \
+                                   AND a.attnum = co.conkey[1]) \
+                            || '_not_null', 63))",
         ));
     }
     // `prokind` is PostgreSQL 11+; on 10 the same split lives in two booleans.
@@ -940,26 +1051,7 @@ async fn find_unsupported_objects(
         }
     }
 
-    let mut found = Vec::new();
-    for (what, sql) in probes {
-        let rows = client
-            .query(&format!("{sql} ORDER BY 1"), &[])
-            .await
-            .map_err(|e| analyze_err(&format!("probe {what} in {database}"), e))?;
-        if rows.is_empty() {
-            continue;
-        }
-        found.push(UnsupportedClass {
-            what,
-            names: rows
-                .iter()
-                .take(MAX_REPORTED)
-                .map(|r| r.get::<_, String>(0))
-                .collect(),
-            total: rows.len(),
-        });
-    }
-    Ok(found)
+    probes
 }
 
 /// Turn the probe result into a refusal, or a loud warning when the operator has
@@ -1051,6 +1143,7 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                     name: format!("{}.{}.{}", db.name, table.schema, table.name),
                     estimated_bytes: bytes,
                     meta: serde_json::json!({
+                        "kind": "table",
                         "database": db.name,
                         "schema": table.schema,
                         "table": table.name,
@@ -1059,6 +1152,30 @@ pub fn build_plan(payload: &PgPlanPayload, created_at: String) -> BackupPlan {
                     }),
                 });
             }
+        }
+        // Extension configuration tables are items of their own: their rows are
+        // user data, the relation itself is created by `CREATE EXTENSION`.
+        for config in &db.extension_configs {
+            let bytes = config.estimated_bytes.max(0) as u64;
+            total = total.saturating_add(bytes);
+            let id = items.len() as u32;
+            items.push(PlanItem {
+                id,
+                ordinal: id,
+                kind: "extension_config".to_string(),
+                name: format!("{}.{}.{}", db.name, config.schema, config.table),
+                estimated_bytes: bytes,
+                meta: serde_json::json!({
+                    "kind": "extension_config",
+                    "database": db.name,
+                    "schema": config.schema,
+                    "table": config.table,
+                    "extension": config.extension,
+                    "condition": config.condition,
+                    "columns": Vec::<String>::new(),
+                    "only": false,
+                }),
+            });
         }
     }
     let source_summary = format!(
@@ -1226,6 +1343,74 @@ mod tests {
         // The payload roundtrips back out of the plan unchanged.
         let back: PgPlanPayload = serde_json::from_value(plan.payload).expect("payload");
         assert_eq!(back, payload);
+    }
+
+    /// An extension configuration table is a data item of its own: the relation
+    /// is recreated by `CREATE EXTENSION`, its matching rows are user data.
+    /// An object an extension owns is recreated verbatim by `CREATE EXTENSION`
+    /// on the destination, so refusing the cluster over it would make every
+    /// PostGIS database unbackupable (PostGIS defines three rules on
+    /// `public.geometry_columns`) while losing nothing.
+    #[test]
+    fn every_unsupported_probe_ignores_extension_owned_objects() {
+        // Probes over catalogs an extension cannot own: a large object, a
+        // default-ACL entry, a subscription, a dotted identifier and a locally
+        // NOT NULL inherited column have no `pg_depend` extension edge.
+        const NOT_EXTENSION_OWNED: &[&str] = &[
+            "large objects",
+            "default privileges (ALTER DEFAULT PRIVILEGES)",
+            "logical-replication subscriptions",
+            "inheritance children whose inherited column is locally NOT NULL",
+            "column-level privileges",
+        ];
+        for major in [10, 11, 18] {
+            for (what, sql) in unsupported_probes(major) {
+                if NOT_EXTENSION_OWNED.contains(&what) || what.starts_with("identifiers containing")
+                {
+                    continue;
+                }
+                if what.starts_with("reg* columns") || what.starts_with("NOT NULL constraints") {
+                    // Both are about a *column* of an ordinary user table.
+                    continue;
+                }
+                assert!(
+                    sql.contains("deptype = 'e'"),
+                    "probe {what:?} (major {major}) must ignore extension-owned objects"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_plan_emits_an_extension_config_item() {
+        let mut payload = crate::model::test_fixture();
+        payload.databases[0].extension_configs = vec![PgExtensionConfig {
+            extension: "rbtest".to_string(),
+            schema: "public".to_string(),
+            table: "rbtest_cfg".to_string(),
+            condition: Some("WHERE k >= 1000".to_string()),
+            estimated_bytes: 8192,
+        }];
+        let plan = build_plan(&payload, "x".to_string());
+
+        assert_eq!(
+            plan.items.len(),
+            2,
+            "the ordinary table plus the config table"
+        );
+        let item = &plan.items[1];
+        assert_eq!(item.kind, "extension_config");
+        assert_eq!(item.name, "appdb.public.rbtest_cfg");
+        assert_eq!(item.estimated_bytes, 8192);
+        assert_eq!(plan.estimated_bytes, 81_920 + 8192);
+        assert_eq!(item.meta["kind"], "extension_config");
+        assert_eq!(item.meta["database"], "appdb");
+        assert_eq!(item.meta["schema"], "public");
+        assert_eq!(item.meta["table"], "rbtest_cfg");
+        assert_eq!(item.meta["extension"], "rbtest");
+        assert_eq!(item.meta["condition"], "WHERE k >= 1000");
+        // No column list: the extension owns the shape, identical on both sides.
+        assert_eq!(item.meta["columns"], serde_json::json!([]));
     }
 
     #[test]

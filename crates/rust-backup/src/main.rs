@@ -186,6 +186,17 @@ struct ModuleParamArgs {
     /// s3: secret key. Prefer the env var to a flag.
     #[arg(long = "secret-key", env = "RUST_BACKUP_SECRET_KEY")]
     secret_key: Option<String>,
+    // No clap `default_value`: one would be folded into the overlay on every run
+    // and a YAML `extension_version: default` could never win — exactly the bug
+    // `Option<bool>` avoids for the boolean flags below. Absent here means
+    // absent from the overlay, and the module's serde default is `source`.
+    /// postgres destination: extension version policy (source|default).
+    #[arg(
+        long = "extension-version",
+        env = "RUST_BACKUP_EXTENSION_VERSION",
+        value_parser = clap::builder::PossibleValuesParser::new(["source", "default"])
+    )]
+    extension_version: Option<String>,
 
     // --- bool module params ---
     //
@@ -306,6 +317,7 @@ impl ModuleParamArgs {
         put_str("prefix", &self.prefix);
         put_str("access_key", &self.access_key);
         put_str("secret_key", &self.secret_key);
+        put_str("extension_version", &self.extension_version);
         if let Some(p) = self.port {
             m.insert("port".into(), Value::Number(p.into()));
         }
@@ -1352,6 +1364,109 @@ targets:
         assert_eq!(params.0["host"], "escape-host");
         assert_eq!(params.0["port"], 6000);
         assert_eq!(params.0["overwrite"], true);
+    }
+
+    /// `--extension-version` is a destination-side policy: it reaches the
+    /// module params of a destination run, clap refuses any value outside the
+    /// two documented ones, and a source run that never passes it leaves the
+    /// module at its own default (`source` — install the exact version).
+    #[test]
+    fn extension_version_flag_is_destination_only() {
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--host",
+            "db",
+            "--user",
+            "admin",
+            "--admin",
+            "--yes",
+            "--extension-version",
+            "default",
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(params.0["extension_version"], "default");
+        let typed: rb_postgres::PostgresParams = params.deserialize().expect("typed params");
+        assert_eq!(
+            typed.extension_version,
+            rb_postgres::ExtensionVersionPolicy::Default
+        );
+
+        // Only `source` and `default` are policies.
+        let Err(err) = Cli::try_parse_from([
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--extension-version",
+            "latest",
+        ]) else {
+            panic!("an unknown policy must be rejected")
+        };
+        assert!(err.to_string().contains("latest"), "{err}");
+
+        // A source run does not carry the key, so the module keeps its default.
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--host",
+            "db",
+            "--user",
+            "ro",
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "postgres", Role::Source).expect("resolve");
+        assert!(params.0.get("extension_version").is_none());
+        let typed: rb_postgres::PostgresParams = params.deserialize().expect("typed params");
+        assert_eq!(
+            typed.extension_version,
+            rb_postgres::ExtensionVersionPolicy::Source
+        );
+    }
+
+    /// The CLI value wins over a YAML underlay, like every other module param.
+    #[test]
+    fn merge_params_carries_extension_version() {
+        let yaml = write_yaml(YAML);
+        let path = yaml.to_str().expect("utf8 path").to_string();
+
+        let cli = parse(&[
+            "rust-backup",
+            "postgres",
+            "destination",
+            "--extension-version",
+            "default",
+            "--config",
+            &path,
+        ]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "postgres", Role::Destination).expect("resolve");
+        assert_eq!(params.0["extension_version"], "default");
+
+        // Absent on the CLI, absent from the overlay: the module default holds.
+        let cli = parse(&["rust-backup", "postgres", "destination", "--config", &path]);
+        let Cmd::Postgres(a) = cli.cmd else {
+            panic!("expected postgres subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "postgres", Role::Destination).expect("resolve");
+        assert!(params.0.get("extension_version").is_none());
+        std::fs::remove_file(yaml).ok();
     }
 
     #[test]

@@ -20,9 +20,40 @@ major (`libc` on 10–14, ICU metadata on 15+, ICU rules on 16+, and `builtin` o
 
 The source captures cluster roles, memberships, databases, schemas, extensions,
 tables, sequence state, table data, constraints, indexes, grants and ownership
-metadata. The destination restores in dependency order: roles and databases,
+metadata, together with the comments carried by each of them — including
+comments on constraints and on indexes — and the relation options of views and
+materialized views (`check_option`, `security_barrier`, storage parameters).
+Relations an extension registered with `pg_extension_config_dump` are captured
+as extension configuration tables: the relation itself is recreated by `CREATE
+EXTENSION`, but the rows matching the extension's registered condition are user
+data and are streamed and restored (PostGIS `spatial_ref_sys` is the usual
+case). The destination clears exactly that scope — `DELETE` with the registered
+condition, `TRUNCATE` when the extension registered none — before loading the
+source's rows, so the rows `CREATE EXTENSION` inserted are replaced rather than
+merged with. A
+materialized view the source left unpopulated (`WITH NO DATA`, never refreshed)
+is restored unpopulated: refreshing it would hand the destination rows the
+source does not have. The destination restores in dependency order: roles and databases,
 pre-data DDL, streamed table data, then post-data constraints/indexes, sequences
 and grants. Source reads are read-only; data streams straight into the tunnel.
+
+## Extension versions
+
+An extension is restored at the source's exact version. The destination's
+preflight checks every extension against `pg_available_extension_versions` and
+refuses the plan when that version is absent — `CREATE EXTENSION … VERSION '1.0'`
+against a destination that only ships 1.1 is an error, and it would otherwise
+surface halfway through `pre_data`, with roles and databases already created.
+The refusal names what the destination does have.
+
+`--extension-version default` (`RUST_BACKUP_EXTENSION_VERSION=default`, the
+destination side only) accepts the destination's default version instead: the
+`CREATE EXTENSION` statement is emitted without a `VERSION` clause, the catalog
+read-back accepts the installed version for that extension and nothing else, and
+each substitution is reported as `deviation: extension <name> restored at version
+<actual> (source <version>)` on the `RESTORE VERIFIED` line. The policy relaxes
+the version, never the extension: one the destination cannot install at all is
+still refused.
 
 ## Completion proof
 
@@ -129,8 +160,7 @@ the same model*, so anything absent from the model is lost invisibly and then
 certified as a faithful copy. Analysis therefore **fails** when the source holds
 any of: triggers, row-level security (policies or `relrowsecurity`), user-defined
 types (enum, domain, composite, range), aggregate or window functions, foreign
-tables, view options such as `WITH CHECK OPTION` or `security_barrier`,
-column-level privileges, default privileges (`ALTER DEFAULT PRIVILEGES`), large
+tables, column-level privileges, default privileges (`ALTER DEFAULT PRIVILEGES`), large
 objects, user-defined collations, rules other than a view's own `_RETURN`, an
 inheritance child whose inherited column is locally `NOT NULL`, or a `reg*`
 column — whose binary `COPY` representation is a raw OID that names a different

@@ -58,7 +58,7 @@ I-IMMUT evidence from the server's own log. Fixtures live in
 | `rb_pg_load_fixtures <container> <major> <db> <dir>` | loads `<dir>/*.sql` in lexical order with `ON_ERROR_STOP=1`, skipping `.ge<major>` files above the server major and printing `LOAD`/`SKIP` per file |
 | `rb_pg_oracle_schema <dump_container> <host> <port> <user> <db> <out>` | `pg_dump --schema-only` run inside `<dump_container>`, normalised and filtered through `e2e/fixtures/postgres/oracle_ignore.txt` |
 | `rb_pg_oracle_counts <container> <user> <db> <out>` | sorted TSV of `rel` (count and order-independent row digest, read `FROM ONLY`), `seq` (`last_value`, `is_called`), `con` (`convalidated`, definition) and `idx` (definition) |
-| `rb_pg_assert_readonly_log <container> <user>` | fails when any statement logged for `<user>` is not a read (`SELECT`/`WITH`/`SHOW`/`TABLE`/`VALUES`/`COPY ... TO STDOUT`) |
+| `rb_pg_assert_readonly_log <container> <user> [since]` | fails when any statement logged for `<user>` is not a read (`SELECT`/`WITH`/`SHOW`/`TABLE`/`VALUES`/`COPY ... TO STDOUT`); `since` is an epoch mark limiting the window to one transfer. Continuation lines of a wrapped statement are rejoined first, so a multi-line `COPY … TO STDOUT` is judged whole |
 | `rb_pg_assert_connections <container> <user> <max>` | fails when `<user>` opened more than `<max>` connections |
 | `rb_pg_assert_no_temp_files <container>` | fails when the server logged a `temporary file:` line (I-NOTEMP) |
 
@@ -75,10 +75,17 @@ Environment switches the scripts read:
 | `RUST_BACKUP_E2E_TLS` | `0` | `relay_smoke.sh` | generate a self-signed cert and run the relay over TLS |
 | `RUST_BACKUP_E2E_KEEP` | `0` | most | keep the temporary work directory and print its path |
 | `RUST_BACKUP_AWS_E2E` | `0` | `s3_aws_test.sh` | opt in to the real-AWS smoke; without it the script prints SKIP |
+| `RB_PG_IMAGE_REPO` | `postgres` | `postgres_matrix.sh` | set to `postgis/postgis` to run the `M-PG-GIS-*` rows; the tag per major is resolved by `postgis_tag` and a major with no such image exits 77 (SKIP) |
+| `RB_PG_NOTEMP_MODE` | `warn` | `postgres_matrix.sh` | `strict` turns the I-NOTEMP row from SKIP into a failure (enforced from phase 3 § 3.3) |
 
 Database arguments accept `source:destination`, for example:
 
 ```bash
 bash e2e/postgres_matrix.sh 10:18 14:17
 bash e2e/mongodb_matrix.sh 4:8 6:8
+RB_PG_IMAGE_REPO=postgis/postgis bash e2e/postgres_matrix.sh 16 12:16
 ```
+
+A cross-major PostGIS pair ships two PostGIS versions, so the case runs with
+`--extension-version default`; `M-PG-GIS-06` first asserts that the same pair is
+refused at preflight without it.

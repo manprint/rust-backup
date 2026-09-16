@@ -16,6 +16,10 @@ NN_<kind>[.ge<major>].sql
   indexes, extensions (`70`) last, PostGIS (`80`) last of all.
 - `<kind>` names the object group: `roles`, `tables`, `sequences`, `views`,
   `matviews`, `indexes`, `constraints`, `extensions`, `postgis`.
+- A `.ge<major>` file sorts **before** the ungated file of the same group
+  (`10_tables.ge11.sql` < `10_tables.sql` in C order), so it may depend only on
+  lower-numbered groups, never on objects created by its own group's ungated
+  file. Each gated file therefore creates the tables it constrains or indexes.
 - `.ge<major>` is optional and gates the file: it is loaded only when the server
   major is greater than or equal to `<major>`. Below it the runner prints
   `SKIP <file> (needs >= <major>)` and every row that lives in that file prints
@@ -45,6 +49,14 @@ the `pg_dump --schema-only` oracle output matching one of them is dropped before
 the source and destination dumps are compared. Use it only for rendering
 differences that are not the property under test, and state the reason in a
 comment above the pattern.
+
+## `postgis/`
+
+`postgis/80_postgis.sql` holds the `M-PG-GIS-*` rows and is loaded, as a second
+`rb_pg_load_fixtures` call over that subdirectory, only when the runner starts
+PostGIS images (`RB_PG_IMAGE_REPO=postgis/postgis`). It sits in its own
+directory rather than in the parent because `rb_pg_load_fixtures` loads every
+`*.sql` of the directory it is given.
 
 ## `71_rbtest_extension.sh`
 

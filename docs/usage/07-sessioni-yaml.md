@@ -82,6 +82,8 @@ targets:
       password: CAMBIAMI
       database: app
       sslmode: require
+      # solo destinazione: source (default) | default
+      extension_version: source
 
     auto_accept: false         # true = come --yes; ignorato sul lato sorgente
 
