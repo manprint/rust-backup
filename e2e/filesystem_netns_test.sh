@@ -38,13 +38,16 @@ start_server() { # port log
   PIDS+=("$!")
   rb_wait_tcp 127.0.0.1 "$1"
 }
-transfer() { # source dest port channel [run-as-user] [no-preserve-ownership]
+# `run_as` names the account the DESTINATION runs under; the source always runs
+# as root. That is the only split these cases can use: the source tree is
+# deliberately owned by root so the plan carries uid/gid 0:0, and a non-root
+# process cannot open a file it does not own with `O_NOATIME` — the access-time
+# guard would refuse the run at Analyze before the destination was ever reached.
+# A non-root *source* is proven over a tree that account owns, by
+# `e2e/filesystem_matrix.sh` (T-FS-ATIME, M-FS-32).
+transfer() { # source dest port channel [destination-run-as-user] [no-preserve-ownership]
   local src=$1 dst=$2 port=$3 channel=$4 run_as=${5:-} no_ownership=${6:-}
-  if [[ -n "$run_as" ]]; then
-    runuser -u "$run_as" -- env RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --root "$src" >"$work/$channel-source.log" 2>&1 &
-  else
-    RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --root "$src" >"$work/$channel-source.log" 2>&1 &
-  fi
+  RUST_LOG=info "$RB_E2E_BIN" filesystem source --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --root "$src" >"$work/$channel-source.log" 2>&1 &
   local spid=$!; PIDS+=("$spid")
   sleep .3
   local destination_args=(filesystem destination --to "127.0.0.1:$port" --channel "$channel" --no-udp --insecure --yes --root "$dst")
@@ -81,8 +84,11 @@ if start_server "$port" "$work/root-server.log" && transfer "$root_src" "$root_d
   else fail 'root restore metadata/link topology differs'; fi
 else fail 'root filesystem transfer failed'; fi
 
-# (b) non-root: exact ownership is rejected by default. An explicit opt-out
-# excludes uid/gid from the contract while every remaining field is verified.
+# (b) non-root destination: exact ownership is rejected by default. An explicit
+# opt-out excludes uid/gid from the contract while every remaining field is
+# verified. The source tree stays root-owned — that is what makes the exact
+# restore impossible for the destination account — and the source therefore runs
+# as root (see `transfer`).
 nonroot=nobody
 id "$nonroot" >/dev/null 2>&1 || nonroot=$(getent passwd 65534 | cut -d: -f1)
 nr_src="$work/nonroot-source"; nr_dst="$work/nonroot-destination"

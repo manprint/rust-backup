@@ -56,7 +56,7 @@ I-IMMUT evidence from the server's own log. Fixtures live in
 | Helper | What it does |
 |--------|--------------|
 | `RB_PG_LOG_ARGS` | server flags every matrix container starts with: `log_statement=all`, `log_connections=on`, `log_temp_files=0`, `log_line_prefix=%u@%d\|%m\|` |
-| `rb_pg_start <name> <image> <host_port> [docker args...]` | starts a PostgreSQL container with `RB_PG_LOG_ARGS`, records it in `RB_PG_CONTAINERS`, waits up to 60 s for `pg_isready` |
+| `rb_pg_start <name> <image> <host_port> [docker args...]` | starts a PostgreSQL container with `RB_PG_LOG_ARGS`, records it in `RB_PG_CONTAINERS`, waits up to 240 s for `pg_isready` **over TCP** plus a `SELECT 1` — the entrypoint's init-time server listens on the unix socket only, so a socket probe reports a server that is about to be shut down and restarted |
 | `rb_pg_container_ip <container>` | the container's IP, for a peer container connecting to it directly |
 | `rb_pg_load_fixtures <container> <major> <db> <dir>` | loads `<dir>/*.sql` in lexical order with `ON_ERROR_STOP=1`, skipping `.ge<major>` files above the server major and printing `LOAD`/`SKIP` per file |
 | `rb_pg_oracle_schema <dump_container> <host> <port> <user> <db> <out>` | `pg_dump --schema-only` run inside `<dump_container>`, normalised and filtered through `e2e/fixtures/postgres/oracle_ignore.txt` |

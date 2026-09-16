@@ -403,8 +403,10 @@ if backends_enabled; then
     CONTAINERS+=("$1")
     docker run -d --name "$1" -e POSTGRES_PASSWORD="$PG_PASSWORD" -p "$2:5432" \
       postgres:16-alpine >/dev/null || return 1
-    for _ in $(seq 1 40); do
-      docker exec "$1" pg_isready -U postgres >/dev/null 2>&1 && return 0
+    # Over TCP: the entrypoint's init-time server listens on the socket only
+    # (see rb_pg_start in e2e/lib.sh).
+    for _ in $(seq 1 60); do
+      docker exec "$1" pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && return 0
       sleep 1
     done
     return 1
@@ -474,7 +476,7 @@ SQL
       kill -9 "$server_pid" >/dev/null 2>&1
       reap "$server_pid"
       [[ "$victim" == backend ]] && { docker start "$pg_dst" >/dev/null 2>&1; \
-        for _ in $(seq 1 40); do docker exec "$pg_dst" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done; }
+        for _ in $(seq 1 40); do docker exec "$pg_dst" pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && break; sleep 1; done; }
 
       assert_source_unchanged "$label" "$before" "$(pg_source_checksum)"
 

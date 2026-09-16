@@ -496,11 +496,24 @@ rb_pg_start() { # name image host_port [extra docker run args...]
   docker run -d --name "$name" -e POSTGRES_PASSWORD="$RB_PG_PASSWORD" \
     -p "${port}:5432" "$@" "$image" postgres $RB_PG_LOG_ARGS >/dev/null
   local _attempt
-  for _attempt in $(seq 1 60); do
-    if docker exec "$name" pg_isready -U postgres >/dev/null 2>&1; then return 0; fi
+  # Probe over TCP, never over the unix socket. While the entrypoint runs
+  # `initdb` and `/docker-entrypoint-initdb.d`, it keeps a *temporary* server up
+  # with `listen_addresses=''` — reachable on the socket, invisible over TCP —
+  # and then shuts it down and starts the real one. A socket probe answers YES
+  # to that temporary server, so the caller connects into the restart and reads
+  # "the database system is shutting down" or loses its fixture load. The
+  # trailing `SELECT 1` closes the gap between listening and accepting. A
+  # PostGIS image spends minutes in that window building its template
+  # databases, which is why the plain images only flaked and the PostGIS ones
+  # failed outright.
+  for _attempt in $(seq 1 240); do
+    if docker exec "$name" pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 &&
+      docker exec "$name" psql -h 127.0.0.1 -U postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 1
   done
-  echo "FAIL: $name ($image) not ready after 60s" >&2
+  echo "FAIL: $name ($image) not ready after 240s" >&2
   return 1
 }
 

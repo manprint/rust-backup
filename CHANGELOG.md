@@ -147,6 +147,24 @@ backend.
   linking to a `pub(crate)` type. Both steps moved into the gate and out of the
   workflow, which now runs `bash scripts/gates.sh` and nothing else.
 
+- **A container was called ready while its entrypoint was still initialising.**
+  `rb_pg_start` probed `pg_isready` over the unix socket, and the postgres
+  entrypoint keeps a temporary server there — `listen_addresses=''` — while it
+  runs `initdb` and `/docker-entrypoint-initdb.d`, then shuts it down and starts
+  the real one. The probe answered YES to that server, so the caller connected
+  into the restart: "the database system is shutting down", or a fixture that
+  never loaded. A PostGIS image spends minutes building its template databases,
+  which is why the plain matrices only flaked where the PostGIS ones failed
+  outright. Readiness is now a TCP probe plus a `SELECT 1`, which the init-time
+  server cannot answer, and `e2e/fault_matrix.sh` probes the same way.
+- **The `T-FS-OWN` non-root cases ran the source as the unprivileged account
+  too.** Their fixture tree is deliberately root-owned — that is what makes the
+  exact restore impossible for a non-root destination — so the access-time guard
+  added in this release correctly refused the run at Analyze, before the
+  destination was reached. Only the destination runs unprivileged now; a
+  non-root *source* is proven over a tree that account owns, by
+  `e2e/filesystem_matrix.sh`.
+
 ### Documentation parity
 
 - **`scripts/docs_parity.sh` fails when the operator guide stops describing the
