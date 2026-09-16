@@ -142,6 +142,10 @@ with, and it starts with its phase — `[Connect]`, `[Analyze]`, `[Validate]`,
 
 ## The test matrix
 
+The catalogue of cases each fidelity runner covers, row by row, is
+`docs/testing/POSTGRES_MATRIX.md` and `docs/testing/FILESYSTEM_MATRIX.md`. Those
+documents list the row IDs the runners print; they never record execution status.
+
 No privileges, no Docker beyond MinIO:
 
 ```bash

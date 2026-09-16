@@ -304,3 +304,204 @@ rb_seed_filesystem_fixture() { # root [large bytes] [bulk files]
     done
   fi
 }
+
+# ---------------------------------------------------------------------------
+# PostgreSQL fidelity-matrix helpers (docs/testing/POSTGRES_MATRIX.md).
+#
+# Every helper drives an existing Docker container through `docker exec`; none of
+# them creates or removes a container except `rb_pg_start`, which records the name
+# it created in RB_PG_CONTAINERS so a caller's cleanup trap can reap it.
+# ---------------------------------------------------------------------------
+
+# Server-side logging the immutability and hygiene assertions read back.
+# `log_line_prefix` uses `|` as its field separator and contains no space, so the
+# whole string stays safe under the word splitting that passes it to `docker run
+# ... postgres $RB_PG_LOG_ARGS`. The prefix is therefore `user@database|time|`.
+RB_PG_LOG_ARGS="-c log_statement=all -c log_connections=on -c log_temp_files=0 -c log_line_prefix=%u@%d|%m| -c log_min_duration_statement=-1"
+export RB_PG_LOG_ARGS
+
+# Superuser password of every container started by rb_pg_start; also used by the
+# pg_dump oracle when it connects across containers.
+RB_PG_PASSWORD=${RB_PG_PASSWORD:-postgres}
+export RB_PG_PASSWORD
+
+RB_PG_CONTAINERS=()
+
+rb_pg_container_ip() { # container
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"
+}
+
+rb_pg_start() { # name image host_port [extra docker run args...]
+  local name=$1 image=$2 port=$3
+  shift 3
+  # Record the name before `docker run`: Docker can leave a created container
+  # behind when host-port programming fails.
+  RB_PG_CONTAINERS+=("$name")
+  # shellcheck disable=SC2086 # RB_PG_LOG_ARGS is a deliberate argument list.
+  docker run -d --name "$name" -e POSTGRES_PASSWORD="$RB_PG_PASSWORD" \
+    -p "${port}:5432" "$@" "$image" postgres $RB_PG_LOG_ARGS >/dev/null
+  local _attempt
+  for _attempt in $(seq 1 60); do
+    if docker exec "$name" pg_isready -U postgres >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  echo "FAIL: $name ($image) not ready after 60s" >&2
+  return 1
+}
+
+# Loads `<dir>/*.sql` in lexical order. A `.ge<major>` suffix gates the file on
+# the server major; the naming rule is e2e/fixtures/postgres/README.md.
+rb_pg_load_fixtures() { # container major db dir
+  local container=$1 major=$2 database=$3 dir=$4 file base needed
+  [[ -d $dir ]] || { echo "FAIL: fixture directory $dir does not exist" >&2; return 1; }
+  while IFS= read -r file; do
+    base=${file##*/}
+    needed=0
+    if [[ $base =~ \.ge([0-9]+)\.sql$ ]]; then needed=${BASH_REMATCH[1]}; fi
+    if (( major < needed )); then
+      echo "SKIP $base (needs >= $needed)"
+      continue
+    fi
+    if ! docker exec -i "$container" psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \
+        -q >/dev/null <"$file"; then
+      echo "FAIL: fixture $base did not load into $database" >&2
+      return 1
+    fi
+    echo "LOAD $base"
+  done < <(find "$dir" -maxdepth 1 -name '*.sql' | LC_ALL=C sort)
+}
+
+# External schema oracle: pg_dump run inside <dump_container> against a server
+# reachable at <host>:<port>, normalised so two dumps of the same schema compare
+# equal. Patterns in e2e/fixtures/postgres/oracle_ignore.txt drop further lines.
+rb_pg_oracle_schema() { # dump_container host port user db out_file
+  local dump_container=$1 host=$2 port=$3 user=$4 database=$5 out=$6
+  local ignore="$RB_E2E_ROOT/e2e/fixtures/postgres/oracle_ignore.txt"
+  if ! docker exec -e PGPASSWORD="$RB_PG_PASSWORD" "$dump_container" \
+      pg_dump --schema-only --no-sync -h "$host" -p "$port" -U "$user" "$database" \
+      >"$out.raw" 2>"$out.err"; then
+    echo "FAIL: pg_dump oracle failed for $database at $host:$port" >&2
+    cat "$out.err" >&2
+    return 1
+  fi
+  sed -E -e '/^--/d' -e '/^SET /d' -e '/^SELECT pg_catalog\.set_config/d' \
+    -e '/^\\restrict/d' -e '/^\\unrestrict/d' -e '/^[[:space:]]*$/d' "$out.raw" >"$out.tmp"
+  if [[ -s $ignore ]]; then
+    local pattern
+    while IFS= read -r pattern; do
+      [[ -z $pattern || $pattern == \#* ]] && continue
+      sed -E "/$pattern/d" "$out.tmp" >"$out.tmp2" && mv "$out.tmp2" "$out.tmp"
+    done <"$ignore"
+  fi
+  mv "$out.tmp" "$out"
+  rm -f "$out.raw" "$out.err"
+}
+
+# External data oracle: one sorted TSV line per relation, sequence, constraint
+# and index. Relations are read with FROM ONLY so an inherited or partitioned
+# parent never counts its children's rows twice, and the row digest is
+# order-independent (md5 of the sorted per-row md5s).
+rb_pg_oracle_counts() { # container user db out_file
+  local container=$1 user=$2 database=$3 out=$4
+  if ! docker exec -i "$container" psql -X -q -v ON_ERROR_STOP=1 \
+      -U "$user" -d "$database" >"$out.raw" 2>"$out.err" <<'SQL'
+\pset tuples_only on
+\pset format unaligned
+\pset fieldsep '\t'
+\pset footer off
+SELECT format(
+    'SELECT %L, %L, count(*)::text, coalesce(md5(string_agg(md5(t::text), %L ORDER BY md5(t::text))), %L) FROM ONLY %s t',
+    'rel', n.nspname || '.' || c.relname, '', '',
+    quote_ident(n.nspname) || '.' || quote_ident(c.relname))
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'm')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname NOT LIKE 'pg_toast%'
+   AND n.nspname NOT LIKE 'pg_temp%'
+   AND (c.relkind <> 'm' OR c.relispopulated)
+   AND (NOT EXISTS (SELECT 1 FROM pg_depend d
+                     WHERE d.classid = 'pg_class'::regclass
+                       AND d.objid = c.oid AND d.deptype = 'e')
+        OR EXISTS (SELECT 1 FROM pg_extension e WHERE c.oid = ANY (e.extconfig)))
+ ORDER BY 1
+\gexec
+SELECT 'rel', n.nspname || '.' || c.relname, 'unpopulated', 'unpopulated'
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind = 'm' AND NOT c.relispopulated
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema');
+SELECT format(
+    'SELECT %L, %L, last_value::text, is_called::text FROM %s',
+    'seq', n.nspname || '.' || c.relname,
+    quote_ident(n.nspname) || '.' || quote_ident(c.relname))
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind = 'S'
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname NOT LIKE 'pg_temp%'
+ ORDER BY 1
+\gexec
+SELECT 'con', n.nspname || '.' || rel.relname || '.' || con.conname,
+       con.convalidated::text, pg_get_constraintdef(con.oid)
+  FROM pg_constraint con
+  JOIN pg_class rel ON rel.oid = con.conrelid
+  JOIN pg_namespace n ON n.oid = rel.relnamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema');
+SELECT 'idx', schemaname || '.' || indexname, indexdef
+  FROM pg_indexes
+ WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
+SQL
+  then
+    echo "FAIL: data oracle query failed on $database" >&2
+    cat "$out.err" >&2
+    return 1
+  fi
+  LC_ALL=C sort "$out.raw" >"$out"
+  rm -f "$out.raw" "$out.err"
+}
+
+# I-IMMUT evidence from the server's own log: every statement the source role
+# issued must be a read. Extended-protocol statements are logged as
+# `execute <name>: <sql>`; continuation lines of a multi-line statement carry no
+# prefix and are therefore not re-checked.
+rb_pg_assert_readonly_log() { # container user
+  local container=$1 user=$2 statement checked=0 offenders=0
+  while IFS= read -r statement; do
+    checked=$((checked + 1))
+    if ! printf '%s\n' "$statement" | grep -Eq \
+        '^(SELECT|WITH|SHOW|TABLE|VALUES)\b|^COPY[[:space:]]*\(?.*\)?[[:space:]]+TO[[:space:]]+STDOUT'; then
+      echo "FAIL: non-read statement from $user: $statement" >&2
+      offenders=$((offenders + 1))
+    fi
+  done < <(docker logs "$container" 2>&1 \
+    | grep -E "^${user}@[^|]*\|" \
+    | grep -E 'statement: |execute [^:]*: ' \
+    | sed -E 's/^.*(statement: |execute [^:]*: )//')
+  if (( offenders > 0 )); then
+    echo "FAIL: $offenders non-read statements from $user" >&2
+    return 1
+  fi
+  echo "read-only log check: $checked statements from $user, all reads"
+}
+
+rb_pg_assert_connections() { # container user max
+  local container=$1 user=$2 max=$3 count
+  count=$(docker logs "$container" 2>&1 | grep -cE "connection authorized: user=${user}\b" || true)
+  if (( count > max )); then
+    echo "FAIL: $count connections authorized for $user, at most $max allowed" >&2
+    return 1
+  fi
+  echo "connection count for $user: $count (max $max)"
+}
+
+rb_pg_assert_no_temp_files() { # container
+  local container=$1 hits
+  hits=$(docker logs "$container" 2>&1 | grep -c 'temporary file:' || true)
+  if (( hits > 0 )); then
+    echo "FAIL: the source spilled $hits temporary files (I-NOTEMP)" >&2
+    docker logs "$container" 2>&1 | grep 'temporary file:' | head -5 >&2
+    return 1
+  fi
+  echo "temporary files on the source: none"
+}

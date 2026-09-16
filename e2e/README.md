@@ -21,6 +21,11 @@ return non-zero on any failure.
 | `resource_hygiene_check.sh` | T-HYGIENE | 8 | static guard: every e2e script parses, and each one only removes namespaces/containers it created. Run by `full_matrix.sh`; no Docker or sudo |
 | `full_matrix.sh` | — | 8 | non-privileged matrix; Docker DBs and sudo tests opt in |
 
+The per-row catalogue behind the fidelity runners is
+`docs/testing/POSTGRES_MATRIX.md` (`M-PG-*`) and
+`docs/testing/FILESYSTEM_MATRIX.md` (`M-FS-*`): case, minimum version or required
+privilege, fixture, expected outcome and oracle for every row the runners print.
+
 `relay_smoke.sh` needs only cargo and Python 3. `s3_minio_test.sh` needs Docker.
 The filesystem, transport, and bandwidth scripts need Linux `ip`, `iptables`, `tc`,
 and non-interactive sudo; invoke them as `sudo -n /abs/path/e2e/<script>.sh`.
@@ -38,6 +43,24 @@ MongoDB 4..8 same-version matrices plus the configured cross-version pairs.
 Each successful E2E path calls `rb_assert_formal_verification`: both peers must
 print their formal verified message, finish at `status="verified"` and `100.0%`,
 and report the same 64-character payload BLAKE3.
+
+## PostgreSQL matrix helpers in `e2e/lib.sh`
+
+Shared by `postgres_matrix.sh` and any script that needs an external oracle or
+I-IMMUT evidence from the server's own log. Fixtures live in
+`e2e/fixtures/postgres/` (naming rule in that directory's `README.md`).
+
+| Helper | What it does |
+|--------|--------------|
+| `RB_PG_LOG_ARGS` | server flags every matrix container starts with: `log_statement=all`, `log_connections=on`, `log_temp_files=0`, `log_line_prefix=%u@%d\|%m\|` |
+| `rb_pg_start <name> <image> <host_port> [docker args...]` | starts a PostgreSQL container with `RB_PG_LOG_ARGS`, records it in `RB_PG_CONTAINERS`, waits up to 60 s for `pg_isready` |
+| `rb_pg_container_ip <container>` | the container's IP, for a peer container connecting to it directly |
+| `rb_pg_load_fixtures <container> <major> <db> <dir>` | loads `<dir>/*.sql` in lexical order with `ON_ERROR_STOP=1`, skipping `.ge<major>` files above the server major and printing `LOAD`/`SKIP` per file |
+| `rb_pg_oracle_schema <dump_container> <host> <port> <user> <db> <out>` | `pg_dump --schema-only` run inside `<dump_container>`, normalised and filtered through `e2e/fixtures/postgres/oracle_ignore.txt` |
+| `rb_pg_oracle_counts <container> <user> <db> <out>` | sorted TSV of `rel` (count and order-independent row digest, read `FROM ONLY`), `seq` (`last_value`, `is_called`), `con` (`convalidated`, definition) and `idx` (definition) |
+| `rb_pg_assert_readonly_log <container> <user>` | fails when any statement logged for `<user>` is not a read (`SELECT`/`WITH`/`SHOW`/`TABLE`/`VALUES`/`COPY ... TO STDOUT`) |
+| `rb_pg_assert_connections <container> <user> <max>` | fails when `<user>` opened more than `<max>` connections |
+| `rb_pg_assert_no_temp_files <container>` | fails when the server logged a `temporary file:` line (I-NOTEMP) |
 
 Environment switches the scripts read:
 

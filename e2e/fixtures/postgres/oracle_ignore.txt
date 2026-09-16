@@ -1,0 +1,5 @@
+# Extended regular expressions (one per line) whose matching lines are removed
+# from the pg_dump --schema-only oracle output before source and destination are
+# compared. Comments start with '#'. Keep this file as short as possible: every
+# pattern here is fidelity the matrix stops checking. State the reason above the
+# pattern and name the matrix row it affects.

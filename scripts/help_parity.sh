@@ -38,8 +38,8 @@ cli_flags() {
 # Every long switch the operator guide mentions. `--` runs in markdown table
 # rules are not switches, hence the leading-alphanumeric requirement; the
 # exclusion list holds switches that belong to other programs the documents
-# legitimately show.
-not_ours='^--(all-features|no-default-features|release|locked|rm|network|entrypoint|name|env-file|detach|check|ff-only|now|lib)$'
+# legitimately show (cargo, docker, git, and the pg_dump oracle in e2e/README.md).
+not_ours='^--(all-features|no-default-features|release|locked|rm|network|entrypoint|name|env-file|detach|check|ff-only|now|lib|schema-only|no-sync)$'
 doc_flags() {
   grep -hEo -- '--[a-z0-9][a-z0-9-]*' "$@" | grep -Ev "$not_ours" | sort -u
 }
