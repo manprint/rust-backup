@@ -112,7 +112,8 @@ the ⟦OPUS GATE⟧ rows in the plan.
    · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo build
    --all-features` · `cargo build --no-default-features` · `cargo test
    --all-features` · `scripts/crate_invariants.sh` ·
-   `scripts/source_readonly_lint.sh` (+ `--selftest`) · `scripts/help_parity.sh`.
+   `scripts/source_readonly_lint.sh` (+ `--selftest`) · `scripts/help_parity.sh` ·
+   `scripts/docs_parity.sh` (+ `--selftest`).
    Plus the relevant `e2e/` script.
 4. **Docs** — every behavior/API/invariant change updates the matching markdown.
 

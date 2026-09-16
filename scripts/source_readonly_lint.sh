@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# I-IMMUT static guard: the source side of every module must not be able to
-# write to the backend it reads.
+# I-IMMUT static guard (test ID T-IMMUT-LINT): the source side of every module
+# must not be able to write to the backend it reads.
 #
 # Each module lists the files that run on the source side and the call shapes
 # that would mutate that backend. A hit is printed as `path:line: <match>` and

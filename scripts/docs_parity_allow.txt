@@ -1,0 +1,37 @@
+# Names scripts/docs_parity.sh must not require in docs/usage/, and must not
+# treat as ghosts when an operator document mentions them. One name per line,
+# `#` starts a comment, a trailing `*` matches a prefix.
+
+# Test hooks. The binary reads them, but they exist to make a failure
+# reproducible in e2e/, not to be set by an operator; they are described as
+# unsupported hooks in the prose of docs/usage/10-variabili-ambiente.md rather
+# than given a table row, which would read as a supported setting.
+RUST_BACKUP_S3_TEST_FAIL_AFTER_PART
+RUST_BACKUP_PG_TEST_EXPECTED_ROWS_DELTA
+
+# The live-database gate of the unit tests in crates/rb-postgres (the whole
+# module is skipped when RUST_BACKUP_PG_HOST is unset). Never read by a real
+# run: the code is inside `mod tests`.
+RUST_BACKUP_PG_HOST
+RUST_BACKUP_PG_PORT
+RUST_BACKUP_PG_USER
+RUST_BACKUP_PG_PASSWORD
+RUST_BACKUP_PG_DATABASE
+
+# Harness variables: read by e2e/ and scripts/, never by the binary. The
+# operator documents name them when they explain how to run the suites.
+RUST_BACKUP_BIN
+RUST_BACKUP_E2E_*
+RUST_BACKUP_AWS_*
+RUST_BACKUP_FULL_DB_MATRIX
+RUST_BACKUP_PRIVILEGED
+RUST_BACKUP_FAULT_BACKENDS
+RUST_BACKUP_PG_LARGE_ROWS
+RUST_BACKUP_RSS_LIMIT_KIB
+
+# Deployment variables consumed by compose.yml and the Dockerfile, not by the
+# program: the image tag, the published UDP port and the two build arguments.
+RUST_BACKUP_IMAGE
+RUST_BACKUP_UDP_PORT
+RUST_BACKUP_VERSION
+RUST_BACKUP_VCS_REF

@@ -23,8 +23,26 @@ bash scripts/gates.sh
 It chains `cargo fmt --all --check`, `cargo clippy --all-targets --all-features
 -- -D warnings`, both builds, `cargo test --all-features`,
 `scripts/crate_invariants.sh`, `scripts/source_readonly_lint.sh` (plus its
-`--selftest`, so a lint that can no longer detect a write fails the gate) and
-`scripts/help_parity.sh`.
+`--selftest`, so a lint that can no longer detect a write fails the gate),
+`scripts/help_parity.sh` and `scripts/docs_parity.sh` (also with its
+`--selftest`, for the same reason).
+
+The last two are the documentation surface, and both are runnable on their
+own:
+
+```bash
+bash scripts/env_inventory.sh          # TSV: command, flag, variable, default, help
+bash scripts/docs_parity.sh            # the operator guide against that inventory
+bash scripts/docs_parity.sh --selftest # prove the check can still fail
+```
+
+`env_inventory.sh` reads the clap help of every command surface plus the direct
+`env::var` reads, so it is the one place that knows the real flag and variable
+surface; `docs_parity.sh` checks `docs/usage/` against it — each flag documented
+in the chapter that owns it, each row naming the variable and default clap
+prints, every variable listed in `docs/usage/10-variabili-ambiente.md`, and no
+document naming a variable the program never reads. Both accept
+`RUST_BACKUP_BIN=/absolute/binary` instead of building.
 
 ## The shape of every run
 
@@ -233,7 +251,11 @@ They require the approved `sudo -n` setup and are never silently counted as
 passes when skipped. The aggregate invokes the exact paths
 `filesystem_netns_test.sh`, `filesystem_matrix.sh`, `filesystem_disk_full.sh`,
 `transport_netns_test.sh`, and `bandwidth_netem.sh` (which also carries the
-one-vs-four-carrier proof).
+one-vs-four-carrier proof). In CI the first three are the job
+`filesystem-privileged` (`timeout-minutes: 45`); `filesystem_matrix.sh` walks
+every `M-FS-*` row twice, once as root and once as an unprivileged user, so the
+rows that need a capability and the rows that must work without one are both
+proven.
 
 The current wildcard rule over `e2e/*` is suitable only for a disposable test
 host: because the repository is user-writable, it is effectively an

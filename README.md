@@ -17,7 +17,8 @@ Supported modules:
 - PostgreSQL 10+: logical cluster metadata and binary `COPY` data. Major 10 is
   the enforced minimum; the CI matrix covers 10–18.
 - MongoDB 4–8: databases, collection options, indexes and BSON documents.
-- POSIX filesystem: files, directories, links, modes, ownership and mtimes.
+- POSIX filesystem: files, directories, symlinks, hardlinks, FIFOs and device
+  nodes, with modes, ownership and mtimes.
 - AWS S3 and compatible storage such as MinIO: streaming multipart restore.
 
 The transport uses a TCP/yamux relay and can upgrade carriers to direct
@@ -66,6 +67,17 @@ docker pull ghcr.io/manprint/rust-backup:latest  # main
 docker pull ghcr.io/manprint/rust-backup:dev     # dev
 docker run --rm ghcr.io/manprint/rust-backup:latest --version
 ```
+
+### What it needs to run
+
+Linux, the binary, and network access to the coordination server — no database
+client libraries, no `pg_dump`, no `mongodump`. Two restores need more than an
+ordinary account: restoring uid/gid needs root or `CAP_CHOWN` on the
+destination, and restoring device nodes needs root or `CAP_MKNOD` (the run says
+so in preflight and writes nothing without it). Sources always run unprivileged
+— except a filesystem source reading files it does not own, which needs
+ownership, `CAP_FOWNER` or `--allow-atime-updates`. The end-to-end suites
+additionally need Docker, and the privileged ones need root.
 
 ## Architecture
 
@@ -118,6 +130,13 @@ Both messages include the same payload BLAKE3. Apply, catalog, data read-back,
 source audit, timeout, or acknowledgement failures produce a non-zero exit and
 never print verified completion. See each module document for the exact
 restorable contract and its explicit exclusions.
+
+The exit code says which of them failed: `2` configuration, `3` preflight (the
+destination is not in a state to receive), `4` the plan was not accepted, `5`
+integrity, apply or read-back, `6` the source changed during the run, `7`
+transport, `1` anything else. A session with several failed targets reports the
+most serious one, in the order `6`, `5`, `3`, `4`, `7`, `2`, `1`
+([exit codes](docs/usage/11-codici-uscita.md)).
 
 ## Source safety
 
@@ -358,8 +377,16 @@ restored differently on purpose: a **sparse file** arrives byte-identical but
 dense, so the copy can occupy more disk than the original.
 
 Reading files the source account does not own needs `--allow-atime-updates`,
-described under [Source safety](#source-safety). See
-[filesystem details](docs/modules/FILESYSTEM.md).
+described under [Source safety](#source-safety):
+
+```bash
+rust-backup filesystem source \
+  --to coordinator.example:7835 --channel fs-prod \
+  --secret-file /etc/rust-backup/coordination.secret \
+  --root /srv/data --allow-atime-updates
+```
+
+See [filesystem details](docs/modules/FILESYSTEM.md).
 
 ### Troubleshooting
 
@@ -498,6 +525,16 @@ exits `5` and drops the databases it created, so nothing half-restored is left
 to be mistaken for a copy. Re-run it; if the message comes back, report it with
 both logs, which carry the expected and the written count.
 
+Some object classes are refused at analysis rather than copied approximately,
+because the catalog read-back compares the same model on both sides and could
+not see their absence: triggers, row-level security, user-defined types,
+aggregate and window functions, foreign tables, column and default privileges,
+large objects, user-defined collations, rules, publications and subscriptions,
+event triggers, `reg*` columns, identifiers containing a dot, and — on
+PostgreSQL 18 and later — a `NOT NULL` constraint that is named or `NOT VALID`.
+The error names every offender. `-P allow_unsupported_objects=true` accepts a
+knowingly partial copy, and the run then logs exactly what it leaves behind.
+
 Use `-P sslrootcert=/run/secrets/postgres-ca.pem` for a private CA. See
 [PostgreSQL fidelity and privileges](docs/modules/POSTGRES.md).
 
@@ -535,6 +572,11 @@ docker run --rm --network host \
   ghcr.io/manprint/rust-backup:latest \
   mongodb destination --to 127.0.0.1:7835 --channel mongo-prod --secret "$RB_SECRET" --database app --yes
 ```
+
+Views and time-series collections are not copied, and a database holding one is
+refused unless `-P allow_skipped_namespaces=true` accepts a copy that omits
+them. User credentials are never exposed by the server, so users and roles are
+not recreated.
 
 See [MongoDB fidelity details](docs/modules/MONGODB.md).
 
@@ -679,6 +721,8 @@ single source of truth for running the program (Italian):
   [filesystem](docs/modules/FILESYSTEM.md) ·
   [s3](docs/modules/S3.md)
 - [QA guide](docs/QA_GUIDE.md)
+- [Fidelity matrices](docs/testing/POSTGRES_MATRIX.md) — the per-row catalogue
+  behind the runners, [filesystem](docs/testing/FILESYSTEM_MATRIX.md) included
 - [Release notes](CHANGELOG.md)
 - [End-to-end harness](e2e/README.md)
 

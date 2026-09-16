@@ -83,7 +83,7 @@ documented as harmless.
 | `PutBucketPolicy` / `PutBucketVersioning` | no (by type) | the source only reads the bucket policy and its versioning status | T-IMMUT-LINT, T-S3-IMMUT |
 | `CreateBucket` | no (by type) | destination-only | T-IMMUT-LINT, T-S3-IMMUT |
 | A write reached from a read-side file through a raw SDK client | no | the whole read side is `crates/rb-s3/src/source.rs`, which the lint greps for every writing operation name; the lint now fails if that file disappears | T-IMMUT-LINT |
-| Read calls used (`ListObjectsV2`, `HeadObject`, `GetObject`, `GetObjectTagging`, `GetObjectAcl`, `GetBucketPolicy`, `GetBucketVersioning`) | yes, read-only | exactly the methods `ReadOnlyS3` exposes; a read-only credential is the deployment guard on top: any write is `AccessDenied` at the service | T-IMMUT-S3-LP |
+| Read calls used (`ListObjectsV2`, `HeadObject`, `GetObject`, `GetObjectTagging`, `GetObjectAcl`, `GetBucketPolicy`, `GetBucketVersioning`) | yes, read-only | the methods `ReadOnlyS3` exposes, which are these seven plus `GetBucketLocation` — carried on the wrapper so that a read nobody issues today still cannot arrive from a raw client, and consequently absent from the least-privilege policy below; a read-only credential is the deployment guard on top: any write is `AccessDenied` at the service | T-IMMUT-S3-LP |
 
 ### Filesystem
 
@@ -155,7 +155,10 @@ GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO rb_ro;
 
 The role needs no superuser attribute, no `CREATEDB` and no `CREATEROLE`. The
 run warns when the source role has any of them, or any write grant, because a
-guard you can verify beats a guard you trust (evidence lands in § 4.2).
+guard you can verify beats a guard you trust: `warn_if_role_can_write`
+(`crates/rb-postgres/src/connect.rs`) probes the role once per run and logs
+`source role <user> can write to the source; a read-only role is recommended`.
+The recipe above is the one `T-IMMUT-PG-LP` runs, on 10, 13, 14, 16 and 18.
 
 ### MongoDB
 

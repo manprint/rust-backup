@@ -31,7 +31,7 @@ vince sul default compilato nel programma.
 | `RUST_BACKUP_SECRET` | `--secret` | nessuno |
 | `RUST_BACKUP_SECRET_FILE` | `--secret-file` | nessuno |
 | `RUST_BACKUP_CARRIERS` | `--carriers` | `1` |
-| `RUST_BACKUP_UDP` | `--udp` | attivo |
+| `RUST_BACKUP_UDP` | `--udp` | `true` |
 | `RUST_BACKUP_INSECURE` | `--insecure` | disattivo |
 | `RUST_BACKUP_MAX_RATE` | `--max-rate` | illimitato |
 | `RUST_BACKUP_YES` | `--yes` | disattivo |
@@ -48,7 +48,7 @@ vince sul default compilato nel programma.
 | `RUST_BACKUP_TLS_CERT` | `--tls-cert` | nessuno |
 | `RUST_BACKUP_TLS_KEY` | `--tls-key` | nessuno |
 | `RUST_BACKUP_MAX_CONNS` | `--max-conns` | `256` |
-| `RUST_BACKUP_UDP` | `--udp` | attivo |
+| `RUST_BACKUP_UDP` | `--udp` | `true` |
 
 ## Sessioni (`run`)
 

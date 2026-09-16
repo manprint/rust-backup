@@ -29,4 +29,10 @@ bash scripts/source_readonly_lint.sh --selftest
 echo "==> help/USAGE parity"
 bash scripts/help_parity.sh
 
+# Reuses the binary built above (env_inventory.sh honours RUST_BACKUP_BIN and
+# defaults to the same path), so the parity step costs no second build.
+echo "==> documentation parity (flags, variables, defaults)"
+RUST_BACKUP_BIN=${RUST_BACKUP_BIN:-target/debug/rust-backup} bash scripts/docs_parity.sh
+RUST_BACKUP_BIN=${RUST_BACKUP_BIN:-target/debug/rust-backup} bash scripts/docs_parity.sh --selftest
+
 echo "==> ALL GATES PASSED"

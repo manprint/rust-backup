@@ -25,7 +25,7 @@ Se il server è stato avviato con un segreto, diventano tre:
 | `--secret <stringa>` | `RUST_BACKUP_SECRET` | nessuno | segreto condiviso HMAC; deve coincidere con quello del server. Da preferire in variabile d'ambiente o file |
 | `--secret-file <file>` | `RUST_BACKUP_SECRET_FILE` | nessuno | stesso segreto letto da file (newline finale ignorato, file vuoto = errore). Esclusivo rispetto a `--secret` |
 | `--carriers <n>` | `RUST_BACKUP_CARRIERS` | `1` | numero di flussi dati paralleli **richiesti**, intervallo `1..=32`. Il valore effettivo è negoziato (vedi sotto) |
-| `--udp[=true\|false]` | `RUST_BACKUP_UDP` | attivo | tenta il percorso diretto UDP/QUIC; in caso di fallimento si usa il relay senza interrompere nulla |
+| `--udp[=true\|false]` | `RUST_BACKUP_UDP` | `true` | tenta il percorso diretto UDP/QUIC; in caso di fallimento si usa il relay senza interrompere nulla |
 | `--no-udp` | — | — | negazione esplicita di `--udp`: forza il solo relay. **Vince su `--udp` e sulla variabile d'ambiente** |
 | `--insecure` | `RUST_BACKUP_INSECURE` | disattivo | salta la verifica del certificato TLS. Solo per test isolati: annulla la protezione contro un coordinatore ostile |
 | `--max-rate <byte/s>` | `RUST_BACKUP_MAX_RATE` | illimitato | tetto aggregato al payload prodotto dalla sorgente. `0` o assente = nessun limite. Si imposta sul lato sorgente, dove i dati vengono generati |

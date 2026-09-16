@@ -1,6 +1,10 @@
 # Implementation status — v0.1.0, QA handoff
 
-The current executable work is tracked by
+> **Superseded as the entry point.** The work in progress is the hardening plan
+> [001_plan-Hardening/STATE.md](001_plan-Hardening/STATE.md); read that file
+> first. This page stays as the record of what V3 proved and how.
+
+The executable work of the V3 cycle was tracked by
 [RUST_BACKUP_PLAN_V3.md](RUST_BACKUP_PLAN_V3.md) — the final plan: bug register
 (B1–B12), phases F1–F7, and the QA exit criteria. Live Docker and privileged
 network-namespace results belong in `V1_LIVE_RESULTS.md`; do not mark a matrix

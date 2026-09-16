@@ -878,7 +878,7 @@ for CASE in "${CASES[@]}"; do
     fail_row "CONSTR-LINE" "the destination printed no 'constraints:' line"
   fi
 
-  # I-NOTEMP: the source must not spill. Since § 3.3 the fingerprint folds an
+  # I-NOTEMP (test ID T-PG-FP2): the source must not spill. Since § 3.3 the fingerprint folds an
   # order-independent commitment and no longer sorts, so what remains is the
   # data stream's `ORDER BY`, which the destination read-back depends on (see
   # the Limits bullet in docs/modules/POSTGRES.md). The check therefore still
