@@ -44,16 +44,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-ci-
 
+      # The gate itself runs the relay-only test suite and the rustdoc build:
+      # both used to live here only, so a green `scripts/gates.sh` could still
+      # meet a red CI.
       - name: Run the repository gate
         run: bash scripts/gates.sh
-
-      - name: Test relay-only feature set
-        run: cargo test --workspace --locked --no-default-features
-
-      - name: Build documentation with warnings denied
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --locked --all-features --no-deps
 
   portability:
     name: Build ${{ matrix.profile }}

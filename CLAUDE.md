@@ -111,7 +111,9 @@ the ⟦OPUS GATE⟧ rows in the plan.
 3. **Gates** (every sub-phase): `bash scripts/gates.sh` ⇒ `cargo fmt --all --check`
    · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo build
    --all-features` · `cargo build --no-default-features` · `cargo test
-   --all-features` · `scripts/crate_invariants.sh` ·
+   --all-features` · `cargo test --no-default-features` · `cargo doc
+   --all-features --no-deps` under `RUSTDOCFLAGS=-D warnings` ·
+   `scripts/crate_invariants.sh` ·
    `scripts/source_readonly_lint.sh` (+ `--selftest`) · `scripts/help_parity.sh` ·
    `scripts/docs_parity.sh` (+ `--selftest`).
    Plus the relevant `e2e/` script.

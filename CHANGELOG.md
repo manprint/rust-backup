@@ -139,6 +139,14 @@ backend.
   `pg-lock-timeout`, `pg-destination-kill`, `pg-concurrent-writer`,
   `pg-plan-rejected` and `pg-row-count-mismatch`.
 
+- **The gate is the CI job again.** `scripts/gates.sh` only *built* the
+  relay-only feature set and never built the documentation, while CI's
+  `rust-quality` job ran `cargo test --no-default-features` and `cargo doc
+  --all-features` under `RUSTDOCFLAGS=-D warnings` as two steps of its own — so
+  a green gate could still meet a red CI, which it did, on a public doc comment
+  linking to a `pub(crate)` type. Both steps moved into the gate and out of the
+  workflow, which now runs `bash scripts/gates.sh` and nothing else.
+
 ### Documentation parity
 
 - **`scripts/docs_parity.sh` fails when the operator guide stops describing the

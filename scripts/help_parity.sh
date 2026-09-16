@@ -41,7 +41,7 @@ cli_flags() {
 # legitimately show (cargo, docker, git, our own gate scripts, the pg_dump
 # oracle in e2e/README.md, and the mongod/mc switches the I-IMMUT evidence
 # recipes quote: `--profile 0 --slowms 0` and `mc admin trace --json`).
-not_ours='^--(all|all-features|all-targets|no-default-features|release|locked|rm|network|entrypoint|name|env-file|detach|check|selftest|ff-only|now|lib|schema-only|no-sync|profile|slowms|json)$'
+not_ours='^--(all|all-features|all-targets|no-default-features|no-deps|release|locked|rm|network|entrypoint|name|env-file|detach|check|selftest|ff-only|now|lib|schema-only|no-sync|profile|slowms|json)$'
 doc_flags() {
   grep -hEo -- '--[a-z0-9][a-z0-9-]*' "$@" | grep -Ev "$not_ours" | sort -u
 }

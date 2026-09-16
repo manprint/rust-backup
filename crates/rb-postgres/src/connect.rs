@@ -32,7 +32,8 @@ pub const MIN_PG_MAJOR: u32 = 10;
 /// A live PostgreSQL connection plus its probed server version.
 ///
 /// Read-write: this is the destination/restore side. The source side uses
-/// [`ReadOnlyConnection`], whose client cannot express a write at all.
+/// `ReadOnlyConnection` (crate-private), whose client cannot express a write
+/// at all.
 pub struct PgConnection {
     /// The query client (the protocol driver task runs in the background).
     pub client: Client,

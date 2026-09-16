@@ -21,8 +21,11 @@ bash scripts/gates.sh
 ```
 
 It chains `cargo fmt --all --check`, `cargo clippy --all-targets --all-features
--- -D warnings`, both builds, `cargo test --all-features`,
-`scripts/crate_invariants.sh`, `scripts/source_readonly_lint.sh` (plus its
+-- -D warnings`, both builds, both test suites (`--all-features` and the
+relay-only `--no-default-features`), `cargo doc --all-features --no-deps` with
+`RUSTDOCFLAGS=-D warnings` — a public item that links to a `pub(crate)` one is
+an error there and nowhere else — `scripts/crate_invariants.sh`,
+`scripts/source_readonly_lint.sh` (plus its
 `--selftest`, so a lint that can no longer detect a write fails the gate),
 `scripts/help_parity.sh` and `scripts/docs_parity.sh` (also with its
 `--selftest`, for the same reason).

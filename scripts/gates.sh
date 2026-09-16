@@ -19,6 +19,15 @@ cargo build --locked --no-default-features
 echo "==> cargo test --locked --all-features"
 cargo test --locked --all-features
 
+echo "==> cargo test --workspace --locked --no-default-features (relay-only)"
+cargo test --workspace --locked --no-default-features
+
+# A public item may only link to another public item: `-D warnings` turns a
+# link to a `pub(crate)` type into an error, and CI ran this step where the
+# gate did not.
+echo "==> cargo doc --workspace --locked --all-features --no-deps (warnings denied)"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --all-features --no-deps
+
 echo "==> crate lint invariants"
 bash scripts/crate_invariants.sh
 
