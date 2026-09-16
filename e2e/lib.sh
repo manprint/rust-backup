@@ -194,8 +194,17 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
             kind = b'd'
         elif stat.S_ISLNK(st.st_mode):
             kind = b'l'
+        elif stat.S_ISFIFO(st.st_mode):
+            kind = b'p'
+        elif stat.S_ISCHR(st.st_mode):
+            kind = b'c'
+        elif stat.S_ISBLK(st.st_mode):
+            kind = b'b'
         else:
             kind = b'?'
+        # A device node is its device number: same path and mode with a
+        # different major/minor is a different device.
+        rdev = str(st.st_rdev).encode() if kind in (b'c', b'b') else b'-'
         hardlink = b'-'
         if kind == b'f' and st.st_nlink > 1:
             key = (st.st_dev, st.st_ino)
@@ -205,7 +214,7 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
             hardlink = str(hardlinks[key]).encode()
         header = b'\0'.join((kind, rel, str(stat.S_IMODE(st.st_mode)).encode(),
             str(st.st_uid).encode(), str(st.st_gid).encode(), str(st.st_mtime_ns).encode(),
-            str(st.st_size).encode(), hardlink)) + b'\n'
+            str(st.st_size).encode(), hardlink, rdev)) + b'\n'
         h.update(header)
         if kind == b'f':
             with open(path, 'rb', buffering=0) as f:
@@ -235,7 +244,11 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
         if stat.S_ISREG(st.st_mode): kind = 'f'
         elif stat.S_ISDIR(st.st_mode): kind = 'd'
         elif stat.S_ISLNK(st.st_mode): kind = 'l'
+        elif stat.S_ISFIFO(st.st_mode): kind = 'p'
+        elif stat.S_ISCHR(st.st_mode): kind = 'c'
+        elif stat.S_ISBLK(st.st_mode): kind = 'b'
         else: kind = '?'
+        rdev = str(st.st_rdev) if kind in ('c', 'b') else '-'
         link_group = '-'
         if kind == 'f' and st.st_nlink > 1:
             key = (st.st_dev, st.st_ino)
@@ -253,7 +266,7 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
         elif kind == 'l':
             payload = os.readlink(path)
         print('\t'.join((kind, rel, oct(stat.S_IMODE(st.st_mode)), str(st.st_uid),
-            str(st.st_gid), str(st.st_mtime_ns), str(st.st_size), link_group, payload)))
+            str(st.st_gid), str(st.st_mtime_ns), str(st.st_size), link_group, rdev, payload)))
 PY
 }
 
@@ -271,6 +284,148 @@ for base, dirs, names in os.walk(root, topdown=True, followlinks=False):
 for path, atime in rows:
     print(f"{path}\t{atime}")
 PY
+}
+
+# The `docs/testing/FILESYSTEM_MATRIX.md` fixture: one deterministic group of
+# entries per row, named after the row (`m04_setuid`, `m19_hard_a`, ...), so a
+# failing digest can be read back to the case it belongs to. `mode` is `root`
+# or `user`: the rows that need privilege to create (modes 0000, foreign
+# owners, device nodes — 09, 10, 12, 13, 25, 26) are seeded only in `root`
+# mode, and every other row is built in both so the unprivileged pass covers
+# the same ground it can cover.
+#
+# Refusal rows (27, 28, 29) each abort a whole run, so they are separate
+# seeders below rather than part of this tree.
+rb_seed_filesystem_matrix_fixture() { # root [root|user]
+  local root=$1 mode=${2:-user}
+  mkdir -p "$root"
+
+  # 01 plain files, three modes. 02 an empty file.
+  printf 'm01 0644\n' >"$root/m01_a.txt"
+  printf 'm01 0600\n' >"$root/m01_b.txt"
+  printf 'm01 0400\n' >"$root/m01_c.txt"
+  chmod 0644 "$root/m01_a.txt"
+  chmod 0600 "$root/m01_b.txt"
+  chmod 0400 "$root/m01_c.txt"
+  : >"$root/m02_empty"
+
+  # 03 empty nested directories.
+  mkdir -p "$root/m03_dir/deep/deeper"
+
+  # 04-06 the special mode bits on files, 07-08 on directories.
+  printf 'm04\n' >"$root/m04_setuid"
+  printf 'm05\n' >"$root/m05_setgid"
+  printf 'm06\n' >"$root/m06_setuid_setgid"
+  chmod 4755 "$root/m04_setuid"
+  chmod 2755 "$root/m05_setgid"
+  chmod 6755 "$root/m06_setuid_setgid"
+  mkdir -p "$root/m07_setgid_dir" "$root/m08_sticky_dir"
+  printf 'm07\n' >"$root/m07_setgid_dir/file.txt"
+  printf 'm08\n' >"$root/m08_sticky_dir/file.txt"
+  chmod 2775 "$root/m07_setgid_dir"
+  chmod 1777 "$root/m08_sticky_dir"
+
+  # 11 a directory that only its owner may read, holding a read-only file. The
+  # directory mode goes on last: 0500 still allows the walk (r-x), but the file
+  # has to exist first.
+  mkdir -p "$root/m11_dir"
+  printf 'm11\n' >"$root/m11_dir/ro.txt"
+  chmod 0400 "$root/m11_dir/ro.txt"
+  chmod 0500 "$root/m11_dir"
+
+  # 14-18 symlinks: relative, absolute, dangling, to a directory, and a loop.
+  ln -s m01_a.txt "$root/m14_rel_link"
+  ln -s "$root/m01_a.txt" "$root/m15_abs_link"
+  ln -s m16_nowhere "$root/m16_dangling"
+  ln -s m03_dir "$root/m17_dir_link"
+  ln -s m18_loop_b "$root/m18_loop_a"
+  ln -s m18_loop_a "$root/m18_loop_b"
+
+  # 19-21 hardlinks: a pair, a triple across directories, and one to a setuid
+  # file (the mode must survive on every name).
+  printf 'm19\n' >"$root/m19_hard_a"
+  ln "$root/m19_hard_a" "$root/m19_hard_b"
+  mkdir -p "$root/m20_dir1" "$root/m20_dir2" "$root/m20_dir3"
+  printf 'm20\n' >"$root/m20_dir1/m20_hard_a"
+  ln "$root/m20_dir1/m20_hard_a" "$root/m20_dir2/m20_hard_b"
+  ln "$root/m20_dir1/m20_hard_a" "$root/m20_dir3/m20_hard_c"
+  printf 'm21\n' >"$root/m21_setuid_src"
+  chmod 4755 "$root/m21_setuid_src"
+  ln "$root/m21_setuid_src" "$root/m21_hard_link"
+
+  # 24 a FIFO. Its mode is set explicitly because mkfifo applies the umask.
+  mkfifo "$root/m24_fifo"
+  chmod 0640 "$root/m24_fifo"
+
+  # 30 a sparse file: 64 MiB of hole with 4 KiB written at 32 MiB. Restored
+  # dense — size and content are identical, disk usage is not (documented).
+  truncate -s 64M "$root/m30_sparse.bin"
+  dd if=/dev/urandom of="$root/m30_sparse.bin" bs=4096 count=1 seek=8192 \
+    conv=notrunc status=none
+
+  if [[ $mode == root ]]; then
+    # 09-10 modes that deny even their owner; only root can walk back into them.
+    mkdir -p "$root/m09_mode000_dir"
+    printf 'm09\n' >"$root/m09_mode000_dir/file.txt"
+    printf 'm10\n' >"$root/m10_mode000.txt"
+    chmod 0000 "$root/m10_mode000.txt"
+    chmod 0000 "$root/m09_mode000_dir"
+    # 12-13 foreign owners, one that exists on the host and one that does not.
+    printf 'm12\n' >"$root/m12_nobody.txt"
+    printf 'm13\n' >"$root/m13_ghost.txt"
+    local nobody_uid nobody_gid
+    nobody_uid=$(id -u nobody 2>/dev/null || echo 65534)
+    nobody_gid=$(id -g nobody 2>/dev/null || echo 65534)
+    chown "$nobody_uid:$nobody_gid" "$root/m12_nobody.txt"
+    chown 12345:12345 "$root/m13_ghost.txt"
+    # 25-26 device nodes.
+    mknod "$root/m25_chardev" c 1 3
+    mknod "$root/m26_blockdev" b 7 0
+    chmod 0660 "$root/m25_chardev" "$root/m26_blockdev"
+  fi
+
+  # 22-23 timestamps at both extremes, set last so nothing above moves them
+  # again. Pre-epoch and far-future both have to round-trip, nanoseconds
+  # included.
+  printf 'm22\n' >"$root/m22_pre_epoch.txt"
+  printf 'm23\n' >"$root/m23_future.txt"
+  touch -d '1960-01-01 00:00:00' "$root/m22_pre_epoch.txt"
+  touch -d '2100-01-01 00:00:00.123456789' "$root/m23_future.txt"
+}
+
+# M-FS-27. A unix socket cannot be reproduced, so the whole run is refused
+# while analyzing; it therefore cannot share a tree with the round-trip rows.
+rb_seed_fs_refusal_socket() { # root
+  mkdir -p "$1"
+  printf 'm27\n' >"$1/m27_file.txt"
+  python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' \
+    "$1/m27_socket"
+}
+
+# M-FS-28. A POSIX name is an arbitrary byte string; this one is not UTF-8, so
+# the plan cannot carry it and the run is refused instead of silently renaming
+# the entry to contain U+FFFD.
+rb_seed_fs_refusal_nonutf8() { # root
+  mkdir -p "$1"
+  python3 -c 'import os, sys
+root = os.fsencode(sys.argv[1])
+with open(os.path.join(root, b"m28_\xff\xfe"), "wb") as handle:
+    handle.write(b"m28\n")' "$1"
+}
+
+# M-FS-29. Deeper than `MAX_WALK_DEPTH` (1024): the walk recurses, so an
+# adversarially deep tree has to be refused rather than overflow the stack.
+rb_seed_fs_refusal_depth() { # root [levels]
+  local root=$1 levels=${2:-1025}
+  mkdir -p "$root"
+  (
+    cd "$root" || exit 1
+    local level
+    for ((level = 0; level < levels; level++)); do
+      mkdir d && cd d || exit 1
+    done
+    printf 'm29\n' >bottom.txt
+  )
 }
 
 rb_seed_filesystem_fixture() { # root [large bytes] [bulk files]

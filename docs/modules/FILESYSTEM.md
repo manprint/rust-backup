@@ -12,6 +12,9 @@ deletes pre-existing entries as part of a restore.
 | mode (rwx, setuid/gid, sticky) | always | always | none |
 | mtime | always | always | none |
 | symlinks / hardlinks | always | recreated | none |
+| FIFOs (named pipes) | the node, never its contents | recreated | none |
+| character / block device nodes | the node and its device number | recreated | **root or `CAP_MKNOD`** |
+| unix sockets | **refused while analyzing** | — | — |
 | **uid / gid (ownership)** | always (recorded in plan) | **only when privileged** | **root or `CAP_CHOWN`** |
 | xattrs | not yet supported | not yet supported | — |
 | **access time (atime) of the source** | left untouched (`O_NOATIME`) | — | **file ownership or `CAP_FOWNER`**; without it the run fails unless `--allow-atime-updates` is passed |
@@ -26,7 +29,26 @@ tree are reproduced. Give the root the permissions you want before the run.
 
 Files and directories are created owner-only (`0600` / `0700`) and widened to
 their recorded mode once the content and ownership are in place, so a restore
-never leaves a world-readable window on a file whose final mode is private.
+never leaves a world-readable window on a file whose final mode is private. The
+same applies to FIFOs and device nodes; their mode is set without ever opening
+them, because opening a FIFO waits for a peer and opening a device talks to the
+device.
+
+A FIFO carries no data item: what is in the pipe belongs to the processes at
+either end, not to the filesystem. A unix socket is refused instead of
+recreated — the inode can be made, but it would be a dead node that no listener
+owns, and copying it would certify something the source does not have:
+
+```text
+[Analyze] unsupported filesystem entry (a unix socket cannot be reproduced): /srv/data/app.sock
+```
+
+Device nodes are the one kind whose restore needs a capability of its own, and
+the destination says so at preflight rather than failing halfway through:
+
+```text
+restoring device nodes needs root or CAP_MKNOD (2 device entries in the plan)
+```
 
 ## The sudo / ownership case (important)
 
@@ -79,6 +101,20 @@ controlled from the destination's point of view. Concretely:
   restores run.
 - A plan that carries extended attributes is refused at preflight, since this
   build does not restore them.
+- Directory creation never follows a symlink planted in the destination.
+  `create_dir_all` treats a symlink that points at a directory as an existing
+  directory, so anything able to write the destination's parent between the
+  emptiness check and the restore could redirect the whole tree elsewhere.
+  Planned directories are therefore created one level at a time, and a path that
+  already exists must be a real directory (`symlink_metadata`, which does not
+  follow) or the restore stops:
+
+  ```text
+  [Apply] destination path was replaced by a symlink during restore: /restore/a
+  ```
+
+  The destination root gets the same check, reported as
+  `destination root is a symlink: /restore`.
 - Metadata verification sorts the received entries before comparing, so it does
   not depend on the peer's ordering.
 
@@ -117,6 +153,15 @@ over paths, metadata, link targets and contents. The vector list, the
 fingerprint contract and the access-time rule are in
 [docs/IMMUTABILITY.md](../IMMUTABILITY.md).
 
+**What that costs.** The fingerprint hashes every file's full contents, and it
+runs twice — before the transfer and after it. A backup therefore reads the
+source tree **three times**: once for the baseline, once to stream it, once to
+prove it did not change. On a tree of a few gigabytes this is the dominant cost
+of the run, and on a slow disk it roughly triples the time a plain copy would
+take. It is not an optimisation that was forgotten: it is the evidence behind
+`BACKUP VERIFIED: source unchanged`, and a fingerprint over metadata alone would
+certify a tree whose contents had been rewritten in place.
+
 ## Current limits
 
 - `--follow-symlinks` is rejected. Following a link could escape the declared
@@ -128,6 +173,16 @@ fingerprint contract and the access-time rule are in
   nor holds `CAP_FOWNER`, the kernel rejects that flag and the run fails unless
   `--allow-atime-updates` accepts the access-time change (see "Immutability").
 - The destination root's own metadata is never restored (see above).
+- **Sparse files are restored dense.** A file with holes comes back with the
+  same size and byte-for-byte the same content — the holes read as zeros, and
+  that is what is written — so the restore is correct but can occupy more disk
+  space than the source did. Nothing in the plan records where the holes were.
+- Extended attributes and POSIX ACLs are **not captured at all**, so a restore
+  cannot reproduce them; asking for them with `--preserve-xattr` is refused
+  while connecting rather than silently dropped.
+- Unix sockets are refused while analyzing (see "What is preserved"). FIFOs and
+  device nodes round-trip, devices only where the destination has root or
+  `CAP_MKNOD`.
 - `SIGINT`/`SIGTERM` abort the run: the active item is removed, no `VERIFIED`
   line is printed, and the process exits non-zero with an explicit "interrupted
   by SIGINT/SIGTERM" message. Items already completed before the signal stay on

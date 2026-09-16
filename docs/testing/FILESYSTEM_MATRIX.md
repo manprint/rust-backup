@@ -1,11 +1,21 @@
 # Filesystem fidelity matrix
 
 Catalogue of the POSIX filesystem cases the module must reproduce 1:1, or refuse
-before any byte is transferred. The runner is `e2e/filesystem_matrix.sh`: it
-prints one `PASS <ID>`, `FAIL <ID>` or `SKIP <ID>` line per row and a final
-`MATRIX FS: p pass, f fail` summary. This document is the catalogue only — it
-never records execution status; the runner output is the single source of truth
-for that.
+before any byte is transferred. The runner is `e2e/filesystem_matrix.sh` (root
+only): it prints one `PASS <ID>`, `FAIL <ID>` or `SKIP <ID>` line per row and a
+final `MATRIX FS: p pass, f fail, s skip` summary. This document is the
+catalogue only — it never records execution status; the runner output is the
+single source of truth for that.
+
+Every round-trip row is exercised twice, because privilege changes what the
+restore can promise: once with both peers as root and ownership preserved
+(`M-FS-nn`), and once with an unprivileged account seeding, sending and
+restoring its own tree with `--no-preserve-ownership` (`M-FS-nn/user`, which
+compares every field except uid/gid). A row that needs privilege to *create* is
+`SKIP`ped in the unprivileged pass. Two extra lines carry checks that belong to
+a row but are not a manifest comparison: `M-FS-30/content` (`cmp` of the sparse
+file) and `M-FS-25/26-privilege` (a destination without `CAP_MKNOD` must refuse
+the plan at preflight).
 
 Row IDs are `M-FS-<nn>` and the seeded entries embed the row number
 (`m01_plain.txt`, `m14_rel_link`, ...). `Requires` is `root` when the row is
@@ -53,6 +63,6 @@ destination tree left behind). `Oracle` names the check that decides the row:
 | M-FS-27 | unix socket | none | `rb_seed_fs_refusal_socket` | refused before transfer | refusal |
 | M-FS-28 | non-UTF-8 file name | none | `rb_seed_fs_refusal_nonutf8` | refused before transfer | refusal (lossy path display) |
 | M-FS-29 | tree deeper than 1024 | none | `rb_seed_fs_refusal_depth` | refused before transfer | refusal |
-| M-FS-30 | sparse 64 MiB file: size and content equal, holes not preserved (documented limit) | none | `rb_seed_filesystem_matrix_fixture` | round-trip | tree digest + content compare |
-| M-FS-31 | xattr present with `--preserve-xattr` | none | unit test `rb-filesystem` | refused at connect (existing behaviour) | refusal |
-| M-FS-32 | non-owner source without `--allow-atime-updates`; round-trip with the flag | root | `rb_seed_filesystem_matrix_fixture` (root mode) plus a non-owner run | refused before transfer, then round-trip | refusal, then tree digest + atime manifest |
+| M-FS-30 | sparse 64 MiB file: size and content equal, holes not preserved (documented limit) | none | `rb_seed_filesystem_matrix_fixture` | round-trip (dense) | tree digest + content compare |
+| M-FS-31 | xattr present with `--preserve-xattr` | none | any tree, run with `--preserve-xattr` | refused at connect | refusal |
+| M-FS-32 | non-owner source without `--allow-atime-updates`; round-trip with the flag | root | `rb_seed_filesystem_fixture` owned by root, read by an unprivileged account | refused before transfer, then round-trip | refusal, then tree digest + atime manifest |

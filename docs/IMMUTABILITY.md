@@ -109,7 +109,7 @@ backend:
 | PostgreSQL | the structural catalog (planner estimates normalized out) plus, per data-bearing table, the row count and an order-independent 128-bit commitment (the wrapping sum of `md5(row)`); prefix `rust-backup/pg-fingerprint/v2` | one full read of every table, streamed and folded client-side — no server sort, no temporary file | `SourceMutated`, exit `6`; a destination that already applied the payload drops the databases it created |
 | MongoDB | per collection: `count_documents` and an `_id`-ordered content checksum, plus the catalog; prefix `rust-backup/mongo-fingerprint/v1` | one full read of every collection | `SourceMutated`, exit `6` |
 | S3 | the object listing (key, size, etag, metadata) and the bucket policy; prefix `rust-backup/s3-fingerprint/v2` | one listing; object bodies are not re-read | `SourceMutated`, exit `6` |
-| Filesystem | per entry: path, kind, size, mode, uid, gid, mtime (with nanoseconds), link target, hardlink target, and the file's contents | one full read of the tree | `SourceMutated`, exit `6` |
+| Filesystem | per entry: path, kind, size, mode, uid, gid, mtime (with nanoseconds), link target, hardlink target, device number, and the file's contents | one full read of the tree — so a run reads the source three times in total (baseline, stream, audit), which is the dominant cost on large trees | `SourceMutated`, exit `6` |
 
 Two properties matter as much as the content:
 

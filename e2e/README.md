@@ -15,6 +15,7 @@ return non-zero on any failure.
 | `postgres_large_table.sh` | T-PG-RSS | 3.4 | one 2 GiB table end to end, peak RSS of both peers sampled and capped |
 | `mongodb_matrix.sh` | T-MONGO-IMMUT, T-IMMUT-MONGO-LP | 3, 4.7 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite + a full run as a `read`-only user, proven from the mongod command log |
 | `filesystem_netns_test.sh` | T-FS-OWN, T-FS-IMMUT | 4 | ownership (root vs non-root) + immutability |
+| `filesystem_matrix.sh` | T-FS-MATRIX, T-FS-SPECIAL, T-FS-ATIME | 5.3 | every `M-FS-*` row: a privileged pass and an unprivileged one over the whole fixture, the three refusals, the access-time guard and the xattr refusal. Root only |
 | `filesystem_disk_full.sh` | T-FS-ENOSPC | F2.4 | real ext4 ENOSPC, abort propagation, cleanup + immutability |
 | `bandwidth_netem.sh` | T-BW | 6 | asymmetric bandwidth/RTT, backpressure proof |
 | `s3_minio_test.sh` | T-S3-IMMUT, T-IMMUT-S3-LP | 5, 4.7 | MinIO 1:1 + a full run under a read-only policy, proven from `mc admin trace` and by a refused write |
@@ -38,7 +39,8 @@ or expose a root-owned runner with narrowly validated inputs.
 
 `full_matrix.sh` runs plain and TLS relay (one and four carriers), the non-sudo
 fault bank, session orchestration, resource hygiene, and MinIO. Set
-`RUST_BACKUP_PRIVILEGED=1` for filesystem/ENOSPC/transport/bandwidth sudo tests.
+`RUST_BACKUP_PRIVILEGED=1` for the filesystem metadata and matrix runs, ENOSPC,
+transport and bandwidth sudo tests.
 Set `RUST_BACKUP_FULL_DB_MATRIX=1` to additionally run PostgreSQL 10..18 and
 MongoDB 4..8 same-version matrices plus the configured cross-version pairs.
 Each successful E2E path calls `rb_assert_formal_verification`: both peers must
@@ -65,6 +67,8 @@ I-IMMUT evidence from the server's own log. Fixtures live in
 | `rb_mongo_assert_readonly_log <container> [since] [app]` | fails when any command the mongod logged for `appName=<app>` (default `rust-backup`) writes; needs the container started with `--profile 0 --slowms 0`, which logs every command without writing a profile collection. `aggregate` is judged by its pipeline — the driver runs `count_documents` as one — and an empty window is a failure, since silence is not evidence |
 | `rb_minio_readonly_policy <bucket>` | prints the least-privilege MinIO policy for a source bucket: `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning` on the bucket and `s3:GetObject`, `s3:GetObjectTagging` on its objects (on AWS, add `s3:GetObjectAcl`) |
 | `rb_minio_assert_readonly_trace <trace-file>` | fails when any `s3.*` API in a `mc admin trace --json` capture is not a read; an empty capture is a failure too |
+| `rb_seed_filesystem_matrix_fixture <root> [root\|user]` | seeds one deterministic group of entries per `docs/testing/FILESYSTEM_MATRIX.md` row, named after it (`m04_setuid`, `m19_hard_a`, ...). `root` mode adds the rows that need privilege to create: modes 0000, foreign owners, device nodes |
+| `rb_seed_fs_refusal_socket\|nonutf8\|depth <root>` | one seeder per refusal row (M-FS-27/28/29). Each aborts a whole run, so each needs its own tree |
 
 Environment switches the scripts read:
 

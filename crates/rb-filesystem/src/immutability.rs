@@ -24,6 +24,11 @@ pub(crate) async fn fingerprint(params: &FilesystemParams) -> Result<String> {
         if let Some(target) = &entry.hardlink_to {
             hasher.update(target.as_bytes());
         }
+        // A device node's identity is its device number: same path, same mode,
+        // different major/minor is a different device.
+        if let Some(rdev) = entry.rdev {
+            hasher.update(&rdev.to_le_bytes());
+        }
         if entry.kind == "file" {
             let path = crate::walk::at_root(&root, &entry.path, Phase::Analyze)?;
             read_noatime(&path, params.allow_atime_updates, Phase::Analyze, |bytes| {

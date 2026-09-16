@@ -71,7 +71,7 @@ pub struct FilesystemPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilesystemEntry {
     pub path: String,
-    /// `file`, `dir`, `symlink`, or `hardlink`.
+    /// `file`, `dir`, `symlink`, `hardlink`, `fifo`, `chardev` or `blockdev`.
     pub kind: String,
     #[serde(default)]
     pub size: u64,
@@ -90,6 +90,11 @@ pub struct FilesystemEntry {
     pub target: Option<String>,
     #[serde(default)]
     pub hardlink_to: Option<String>,
+    /// Device number of a `chardev`/`blockdev` entry, `None` for every other
+    /// kind. Absent from plans written before device nodes were supported,
+    /// which is why it defaults.
+    #[serde(default)]
+    pub rdev: Option<u64>,
     /// Kept in the plan format for forward compatibility.  Xattrs are not
     /// collected until a safe std+nix-only API is available.
     #[serde(default)]
@@ -198,7 +203,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -389,6 +394,273 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // --- destination TOCTOU (§ 5.4) -----------------------------------------
+
+    /// `create_dir_all` follows a symlink that points at a directory and calls
+    /// it an existing directory. One planted between the emptiness check and
+    /// directory creation would therefore redirect the whole restore outside
+    /// the declared root.
+    #[tokio::test]
+    async fn a_planted_symlink_directory_is_refused_during_restore() {
+        let destination_root = tempdir("toctou-destination");
+        let outside = tempdir("toctou-outside");
+        std::os::unix::fs::symlink(&outside, destination_root.join("a")).unwrap();
+        let payload = FilesystemPlan {
+            root: destination_root.display().to_string(),
+            entries: vec![
+                entry("a", "dir", 0o040_755),
+                entry("a/f.txt", "file", 0o100_644),
+            ],
+            total_bytes: 0,
+            ownership_note: String::new(),
+        };
+        let error = crate::dest::create_directories(&destination_root, &payload)
+            .expect_err("a symlink in place of a planned directory must be refused");
+        assert!(
+            matches!(
+                &error,
+                rb_core::error::BackupError::Phase {
+                    phase: Phase::Apply,
+                    ..
+                }
+            ),
+            "the refusal must be Apply-phase: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("replaced by a symlink"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing may have been created through the link"
+        );
+        fs::remove_dir_all(&destination_root).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// And the same for the root itself: a symlinked destination root would
+    /// redirect every path under it.
+    #[tokio::test]
+    async fn a_symlink_destination_root_is_refused() {
+        let parent = tempdir("toctou-root");
+        let real = parent.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = crate::dest::create_destination_root(&link)
+            .expect_err("a symlinked destination root must be refused");
+        assert!(
+            matches!(
+                &error,
+                rb_core::error::BackupError::Phase {
+                    phase: Phase::Validate,
+                    ..
+                }
+            ),
+            "the refusal must be Validate-phase: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("destination root is a symlink"),
+            "unexpected error: {error}"
+        );
+        // A real, absent root is still created.
+        let fresh = parent.join("fresh");
+        crate::dest::create_destination_root(&fresh).unwrap();
+        assert!(fs::symlink_metadata(&fresh).unwrap().is_dir());
+        fs::remove_dir_all(&parent).ok();
+    }
+
+    // --- special files (§ 5.1) ----------------------------------------------
+
+    /// A FIFO is a node, not a stream: nothing is read from it, and what has to
+    /// survive is the node plus its mode and mtime.
+    #[tokio::test]
+    async fn a_fifo_roundtrips_with_mode_and_mtime() {
+        let source_root = tempdir("fifo-source");
+        let destination_root = tempdir("fifo-destination");
+        let pipe = source_root.join("pipe");
+        nix::unistd::mkfifo(&pipe, nix::sys::stat::Mode::from_bits_truncate(0o640)).unwrap();
+        // mkfifo(2) applies the umask, so state the mode instead of assuming it.
+        fs::set_permissions(&pipe, fs::Permissions::from_mode(0o640)).unwrap();
+        let source_meta = fs::symlink_metadata(&pipe).unwrap();
+
+        let source = FilesystemSource {
+            params: params(&source_root),
+        };
+        let plan = source.analyze().await.unwrap();
+        let payload = crate::source::payload(&plan, Phase::Analyze).unwrap();
+        let entry = payload
+            .entries
+            .iter()
+            .find(|entry| entry.path == "pipe")
+            .expect("the FIFO must be in the plan");
+        assert_eq!(entry.kind, "fifo");
+        assert_eq!(entry.size, 0);
+        assert!(entry.rdev.is_none(), "a FIFO has no device number");
+        assert!(plan.items.is_empty(), "a FIFO carries no data item");
+
+        let mut sink = RecordingSink::default();
+        source.stream_out(&plan, &mut sink).await.unwrap();
+        assert!(sink.chunks.is_empty());
+        let evidence = sink.evidence();
+
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        destination
+            .stream_in(&plan, &mut EventSource(VecDeque::from([ChunkEvent::End])))
+            .await
+            .unwrap();
+        destination.verify(&plan, &evidence).await.unwrap();
+
+        let restored = fs::symlink_metadata(destination_root.join("pipe")).unwrap();
+        assert!(
+            restored.file_type().is_fifo(),
+            "the node must still be a FIFO"
+        );
+        assert_eq!(restored.mode() & 0o7777, 0o640);
+        assert_eq!(restored.mtime(), source_meta.mtime());
+        assert_eq!(restored.mtime_nsec(), source_meta.mtime_nsec());
+        fs::remove_dir_all(&source_root).ok();
+        fs::remove_dir_all(&destination_root).ok();
+    }
+
+    /// A unix socket only exists while a process holds it bound. Recreating the
+    /// inode would certify something the source does not have, so the run is
+    /// refused while analyzing rather than restored as a dead node.
+    #[tokio::test]
+    async fn a_unix_socket_is_refused_at_analyze() {
+        let root = tempdir("socket-source");
+        let listener = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+        let source = FilesystemSource {
+            params: params(&root),
+        };
+        let error = source
+            .analyze()
+            .await
+            .expect_err("a unix socket must not be planned");
+        assert!(
+            matches!(
+                &error,
+                rb_core::error::BackupError::Phase {
+                    phase: Phase::Analyze,
+                    ..
+                }
+            ),
+            "the refusal must be Analyze-phase: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("unix socket"),
+            "the message must say what was refused: {error}"
+        );
+        drop(listener);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Device nodes are the one kind whose creation needs a capability, and a
+    /// destination without it has to say so at preflight.
+    #[tokio::test]
+    async fn device_entries_need_cap_mknod_at_validate() {
+        let destination_root = tempdir("mknod-destination");
+        let mut device = entry("null", "chardev", 0o020_666);
+        device.rdev = Some(259);
+        let plan = hostile_plan(&destination_root, vec![device]);
+        let without_mknod = crate::dest::Capabilities {
+            chown: true,
+            mknod: false,
+        };
+        let report =
+            crate::dest::validate_with(&params(&destination_root), &plan, without_mknod).unwrap();
+        assert!(!report.ok, "a device node without CAP_MKNOD must not pass");
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "special_files")
+            .expect("the special_files check must be reported");
+        assert!(!check.passed);
+        assert!(
+            check.detail.contains("CAP_MKNOD"),
+            "the operator has to learn what is missing: {}",
+            check.detail
+        );
+
+        let with_mknod = crate::dest::Capabilities {
+            chown: true,
+            mknod: true,
+        };
+        let report =
+            crate::dest::validate_with(&params(&destination_root), &plan, with_mknod).unwrap();
+        assert!(report.ok, "with the capability the same plan is restorable");
+        fs::remove_dir_all(&destination_root).ok();
+    }
+
+    /// Device number and kind belong together: a device entry without one, or a
+    /// non-device entry carrying one, describes something this build cannot
+    /// reproduce.
+    #[tokio::test]
+    async fn device_entry_without_rdev_is_rejected() {
+        let destination_root = tempdir("rdev-destination");
+        let plan = hostile_plan(
+            &destination_root,
+            vec![entry("null", "blockdev", 0o060_600)],
+        );
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let error = destination
+            .validate(&plan)
+            .await
+            .expect_err("a device entry without a device number must be refused");
+        assert!(
+            error.to_string().contains("device number"),
+            "unexpected error: {error}"
+        );
+
+        let mut file = entry("f", "file", 0o100_644);
+        file.rdev = Some(259);
+        let plan = hostile_plan(&destination_root, vec![file]);
+        let error = destination
+            .validate(&plan)
+            .await
+            .expect_err("a plain file must not carry a device number");
+        assert!(
+            error.to_string().contains("must not carry a device number"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(&destination_root).ok();
+    }
+
+    /// The new kinds widen the allowlist; they do not remove it.
+    #[tokio::test]
+    async fn unknown_entry_kind_is_still_rejected() {
+        let destination_root = tempdir("kind-destination");
+        let plan = hostile_plan(&destination_root, vec![entry("w", "whiteout", 0o100_644)]);
+        let destination = FilesystemDestination {
+            params: params(&destination_root),
+        };
+        let error = destination
+            .validate(&plan)
+            .await
+            .expect_err("an unknown kind must be refused");
+        assert!(
+            error.to_string().contains("unknown filesystem entry kind"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(&destination_root).ok();
+    }
+
+    /// A plan written before device nodes existed has no `rdev` field at all,
+    /// and must still deserialize — the destination is allowed to be newer than
+    /// the source.
+    #[test]
+    fn older_plan_without_rdev_deserializes() {
+        let older = r#"{"path":"f","kind":"file","size":3,"mode":33188,"uid":0,"gid":0,
+                        "mtime":1,"mtime_nsec":0,"target":null,"hardlink_to":null,"xattrs":{}}"#;
+        let entry: FilesystemEntry = serde_json::from_str(older).unwrap();
+        assert_eq!(entry.path, "f");
+        assert!(entry.rdev.is_none());
+    }
+
     /// Build a plan whose payload is exactly `entries`, with no data items.
     fn hostile_plan(root: &Path, entries: Vec<FilesystemEntry>) -> BackupPlan {
         let payload = FilesystemPlan {
@@ -422,6 +694,7 @@ mod tests {
             mtime_nsec: 0,
             target: None,
             hardlink_to: None,
+            rdev: None,
             xattrs: BTreeMap::new(),
         }
     }

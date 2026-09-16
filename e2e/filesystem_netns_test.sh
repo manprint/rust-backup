@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# T-FS-OWN, T-FS-IMMUT and T-FS-ATIME. Invoke directly:
-# sudo -n /absolute/path/to/script. Tests privileged exact restore, explicit
-# non-root ownership opt-out, strict default ownership preflight, formal
-# read-back proof, abort immutability, and the access-time guard (a non-owner
-# source is refused unless `--allow-atime-updates` accepts the atime change).
+# T-FS-OWN and T-FS-IMMUT. Invoke directly: sudo -n /absolute/path/to/script.
+# Tests privileged exact restore, explicit non-root ownership opt-out, strict
+# default ownership preflight, formal read-back proof and abort immutability.
+#
+# The access-time guard (T-FS-ATIME, M-FS-32), special files (T-FS-SPECIAL,
+# M-FS-24..27) and the CAP_MKNOD preflight live in `e2e/filesystem_matrix.sh`,
+# which owns every per-row `M-FS-*` assertion; they are not duplicated here.
 set -euo pipefail
 
 source "$(dirname "$0")/lib.sh"
@@ -133,67 +135,5 @@ if start_server "$port" "$work/abort-server.log"; then
   else fail 'mid-transfer abort changed source tree or atime'; fi
 else fail 'abort test server did not start'; fi
 
-# (d) T-FS-ATIME: a source that is not the file owner cannot use O_NOATIME, so
-# reading would move every atime. Without the opt-in the run must fail before
-# transferring anything and leave the atimes untouched; with it, the run works
-# and says so once.
-atime_src="$work/atime-source"; atime_dst="$work/atime-destination"
-mkdir -p "$atime_src"
-rb_seed_filesystem_fixture "$atime_src" $((64 * 1024))
-chown -R 0:0 "$atime_src"
-chmod -R a+rX "$atime_src"
-find "$atime_src" -type f -exec chmod 0644 {} +
-before_atime=$(rb_atime_manifest "$atime_src")
-before_tree=$(rb_tree_digest "$atime_src")
-port=$(rb_free_port)
-if start_server "$port" "$work/atime-server.log"; then
-  runuser -u "$nonroot" -- env RUST_LOG=info "$RB_E2E_BIN" filesystem source \
-    --to "127.0.0.1:$port" --channel fs-atime --no-udp --insecure \
-    --root "$atime_src" >"$work/fs-atime-source.log" 2>&1 &
-  spid=$!; PIDS+=("$spid")
-  source_rc=0; wait "$spid" || source_rc=$?
-  if (( source_rc == 0 )); then
-    fail 'a non-owner source ran without accepting atime updates'
-  elif ! grep -q 'cannot open' "$work/fs-atime-source.log"; then
-    fail 'the atime refusal lacks the documented diagnostic'
-  elif [[ "$before_atime" != "$(rb_atime_manifest "$atime_src")" ]]; then
-    fail 'the refused run moved the source atimes anyway'
-  elif [[ -e "$atime_dst" ]]; then
-    fail 'the refused run created the destination root'
-  else
-    pass 'a non-owner source without --allow-atime-updates fails and touches nothing'
-  fi
-else fail 'atime refusal server did not start'; fi
-
-mkdir -p "$atime_dst"
-port=$(rb_free_port)
-if start_server "$port" "$work/atime-accepted-server.log"; then
-  runuser -u "$nonroot" -- env RUST_LOG=info "$RB_E2E_BIN" filesystem source \
-    --to "127.0.0.1:$port" --channel fs-atime-ok --no-udp --insecure \
-    --allow-atime-updates --root "$atime_src" >"$work/fs-atime-ok-source.log" 2>&1 &
-  spid=$!; PIDS+=("$spid")
-  sleep .3
-  RUST_LOG=info "$RB_E2E_BIN" filesystem destination --to "127.0.0.1:$port" \
-    --channel fs-atime-ok --no-udp --insecure --yes \
-    --root "$atime_dst" >"$work/fs-atime-ok-destination.log" 2>&1 &
-  dpid=$!; PIDS+=("$dpid")
-  source_rc=0; destination_rc=0
-  wait "$spid" || source_rc=$?
-  wait "$dpid" || destination_rc=$?
-  if (( source_rc != 0 || destination_rc != 0 )); then
-    fail 'the accepted-atime run failed'
-  elif ! grep -q 'atime updates on the source accepted by --allow-atime-updates' \
-      "$work/fs-atime-ok-source.log"; then
-    fail 'the accepted-atime run did not warn'
-  elif ! rb_assert_formal_verification "$work/fs-atime-ok-source.log" \
-      "$work/fs-atime-ok-destination.log"; then
-    fail 'the accepted-atime run printed no formal verification'
-  elif [[ "$before_tree" != "$(rb_tree_digest "$atime_src")" ]]; then
-    fail 'the accepted-atime run changed the source tree'
-  else
-    pass '--allow-atime-updates completes the run and warns once'
-  fi
-else fail 'atime accepted server did not start'; fi
-
-printf 'T-FS-OWN/T-FS-IMMUT/T-FS-ATIME summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
+printf 'T-FS-OWN/T-FS-IMMUT summary: PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

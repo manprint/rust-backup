@@ -2,7 +2,7 @@
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan
 > file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-16 (phase 4 committed `4d1b5e7`) | **By:** `agent:opus` | **Session:** 2026-09-16
+> **Last updated:** 2026-09-16 (§ 5.6 closed, phase 5 done) | **By:** `agent:opus` | **Session:** 2026-09-16
 
 ## 0. Protocol
 
@@ -43,13 +43,13 @@ that state as `wip(<id>): <what remains>`.
 ## 1. Current unit
 
 - **Type:** `sub-phase`
-- **ID:** 5.1
+- **ID:** 6.1
 - **Status:** `none`
-- **Intent:** Filesystem special files: FIFOs and devices round-trip, sockets refused
-- **Phase:** phase_06.md — Phase 5
-- **Next action:** read phase_06.md § 5.1 and open it
+- **Intent:** Documentation audit and parity gate — write `scripts/docs_parity.sh`
+- **Phase:** phase_07.md — Phase 6
+- **Next action:** read phase_07.md § 6.1 and open it
 - **Assigned:** `agent:opus`
-- **Repo state:** phases 0-4 committed on dev; nothing in flight
+- **Repo state:** phases 0-4 committed on dev; 5.1 closed and uncommitted (phase 5 commits at its end)
 
 ## 2. Feature context (self-contained recap)
 
@@ -140,6 +140,12 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | 21 | sub-phase | 3.4 | `agent:opus` | e2e/postgres_large_table.sh: one 2 GiB table end to end with both peers' peak RSS sampled and capped at 256 MiB; CI job postgres-large | postgres_large_table.sh, e2e.yml, e2e/README.md, QA_GUIDE.md | gates.sh PASS; ShellCheck PASS; actionlint 1.7.12 clean; T-PG-RSS on 16 => 5 pass, 0 fail (source 14056 KiB, destination 22592 KiB) | `75ea492` |
 | 22 | sub-phase | 3.5 | `agent:opus` | abort and race proofs: destination kill, concurrent writer, source kill, refused plan — and the product fix they found (a run that fails after apply now removes the databases it created) | module.rs, session.rs, dest.rs, lib.rs, session_test.rs, fault_matrix.sh, POSTGRES.md | gates.sh PASS (18 rb-core session tests, 2 new); fault_matrix.sh postgres => CASES=8 PASS=21 FAIL=0; fault_matrix.sh (all) => CASES=28 PASS=69 FAIL=0 | `75ea492` |
 | 23 | sub-phase | 3.6 | `agent:opus` | README: lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes and exit 6 | README.md | gates.sh PASS; closing matrix 10..18 => 1025 pass, 0 fail; relay_smoke PASS; session_two_targets PASS | `75ea492` |
+| 38 | sub-phase | 5.6 | `agent:opus` | the README now answers, without leaving it, which filesystem entries round-trip, which three are refused, what a sparse file becomes, and which privilege each restore needs; the three operator-visible messages are quoted from real runs with their remedy | README.md | gates.sh PASS; phase-5 regression guard: T-E2E0 5/0 and T-SESSION-2 green (the four filesystem guards are sudo-blocked, § 9) | uncommitted |
+| 37 | sub-phase | 5.5 | `agent:opus` | the fingerprint's cost is stated where an operator meets it: a run reads the source tree three times, and that is the evidence behind `source unchanged`. The scope edges are written with it — sparse files restored dense, xattrs and ACLs never captured, sockets refused, devices needing a capability | docs/modules/FILESYSTEM.md, docs/usage/05-filesystem.md, docs/IMMUTABILITY.md, docs/testing/FILESYSTEM_MATRIX.md | gates.sh PASS | uncommitted |
+| 36 | sub-phase | 5.4 | `agent:opus` | directory creation no longer follows a symlink planted in the destination: planned directories are created one level at a time and a path that already exists must be a real directory, and the destination root is checked with `symlink_metadata` after it is created | crates/rb-filesystem/src/dest.rs, crates/rb-filesystem/src/lib.rs, docs/modules/FILESYSTEM.md | gates.sh PASS (25 rb-filesystem tests, 2 new); the filesystem round-trip smoke still 22/0 and T-E2E0 5/0 after the change | uncommitted |
+| 35 | sub-phase | 5.3 | `agent:opus` | `e2e/filesystem_matrix.sh`: one PASS/FAIL/SKIP line per `M-FS-*` row from a field-by-field manifest comparison, run twice (root, then an unprivileged account with `--no-preserve-ownership`), plus the three refusals, the xattr refusal, the access-time guard and the CAP_MKNOD preflight. T-FS-ATIME and T-FS-SPECIAL moved out of `filesystem_netns_test.sh` so no assertion lives in two scripts; CI job renamed and raised to 45 minutes | e2e/filesystem_matrix.sh (new), e2e/filesystem_netns_test.sh, e2e/lib.sh, e2e/full_matrix.sh, e2e/README.md, .github/workflows/e2e.yml, docs/QA_GUIDE.md, docs/testing/FILESYSTEM_MATRIX.md | gates.sh PASS; ShellCheck v0.11.0 PASS on all four scripts; actionlint 1.7.12 clean; resource hygiene PASS; unprivileged proof of the runner's own logic: the whole user pass green (21 rows + the sparse content compare) and all four refusal/privilege-message rows green | uncommitted |
+| 34 | sub-phase | 5.2 | `agent:opus` | `rb_seed_filesystem_matrix_fixture <root> [root\|user]` builds one named group of entries per `M-FS-*` round-trip row, privileged rows only in `root` mode; the three refusal rows get their own seeders because each aborts a whole run | e2e/lib.sh, e2e/README.md | ShellCheck v0.11.0 PASS; gates.sh PASS; seeded as an unprivileged user: every non-root row present with the expected modes, the non-UTF-8 name lands as `m28_\377\376`, the deep tree reaches 1026 levels | uncommitted |
+| 33 | sub-phase | 5.1 | `agent:opus` | FIFOs and device nodes are part of the tree now: the walk records them (`rdev` for devices), the destination recreates them behind a `special_files` preflight check for CAP_MKNOD, the fingerprint and `rb_tree_digest` cover the device number, and a unix socket is refused while analyzing instead of restored as a dead node | crates/rb-filesystem/src/{walk,lib,dest,immutability}.rs, e2e/lib.sh, e2e/filesystem_netns_test.sh, docs/modules/FILESYSTEM.md, docs/usage/05-filesystem.md | gates.sh PASS (23 rb-filesystem tests, 6 new); ShellCheck PASS; live proof without root: a FIFO tree round-trips (digests equal, mode 0640 preserved, both peers VERIFIED) and a unix socket is refused at Analyze with no destination root; the device-node and CAP_MKNOD cases need sudo (§ 9) | uncommitted |
 | 32 | sub-phase | 4.9 | `agent:opus` | README gains a "Source safety" section: what makes the source read-only and what the audit does on every exit path, the least-privilege account per backend with a pointer to the full recipes, the writable-role warning, and the access-time rule with the refusal message and both remedies | README.md | gates.sh PASS (help/docs parity included); phase-4 regression guard: postgres 10/16/18, mongodb 4, MinIO all green | `4d1b5e7` |
 | 31 | sub-phase | 4.8 | `agent:opus` | the source pipeline runs inside `catch_unwind`, so a panic becomes an ordinary error and takes the same failure path as any other: the source is fingerprinted again and the run reports `SourceMutated` on drift, otherwise `source pipeline panicked: <message>` | crates/rb-core/src/session.rs, crates/rb-core/Cargo.toml, crates/rb-core/tests/session_test.rs, docs/IMMUTABILITY.md, docs/modules/README.md | gates.sh PASS (20 session_test tests, 2 new); T-E2E0 PASS=5 FAIL=0; T-SESSION-2 PASS | `4d1b5e7` |
 | 30 | sub-phase | 4.7 | `agent:opus` | all three server-side least-privilege proofs: PostgreSQL runs a whole transfer as `rb_ro` (both grant recipes) and the server log is asserted for that role; MongoDB runs one as a `read`-only user against a mongod that logs every command; MinIO runs one under a 5-action read policy with `mc admin trace` as the record and a refused write as the counter-proof | e2e/lib.sh, e2e/postgres_matrix.sh, e2e/mongodb_matrix.sh, e2e/s3_minio_test.sh, e2e/README.md, docs/IMMUTABILITY.md, scripts/help_parity.sh | gates.sh PASS; ShellCheck v0.11.0 PASS on the four scripts; T-IMMUT-PG-LP PASS on 10, 13, 14, 16, 18; T-IMMUT-MONGO-LP PASS on 4, 6, 7 (110 commands checked, all reads); T-IMMUT-S3-LP PASS (25 S3 APIs checked, all reads; the same credential is refused a write) | `4d1b5e7` |
@@ -156,6 +162,28 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 |------|---------------|------|
 | `docs/testing/POSTGRES_MATRIX.md` | new: 106 rows (TAB 18, SEQ 7, VIEW 9, MV 7, IDX 18, CON 18, EXT 8, GIS 6, REF 15) with the oracle legend | 0.1 |
 | `docs/testing/FILESYSTEM_MATRIX.md` | new: 32 rows with the oracle legend | 0.1 |
+| `README.md` | "What is copied, what is refused" and "Troubleshooting" under "Filesystem backup" | 5.6 |
+| `docs/modules/FILESYSTEM.md` | the three-reads cost paragraph and four new limits | 5.5 |
+| `docs/usage/05-filesystem.md` | "Costo dell'impronta e limiti di perimetro" | 5.5 |
+| `docs/IMMUTABILITY.md` | the filesystem fingerprint row names the device number and the three reads | 5.5 |
+| `docs/testing/FILESYSTEM_MATRIX.md` | rows 30 and 31 carry their exact expected outcome | 5.5 |
+| `crates/rb-filesystem/src/dest.rs` | `create_private_dir` (one level, no-follow check), `create_private_dir_all(root, path)`, `create_destination_root` | 5.4 |
+| `crates/rb-filesystem/src/lib.rs` | the two T-FS-TOCTOU unit tests | 5.4 |
+| `docs/modules/FILESYSTEM.md` | the plan-hardening list states the directory-creation guarantee and both messages | 5.4 |
+| `e2e/filesystem_matrix.sh` | new: the per-row `M-FS-*` runner (root pass, user pass, refusals, atime, xattr, CAP_MKNOD) | 5.3 |
+| `e2e/filesystem_netns_test.sh` | cases (d) and (e) removed — they now live in the matrix runner; header and summary back to T-FS-OWN/T-FS-IMMUT | 5.3 |
+| `e2e/lib.sh` | `rb_tree_manifest` reports FIFO/char/block kinds and the device number | 5.3 |
+| `e2e/full_matrix.sh`, `.github/workflows/e2e.yml` | the matrix runner registered in the privileged group; the CI job renamed and given 45 minutes | 5.3 |
+| `docs/testing/FILESYSTEM_MATRIX.md`, `e2e/README.md`, `docs/QA_GUIDE.md` | the two passes, the `/user` suffix, the two extra check lines, the new script | 5.3 |
+| `e2e/lib.sh` | `rb_seed_filesystem_matrix_fixture` and `rb_seed_fs_refusal_socket\|nonutf8\|depth` | 5.2 |
+| `e2e/README.md` | the four seeders in the helper table | 5.2 |
+| `crates/rb-filesystem/src/walk.rs` | FIFO, char/block device and unix-socket branches; `rdev` on the entry | 5.1 |
+| `crates/rb-filesystem/src/lib.rs` | `FilesystemEntry.rdev`; 6 new unit tests | 5.1 |
+| `crates/rb-filesystem/src/dest.rs` | `Capabilities`/`validate_with`, the `special_files` check, `has_cap(bit)`, node creation (`mkfifo`/`mknod`), `chmod_node_no_follow`, `rdev` in verification | 5.1 |
+| `crates/rb-filesystem/src/immutability.rs` | the device number is part of the fingerprint | 5.1 |
+| `e2e/lib.sh` | `rb_tree_digest` reports FIFO/char/block kinds and the device number | 5.1 |
+| `e2e/filesystem_netns_test.sh` | case (e): T-FS-SPECIAL — round-trip, socket refusal, CAP_MKNOD preflight | 5.1 |
+| `docs/modules/FILESYSTEM.md`, `docs/usage/05-filesystem.md` | special-file rows, the two new messages, the `special_files` check | 5.1 |
 | `README.md` | new "Source safety" section; the filesystem section points at it for `--allow-atime-updates` | 4.9 |
 | `crates/rb-core/src/session.rs` | `run_source_limited` wraps `source_run` in `catch_unwind`; `panicked()` renders the payload | 4.8 |
 | `crates/rb-core/Cargo.toml` | `futures-util` dependency (`FutureExt::catch_unwind`) | 4.8 |
@@ -388,6 +416,21 @@ none — tree consistent
 | § 4.8 regressions | `bash e2e/relay_smoke.sh`, `bash e2e/session_two_targets.sh` | PASS — T-E2E0 5 pass/0 fail, T-SESSION-2 passed (the runner is unchanged on the normal paths) | 2026-09-16 |
 | § 4.9 gates | `bash scripts/gates.sh` | PASS — the ghost-flag scan accepts the README's `--allow-atime-updates` and finds no flag the CLI lacks | 2026-09-16 |
 | phase 4 regression guard | `bash e2e/postgres_matrix.sh 10 16 18`, `bash e2e/mongodb_matrix.sh 4`, `bash e2e/s3_minio_test.sh`, `bash e2e/relay_smoke.sh`, `bash e2e/session_two_targets.sh` | PASS — postgres 10: 106/0, 16: 117/0, 18: 119/0; mongodb 4: 6 pass 0 fail; MinIO passed incl. T-IMMUT-S3-LP; T-E2E0 5/0; T-SESSION-2 passed. T-FS-OWN/T-FS-IMMUT could not run (no passwordless sudo, § 9) | 2026-09-16 |
+| § 5.1 unit tests | `cargo test -p rb-filesystem` | PASS — 23 tests, 6 new (FIFO round-trip, socket refusal at Analyze, CAP_MKNOD preflight both ways, missing/stray `rdev`, unknown kind, older plan without `rdev`) | 2026-09-16 |
+| § 5.1 live proof (no root) | relay transfer of a tree containing a FIFO, then a tree containing a unix socket | PASS — digests equal and the FIFO comes back as a FIFO with mode 0640, both peers print VERIFIED; the socket run exits 1 with `[Analyze] unsupported filesystem entry (a unix socket cannot be reproduced)` and creates no destination root | 2026-09-16 |
+| § 5.1 T-FS-SPECIAL (device nodes) | `sudo -n bash e2e/filesystem_netns_test.sh` | NOT RUN — needs passwordless sudo (§ 9); the case is written (case (e)) and ShellCheck-clean | 2026-09-16 |
+| § 5.1 gates | `bash scripts/gates.sh` | PASS | 2026-09-16 |
+| § 5.2 seeders | seed `user` mode as an unprivileged user, then `rb_tree_digest` | PASS — every non-root row is created with the expected mode (setuid/setgid/sticky, 0500 dir, hardlink groups, FIFO, pre-epoch and far-future mtimes, 64 MiB sparse file), the digest prints, the non-UTF-8 name is on disk and the deep tree is 1026 levels | 2026-09-16 |
+| § 5.2 gates | `bash scripts/gates.sh`, ShellCheck v0.11.0 | PASS | 2026-09-16 |
+| § 5.3 runner, unprivileged proof | the user pass and the refusal rows run directly as this account | PASS — 21 rows plus `M-FS-30/content` compare equal after a real relay transfer (setuid/setgid/sticky, 0500 dir, symlink loop and dangling link, three hardlink groups, pre-epoch and 2100 mtimes with nanoseconds, FIFO, 64 MiB sparse file), and M-FS-27/28/29/31 are refused with the exact messages the runner greps for | 2026-09-16 |
+| § 5.3 T-FS-MATRIX (root pass) | `sudo -n bash e2e/filesystem_matrix.sh` | NOT RUN — needs passwordless sudo (§ 9). Untested from here: the root pass, the `runuser` plumbing of the user pass, M-FS-32 and the CAP_MKNOD row | 2026-09-16 |
+| § 5.3 gates | `bash scripts/gates.sh`, ShellCheck v0.11.0, actionlint 1.7.12, `bash e2e/resource_hygiene_check.sh` | PASS | 2026-09-16 |
+| § 5.4 T-FS-TOCTOU | `cargo test -p rb-filesystem` | PASS — 25 tests, 2 new: a symlink planted where a planned directory goes is refused Apply-phase with `replaced by a symlink` and the directory it pointed at stays empty; a symlinked destination root is refused Validate-phase, while an absent one is still created | 2026-09-16 |
+| § 5.4 regressions | filesystem round-trip smoke (21 rows + sparse content), `bash e2e/relay_smoke.sh` | PASS — 22/0 and 5/0 after the change | 2026-09-16 |
+| § 5.4 gates | `bash scripts/gates.sh` | PASS | 2026-09-16 |
+| § 5.5 gates | `bash scripts/gates.sh` | PASS (help/docs parity included) | 2026-09-16 |
+| § 5.6 gates | `bash scripts/gates.sh` | PASS (ghost-flag scan covers the new README text) | 2026-09-16 |
+| phase 5 regression guard | `bash e2e/relay_smoke.sh`, `bash e2e/session_two_targets.sh` | PASS — T-E2E0 5 pass 0 fail (carriers=1, source tree unchanged); T-SESSION-2 passed (parallel pairs, progress, fail-fast). T-FS-OWN/T-FS-IMMUT/T-FS-ENOSPC/T-FS-ATIME need passwordless sudo and could not run (§ 9) | 2026-09-16 |
 
 ## 8. Runtime deviations from the plan
 
@@ -436,6 +479,17 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 | 57 | § 4.6 wires the lint into `scripts/gates.sh` | also its `--selftest`, and `scripts/help_parity.sh` gained `--all`, `--all-targets` and `--selftest` to its foreign-flag exclusion list | a lint whose regexes stop matching passes silently, which is worse than no lint; and documenting the new gate command in the QA guide named three cargo/script switches that the ghost-flag scan then reported as flags the CLI does not accept | none — the exclusion list exists for exactly this (cargo, docker, git, `pg_dump`), and the CLI's own flags are still checked in both directions |
 | 52 | § 4.5 the flag is `ArgAction::SetTrue` | `Option<bool>` with `boolish()`, `num_args(0..=1)`, `default_missing_value("true")`, `require_equals` | the convention `main.rs` documents for every module bool: `SetTrue` collapses "absent" and "given as false", so a YAML `allow_atime_updates: true` could never be turned off from the CLI, against the documented CLI > env > YAML precedence | none — `--allow-atime-updates` and `--allow-atime-updates=false` both work |
 | 53 | § 4.5 the flag is rejected on non-filesystem modules and on the destination role, following the `--no-preserve-ownership` pattern | no rejection: the flag merges into the params like every other module bool, and only the filesystem source reads it | that pattern does not exist — `--no-preserve-ownership` (like `--follow-symlinks`, `--path-style`, `--admin`) is merged and left to the module, and the param structs ignore unknown keys; inventing a rejection table here would be new machinery in `main.rs`, outside this sub-phase | none — documented as `Lato: sorgente` in `docs/usage/05-filesystem.md`, and `allow_atime_updates_flag_is_filesystem_source_only` locks the key, the typed default and the explicit `false` |
+| 79 | § 5.4 removes `create_private_dir_all` | it stays, as `create_private_dir_all(root, path)`: a loop over `create_private_dir`, one level at a time | `ActiveFile::open` materialises a data item's ancestors, and it is reached for items whose parent the plan may not name; dropping the helper would leave that path on `create_dir_all`, which is the call the sub-phase exists to remove | none — both call sites go through the one-level-at-a-time creation now |
+| 80 | § 5.4 unit tests reach the creation step through a restore | they call `create_directories` / `create_destination_root` directly, both made `pub(crate)` | `stream_in` refuses a non-empty destination before it ever creates a directory, so a symlink planted in the root cannot be seen by the step under test through that path; the race the sub-phase is about happens between those two moments and cannot be staged from outside | none — no production behaviour depends on the visibility change |
+| 76 | § 5.3 prints one `PASS M-FS-nn` per row | every round-trip row is printed twice: `M-FS-nn` for the privileged pass and `M-FS-nn/user` for the unprivileged one, and two extra lines carry checks that are not manifest comparisons (`M-FS-30/content`, `M-FS-25/26-privilege`) | the plan asks for both passes but for one line per row; privilege changes what the restore promises, so a single line would have to hide one of the two results. The matrix document now describes the suffix | the plan's `MATRIX FS: 30 pass, 0 fail` acceptance is therefore `0 fail` over more than 30 lines |
+| 77 | § 5.3 "leave the originals in place if moving breaks their labels" | T-FS-ATIME and the whole special-file case were moved out of `e2e/filesystem_netns_test.sh` | the matrix runner owns every `M-FS-*` row, and 24-27 and 32 are exactly those cases: keeping them in both scripts would duplicate the assertions the plan says not to duplicate. The labels moved with them, and the netns script's header now points at their new home | none |
+| 78 | § 5.3 M-FS-31 is decided by the `rb-filesystem` unit test | the runner also runs it: a source started with `--preserve-xattr` must be refused while connecting | it costs one process and turns a row that was "covered elsewhere" into a row this runner actually proves | none — the unit test stays |
+| 74 | § 5.2 fills the matrix doc's `Fixture` column | nothing to do — the column already names these four functions | § 0.1 wrote the catalogue with the planned function names, and the seeders were written to match them rather than the other way round | none |
+| 75 | (unstated) cleaning up a seeded tree | § 5.3's runner must `chmod -R u+rwX` before removing it | the fixture deliberately contains a 0500 directory (M-FS-11) and, in root mode, 0000 entries (M-FS-09/10); `rm -rf` fails on them | § 5.3 — noticed while smoke-testing the seeder |
+| 70 | § 5.1 `apply_metadata` handles FIFOs and devices "like files" | their mode is set by `chmod_node_no_follow`, an `O_PATH` + `/proc/self/fd/<n>` `chmod` | the file path opens the node with `O_NOFOLLOW` and `fchmod`s it, which for a FIFO blocks until a peer appears and for a device node talks to the device (a tape rewinds). `O_PATH` names the inode without opening it, and `/proc/self/fd` is how a no-follow chmod is done on Linux, where `fchmodat` rejects `AT_SYMLINK_NOFOLLOW` | none — `chown` and `utimensat` already work by path with no-follow flags |
+| 71 | § 5.1 device entries must carry `rdev` | and no other kind may carry one | a `file` entry with a device number describes something this build does not understand; accepting it silently would mean the plan and the restore disagree about what the entry is | none |
+| 72 | § 5.1 `has_cap` stubbed "through a small seam" | the seam is `Capabilities { chown, mknod }` plus `validate_with(params, plan, caps)`; `validate` passes `Capabilities::current()` | one seam covers both capability checks, and the test states the capability set instead of the kernel — the CAP_MKNOD case is then provable without root, which matters on a host without passwordless sudo | none |
+| 73 | § 5.1 `create_links` | renamed `create_nodes` | it now creates FIFOs and device nodes too, and a name that says "links" would hide them | none |
 | 69 | § 4.9 puts the atime refusal and its remedy in a README "Troubleshooting" section | the refusal and both remedies are in the new "Source safety" section | `README.md` has no troubleshooting section — the guide it points to (`docs/usage/`) carries that role — and splitting a message from the rule it enforces would make both harder to find | § 6.5's final README read should confirm this is still the right home |
 | 66 | § 4.8 the panic test mock panics inside `stream_out` with `panic!` | the mock indexes an empty `Vec` out of bounds | `panic!` is forbidden in this workspace's lints, and an out-of-bounds index is the shape a real bug takes; a constant index on an array would be rejected at compile time by `unconditional_panic`, so the index comes from `Vec::capacity()` | none |
 | 67 | § 4.8 `catch_unwind` is applied at `session.rs:326` | applied where `source_run` is awaited, which § 3.2-3.5 moved | the plan's line numbers predate those sub-phases; the call site is the same single statement | none |
@@ -500,7 +554,7 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
   - Every other row is still unevaluated: the run aborts before the oracles.
 - **Privileged e2e cannot run in this session**: `sudo -n true` answers `sudo: è necessaria una
   password` on this host, so every script that needs root — `e2e/filesystem_netns_test.sh`
-  (T-FS-OWN, T-FS-IMMUT, and T-FS-ATIME case (d) added in § 4.5) and `e2e/filesystem_matrix.sh`
+  (T-FS-OWN, T-FS-IMMUT) and `e2e/filesystem_matrix.sh` (every `M-FS-*` row, T-FS-SPECIAL and T-FS-ATIME since § 5.3)
   (§ 5.3) — is written and lint-clean but unexecuted here. Phase 5 must run them on a host with
   passwordless sudo, or in CI. Where a non-privileged proof of the same behaviour exists it is
   recorded in §7 (§ 4.5 proved both atime polarities against the root-owned, world-readable
@@ -530,7 +584,7 @@ disagree with §1 and §4.
 | 2 — Restore validation | phase_03.md | `DONE` | 2.1-2.4 closed; matrix 0 fail on 10,12,14,16,18 and every cross pair; full_matrix green after the CONSTR-STATE clone fix |
 | 3 — PostgreSQL latent defects | phase_04.md | `DONE` | 3.1-3.6 closed; pooled connections, timeouts, fingerprint v2, RSS proof, abort/race proofs (one product fix: abandon) |
 | 4 — Source immutability guardrails | phase_05.md | `DONE` | 4.1-4.9 closed: IMMUTABILITY.md, typed read-only clients in all three database modules, the filesystem atime guard, the lint as a gate, the three least-privilege runs proven from the servers' own logs, a panic-safe audit, and the README source-safety section. T-FS-ATIME stays PARTIAL until a host with passwordless sudo runs the privileged case (§ 9) |
-| 5 — Filesystem deep verification | phase_06.md | `TODO` | 5.1-5.6 |
+| 5 — Filesystem deep verification | phase_06.md | `DONE` | 5.1-5.6 closed: special files with their capability check, the matrix fixture and its runner, symlink-proof directory creation, the fingerprint cost and scope edges, and the README. T-FS-MATRIX / T-FS-SPECIAL / T-FS-ATIME stay PARTIAL until a host with passwordless sudo runs the privileged pass (§ 9) |
 | 6 — Documentation audit and parity gate | phase_07.md | `TODO` | 6.1-6.5 |
 
 Status values: `TODO` · `IN_PROGRESS` · `DONE` · `SKIPPED` · `BLOCKED`
@@ -562,10 +616,10 @@ A `SKIPPED` sub-phase or phase keeps its row and carries the reason.
 | T-IMMUT-S3-LP | e2e | `PASS` | source runs under the 5-action MinIO read policy with the anonymous grant removed; `mc admin trace` shows 25 S3 APIs, all reads, and the same credential is refused a write (§ 4.7) |
 | T-IMMUT-LINT | gate | `PASS` | `scripts/gates.sh` runs `scripts/source_readonly_lint.sh` and its `--selftest`: 12 source-side files clean, injected write detected (§ 4.6) |
 | T-IMMUT-PANIC | unit | `PASS` | both in `crates/rb-core/tests/session_test.rs`: the panic is reported as an error naming it, the after-audit ran (2 fingerprints), and drift on that path is `SourceMutated` (§ 4.8) |
-| T-FS-ATIME | e2e | `PARTIAL` | case (d) written in `e2e/filesystem_netns_test.sh`; the privileged run needs passwordless sudo (§ 9). Both polarities proven without root against `/etc/skel`: refused with the documented message and no atime change; accepted with the flag, one warning, formal verification (§ 4.5) |
-| T-FS-SPECIAL | e2e | `TODO` | FIFO + devices round-trip as root; socket refused; devices refused without CAP_MKNOD (§ 5.1) |
-| T-FS-MATRIX | e2e | `TODO` | `filesystem_matrix.sh` prints `MATRIX FS: 30 pass, 0 fail` (§ 5.3) |
-| T-FS-TOCTOU | unit | `TODO` | `a_planted_symlink_directory_is_refused_during_restore`, `a_symlink_destination_root_is_refused` (§ 5.4) |
+| T-FS-ATIME | e2e | `PARTIAL` | now row M-FS-32 of `e2e/filesystem_matrix.sh` (moved there in § 5.3); the privileged run needs passwordless sudo (§ 9). Both polarities proven without root against `/etc/skel`: refused with the documented message and no atime change; accepted with the flag, one warning, formal verification (§ 4.5) |
+| T-FS-SPECIAL | e2e | `PARTIAL` | now rows M-FS-24..27 and `M-FS-25/26-privilege` of `e2e/filesystem_matrix.sh` (moved there in § 5.3). Proven without root: the FIFO row round-trips with its mode and the socket is refused at Analyze. The device-node rows and the CAP_MKNOD preflight need passwordless sudo (§ 9); the CAP_MKNOD *decision* is covered by a unit test that states the capability set (§ 5.1) |
+| T-FS-MATRIX | e2e | `PARTIAL` | `e2e/filesystem_matrix.sh` written and lint-clean; its unprivileged half is proven here (21 rows + sparse content + 4 refusal rows, 0 fail). The root pass needs passwordless sudo (§ 9) (§ 5.3) |
+| T-FS-TOCTOU | unit | `PASS` | both in `crates/rb-filesystem/src/lib.rs`: the planted symlink is refused Apply-phase and nothing is written through it; a symlinked destination root is refused Validate-phase (§ 5.4) |
 | T-DOCS-PARITY | gate | `TODO` | `scripts/docs_parity.sh` exits 0 inside `gates.sh` (§ 6.1-6.4) |
 | T-PG-MATRIX, T-PG-IMMUT, T-PG-INTROSPECT | e2e (existing) | `TODO` (re-run per phase) | regression guards; must stay green after every postgres sub-phase |
 | T-FS-OWN, T-FS-IMMUT, T-FS-ENOSPC | e2e (existing) | `TODO` (re-run per phase) | regression guards for the filesystem module |
@@ -583,11 +637,11 @@ other docs get their own rows.
 | README.md | 2 | `DONE` | the `rows verified:` / `constraints:` lines with their meaning, and the row-count refusal with its remedy (§ 2.4) |
 | README.md | 3 | `DONE` | lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes, exit 6 (§ 3.6) |
 | README.md | 4 | `DONE` | "Source safety": the read-only source and the audit on every exit path, the least-privilege account per backend, the writable-role warning, the atime rule with its refusal message and both remedies (§ 4.9) |
-| README.md | 5 | `TODO` | filesystem entries preserved/refused, capabilities, troubleshooting (§ 5.6) |
+| README.md | 5 | `DONE` | what round-trips (incl. FIFOs and device nodes) and what is refused (sockets, non-UTF-8 names, depth > 1024, xattrs), sparse files restored dense, the `CAP_CHOWN` / `CAP_MKNOD` rule and three troubleshooting messages with remedies (§ 5.6) |
 | README.md | 6 | `TODO` | final full read (§ 6.5) |
-| docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6/5.2; reconciled § 6.3 |
+| docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6 and already correct for the filesystem rows, whose seeders § 5.2 wrote to match it; reconciled § 6.3 |
 | docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", the printed proof, "Runtime model and guardrails", "Connections, timeouts and keepalives", "The source fingerprint" and "Failure behaviour" written (§ 1.3-1.5, 2.1-2.3, 3.1-3.5); Limits reconciled in § 6.3 |
-| docs/modules/FILESYSTEM.md | 4, 5, 6 | `IN_PROGRESS` | the atime rule, its message and its remedies written, plus the guarantees-table row (§ 4.5); special files, the TOCTOU guarantee and the fingerprint cost land in phase 5 |
+| docs/modules/FILESYSTEM.md | 4, 5, 6 | `IN_PROGRESS` | the atime rule, its message and its remedies written, plus the guarantees-table row (§ 4.5); special files and their two messages written (§ 5.1); the TOCTOU guarantee (§ 5.4) and the three-reads fingerprint cost with the scope limits (§ 5.5) written; reconciled § 6.3 |
 | docs/modules/MONGODB.md | 4, 6 | `IN_PROGRESS` | "Immutability" rewritten for the typed client, the command allowlist and the pinned read settings (§ 4.3); reconciled § 6.3 |
 | docs/modules/README.md | 4, 6 | `IN_PROGRESS` | the module-author checklist states that `fingerprint` runs after a failed or panicked run too (§ 4.8); reconciled § 6.3 |
 | docs/modules/S3.md | 4, 6 | `IN_PROGRESS` | "Immutability" names `ReadOnlyS3`, the eight read operations and the one-file read side (§ 4.4); reconciled § 6.3 |

@@ -71,6 +71,35 @@ flag la corsa prosegue e stampa una volta:
 WARN atime updates on the source accepted by --allow-atime-updates
 ```
 
+### File speciali
+
+L'albero non è fatto solo di file, directory e link. Cosa succede agli altri:
+
+| Voce | Sorgente | Destinazione | Privilegio |
+|------|----------|--------------|------------|
+| FIFO (pipe con nome) | copiata come nodo, mai il suo contenuto | ricreata con modo e mtime | nessuno |
+| device a caratteri / a blocchi | copiati con il loro numero di device | ricreati con `mknod` | **root o `CAP_MKNOD`** |
+| socket unix | **rifiutata durante l'analisi** | — | — |
+
+Un socket unix esiste solo finché un processo lo tiene aperto: ricrearne l'inode
+darebbe un nodo morto senza nessuno in ascolto, cioè certificherebbe qualcosa
+che la sorgente non ha. La corsa si ferma prima di trasferire qualsiasi byte:
+
+```text
+[Analyze] unsupported filesystem entry (a unix socket cannot be reproduced): /srv/data/app.sock
+```
+
+I device sono l'unica voce il cui ripristino richiede una capability propria. Se
+manca, il **preflight** fallisce sul controllo `special_files`, prima di
+scrivere qualsiasi cosa:
+
+```text
+restoring device nodes needs root or CAP_MKNOD (2 device entries in the plan)
+```
+
+Rimedio: eseguire la destinazione con `sudo` (o concederle `CAP_MKNOD`), oppure
+escludere i device dall'albero copiato.
+
 Passare `--follow-symlinks` o `--preserve-xattr` con valore vero fa terminare il
 comando con:
 
@@ -134,6 +163,7 @@ Prima di scrivere qualunque cosa, la destinazione verifica e stampa:
 | `destination-parent` | la directory che contiene la root esiste |
 | `destination-empty` | la root è assente o vuota; **voci preesistenti non vengono mai cancellate** |
 | `ownership` | se il ripristino di uid/gid è richiesto, il processo può farlo |
+| `special_files` | se il piano contiene device node, il processo ha root o `CAP_MKNOD` |
 | `estimated-bytes` | quantità di dati da ripristinare |
 
 Non esiste un `--overwrite` per il filesystem: per rifare un ripristino si
@@ -207,12 +237,32 @@ targets:
 
 Modello pronto: [examples/filesystem-session.yml](../../examples/filesystem-session.yml).
 
+## Costo dell'impronta e limiti di perimetro
+
+L'impronta che dimostra che la sorgente non è cambiata contiene il **contenuto
+completo** di ogni file, e viene calcolata due volte: prima del trasferimento e
+dopo. Una copia legge quindi l'albero sorgente **tre volte** (impronta, stream,
+impronta). Su alberi grandi è il costo dominante della corsa; è il prezzo della
+riga `BACKUP VERIFIED: source unchanged`, perché un'impronta sui soli metadati
+certificherebbe anche un albero riscritto sul posto.
+
+Cosa resta fuori dal perimetro, per scelta esplicita:
+
+| Caso | Comportamento |
+|------|---------------|
+| file sparsi (con buchi) | ripristinati **densi**: stessa dimensione e stesso contenuto byte per byte, ma i buchi diventano zeri scritti e l'occupazione su disco può crescere |
+| attributi estesi (xattr) e ACL POSIX | **non letti**: `--preserve-xattr` viene rifiutato alla connessione invece di essere ignorato in silenzio |
+| socket unix | rifiutati durante l'analisi |
+| FIFO e device | copiati; i device richiedono root o `CAP_MKNOD` sulla destinazione |
+
 ## Errori frequenti
 
 | Sintomo | Causa e rimedio |
 |---------|-----------------|
 | preflight `destination-empty` fallito | la root contiene già qualcosa: svuotarla o usarne un'altra |
 | preflight `ownership` fallito | eseguire la destinazione con `sudo`, oppure accettare `--no-preserve-ownership` |
+| preflight `special_files` fallito | l'albero contiene device node: eseguire la destinazione con `sudo`/`CAP_MKNOD`, oppure copiare un albero che non li contiene |
+| `a unix socket cannot be reproduced` | rimuovere il socket dall'albero copiato (o copiarne una sottodirectory che non lo contiene): un socket non è riproducibile |
 | `follow_symlinks and preserve_xattr are not supported` | rimuovere quei flag: non sono supportati da questa build |
 | trasferimento lento su molti file piccoli | alzare `--carriers` (fino a 32) su entrambi i lati |
 | exit `6` | l'albero sorgente è cambiato durante la copia: fermare le scritture e ripetere |

@@ -339,11 +339,54 @@ docker run --rm --network host --user 0:0 \
   --secret-file /run/secrets/coordinator --carriers 4 --root /restore --yes
 ```
 
-`--follow-symlinks` and `--preserve-xattr` are deliberately rejected in the
-current safe backend; symlinks themselves are preserved. Reading files the
-source account does not own needs `--allow-atime-updates`, described under
-[Source safety](#source-safety). See
+### What is copied, what is refused
+
+Regular files, directories, symlinks, hardlinks, FIFOs and character or block
+device nodes round-trip with their permission bits — setuid, setgid and the
+sticky bit included — and their modification time. Ownership is restored
+exactly when the destination runs as root or holds `CAP_CHOWN`; device nodes
+additionally need root or `CAP_MKNOD` there, and the restore refuses in
+preflight, before writing anything, when that privilege is missing. Hardlinks
+are recreated as links to the same file, and symlinks stay symlinks —
+`--follow-symlinks` is rejected.
+
+Three entries are refused rather than copied approximately: a **unix socket**
+(it cannot be recreated as the socket it was), a **path that is not valid
+UTF-8**, and a **tree deeper than 1024 levels**. Extended attributes and POSIX
+ACLs are never read, so `--preserve-xattr` is rejected too. One thing is
+restored differently on purpose: a **sparse file** arrives byte-identical but
+dense, so the copy can occupy more disk than the original.
+
+Reading files the source account does not own needs `--allow-atime-updates`,
+described under [Source safety](#source-safety). See
 [filesystem details](docs/modules/FILESYSTEM.md).
+
+### Troubleshooting
+
+```text
+[Analyze] unsupported filesystem entry (a unix socket cannot be reproduced): /srv/data/run/app.sock
+```
+
+The source stops before streaming anything. Point `--root` at a subtree that
+holds no socket — a live socket belongs to the running service, not to its
+data.
+
+```text
+FAILED: restoring device nodes needs root or CAP_MKNOD (2 device entries in the plan) check=special_files
+```
+
+The plan carries device nodes and the destination cannot create them, so the
+run stops in preflight with `preflight failed` and nothing is written. Run the
+destination as root, or grant the binary the capability
+(`sudo setcap cap_mknod,cap_chown+ep /usr/local/bin/rust-backup`).
+
+```text
+[Apply] destination path was replaced by a symlink during restore: /srv/restore/data
+```
+
+Something under `--root` turned a directory into a symlink while the restore
+was running. The restore stops instead of following it out of the destination
+tree; restore into a directory no other process writes to.
 
 ## PostgreSQL backup
 

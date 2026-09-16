@@ -27,6 +27,7 @@ run bash e2e/fault_matrix.sh
 run bash e2e/s3_minio_test.sh
 if [[ ${RUST_BACKUP_PRIVILEGED:-0} == 1 ]]; then
   run sudo -n "$root/e2e/filesystem_netns_test.sh"
+  run sudo -n "$root/e2e/filesystem_matrix.sh"
   run sudo -n "$root/e2e/filesystem_disk_full.sh"
   run sudo -n "$root/e2e/transport_netns_test.sh"
   run sudo -n "$root/e2e/bandwidth_netem.sh"

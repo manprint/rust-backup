@@ -250,14 +250,15 @@ jobs:
         run: bash e2e/mongodb_matrix.sh "$DATABASE_PAIR"
 
   filesystem-privileged:
-    name: Filesystem metadata and ENOSPC
+    name: Filesystem metadata, matrix and ENOSPC
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: sudo -n "$GITHUB_WORKSPACE/e2e/filesystem_netns_test.sh"
+      - run: sudo -n "$GITHUB_WORKSPACE/e2e/filesystem_matrix.sh"
       - run: sudo -n "$GITHUB_WORKSPACE/e2e/filesystem_disk_full.sh"
 
   transport-privileged:

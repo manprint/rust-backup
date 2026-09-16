@@ -231,7 +231,7 @@ RUST_BACKUP_PRIVILEGED=1 bash e2e/full_matrix.sh
 
 They require the approved `sudo -n` setup and are never silently counted as
 passes when skipped. The aggregate invokes the exact paths
-`filesystem_netns_test.sh`, `filesystem_disk_full.sh`,
+`filesystem_netns_test.sh`, `filesystem_matrix.sh`, `filesystem_disk_full.sh`,
 `transport_netns_test.sh`, and `bandwidth_netem.sh` (which also carries the
 one-vs-four-carrier proof).
 

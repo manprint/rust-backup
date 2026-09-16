@@ -4,10 +4,10 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use nix::fcntl::AtFlags;
-use nix::sys::stat::{utimensat, UtimensatFlags};
+use nix::fcntl::{AtFlags, OFlag};
+use nix::sys::stat::{fchmodat, mknod, utimensat, FchmodatFlags, Mode, SFlag, UtimensatFlags};
 use nix::sys::time::TimeSpec;
-use nix::unistd::{fchownat, Gid, Uid};
+use nix::unistd::{fchownat, mkfifo, Gid, Uid};
 use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupPlan, Preflight};
@@ -26,14 +26,48 @@ pub(crate) fn validate_destination_params(params: &FilesystemParams) -> Result<(
     Ok(())
 }
 
+/// What this process is allowed to do, resolved once so preflight and the
+/// tests can answer the same question the same way — the tests build the
+/// capability set instead of the kernel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Capabilities {
+    pub(crate) chown: bool,
+    pub(crate) mknod: bool,
+}
+
+impl Capabilities {
+    fn current() -> Self {
+        Self {
+            chown: has_cap_chown(),
+            mknod: has_cap_mknod(),
+        }
+    }
+}
+
 pub(crate) async fn validate(params: &FilesystemParams, plan: &BackupPlan) -> Result<Preflight> {
+    validate_with(params, plan, Capabilities::current())
+}
+
+pub(crate) fn validate_with(
+    params: &FilesystemParams,
+    plan: &BackupPlan,
+    caps: Capabilities,
+) -> Result<Preflight> {
     let payload = payload(plan, Phase::Validate)?;
     validate_entries(&payload)?;
     let root = Path::new(&params.root);
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     let parent_ok = parent.is_dir();
     let target_empty = destination_is_empty(root)?;
-    let ownership_possible = has_cap_chown();
+    let ownership_possible = caps.chown;
+    // Device nodes are the one kind whose creation needs a capability of its
+    // own. Saying so at preflight is the difference between "this restore
+    // cannot work here" and a run that fails halfway through apply.
+    let device_entries = payload
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "chardev" | "blockdev"))
+        .count();
     let ownership_needed = params.preserve_ownership
         && payload
             .entries
@@ -64,6 +98,19 @@ pub(crate) async fn validate(params: &FilesystemParams, plan: &BackupPlan) -> Re
             },
         )
         .check(
+            "special_files",
+            device_entries == 0 || caps.mknod,
+            if device_entries > 0 && !caps.mknod {
+                format!(
+                    "restoring device nodes needs root or CAP_MKNOD ({device_entries} device entries in the plan)"
+                )
+            } else if device_entries > 0 {
+                format!("{device_entries} device nodes can be recreated")
+            } else {
+                String::from("no device nodes in the plan")
+            },
+        )
+        .check(
             "estimated-bytes",
             true,
             format!("{} bytes to restore", payload.total_bytes),
@@ -87,7 +134,7 @@ pub(crate) async fn stream_in(
             ),
         ));
     }
-    fs::create_dir_all(root).map_err(|e| io_error(Phase::Apply, root, e))?;
+    create_destination_root(root)?;
     create_directories(root, &payload)?;
 
     let by_id: HashMap<_, _> = plan.items.iter().map(|item| (item.id, item)).collect();
@@ -160,7 +207,7 @@ pub(crate) async fn stream_in(
             "filesystem stream ended before item completion",
         ));
     }
-    create_links(root, &payload)?;
+    create_nodes(root, &payload)?;
     apply_metadata(root, &payload, params.preserve_ownership && has_cap_chown())?;
     Ok(())
 }
@@ -199,6 +246,7 @@ pub(crate) fn verify_metadata(params: &FilesystemParams, plan: &BackupPlan) -> R
             || source.mtime_nsec != destination.mtime_nsec
             || source.target != destination.target
             || source.hardlink_to != destination.hardlink_to
+            || source.rdev != destination.rdev
             || source.xattrs != destination.xattrs
             || !ownership_matches
         {
@@ -236,7 +284,7 @@ impl ActiveFile {
     pub(crate) fn open(root: &Path, item_id: u32, name: &str) -> Result<Self> {
         let path = at_root(root, name, Phase::Apply)?;
         if let Some(parent) = path.parent() {
-            create_private_dir_all(parent)?;
+            create_private_dir_all(root, parent)?;
         }
         // O_NOFOLLOW: a plan that planted a symlink at this path must not have
         // the restore write the item's bytes into the link's target.
@@ -290,30 +338,89 @@ impl Drop for ActiveFile {
 pub(crate) const OWNER_ONLY_FILE: u32 = 0o600;
 pub(crate) const OWNER_ONLY_DIR: u32 = 0o700;
 
-/// `fs::create_dir_all` with an owner-only mode on every component it creates.
+/// Create one directory, owner-only, and refuse anything else already sitting
+/// at that path.
+///
+/// `create_dir_all` and `DirBuilder::recursive(true)` *follow* a symlink that
+/// points at a directory and call it an existing directory. Between
+/// `destination_is_empty` and this call, anything that can write the
+/// destination's parent can therefore plant `root/a -> /elsewhere` and have the
+/// restore write the tree outside the declared root. `create` (non-recursive)
+/// fails with `AlreadyExists` instead, and what is actually there is then
+/// checked with `symlink_metadata`, which does not follow.
+///
 /// The plan's own mode is applied by `apply_metadata` once the tree is complete,
 /// so a directory that is meant to be 0o700 must not be readable in the
 /// meantime — and an intermediate component the plan never names keeps the
 /// restrictive mode rather than inheriting 0o777 minus the umask.
-fn create_private_dir_all(path: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(OWNER_ONLY_DIR)
-        .create(path)
-        .map_err(|e| io_error(Phase::Apply, path, e))
+fn create_private_dir(path: &Path) -> Result<()> {
+    match fs::DirBuilder::new().mode(OWNER_ONLY_DIR).create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing =
+                fs::symlink_metadata(path).map_err(|e| io_error(Phase::Apply, path, e))?;
+            if existing.is_dir() {
+                Ok(())
+            } else {
+                Err(BackupError::phase(
+                    Phase::Apply,
+                    format!(
+                        "destination path was replaced by a symlink during restore: {}",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+        Err(error) => Err(io_error(Phase::Apply, path, error)),
+    }
 }
 
-fn create_directories(root: &Path, plan: &FilesystemPlan) -> Result<()> {
+/// `create_private_dir` for a path and every component of it below `root`,
+/// parent first. `root` itself is created by `create_destination_root`.
+fn create_private_dir_all(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        create_private_dir(&current)?;
+    }
+    Ok(())
+}
+
+/// The destination root may legitimately not exist yet. Create it — and then
+/// insist that what is there is a real directory: a symlink at the root would
+/// redirect the whole restore, and `create_dir_all` would have accepted it.
+pub(crate) fn create_destination_root(root: &Path) -> Result<()> {
+    if let Err(error) = fs::create_dir_all(root) {
+        return Err(io_error(Phase::Apply, root, error));
+    }
+    let meta = fs::symlink_metadata(root).map_err(|e| io_error(Phase::Apply, root, e))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(BackupError::phase(
+            Phase::Validate,
+            format!("destination root is a symlink: {}", root.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Planned directories are created parent first: the plan's paths are sorted and
+/// every one of them is a canonical relative path, so a parent always precedes
+/// its children.
+pub(crate) fn create_directories(root: &Path, plan: &FilesystemPlan) -> Result<()> {
     for entry in &plan.entries {
         if entry.kind == "dir" {
             let path = at_root(root, &entry.path, Phase::Apply)?;
-            create_private_dir_all(&path)?;
+            create_private_dir_all(root, &path)?;
         }
     }
     Ok(())
 }
 
-fn create_links(root: &Path, plan: &FilesystemPlan) -> Result<()> {
+/// Create everything that is not a directory and carries no data: symlinks,
+/// hardlinks, FIFOs and device nodes. Runs after the payload has landed, so a
+/// hardlink always finds the file it names.
+fn create_nodes(root: &Path, plan: &FilesystemPlan) -> Result<()> {
     for entry in &plan.entries {
         let path = at_root(root, &entry.path, Phase::Apply)?;
         match entry.kind.as_str() {
@@ -343,6 +450,30 @@ fn create_links(root: &Path, plan: &FilesystemPlan) -> Result<()> {
                 }
                 fs::hard_link(&target, &path).map_err(|e| io_error(Phase::Apply, &path, e))?;
             }
+            // Created owner-only and widened by `apply_metadata`, exactly like a
+            // regular file: a FIFO or a device must not be readable by anyone
+            // else for the window between creation and the final chmod.
+            "fifo" => {
+                mkfifo(&path, Mode::from_bits_truncate(OWNER_ONLY_FILE)).map_err(|e| {
+                    BackupError::phase(Phase::Apply, format!("{}: {e}", path.display()))
+                })?;
+            }
+            "chardev" | "blockdev" => {
+                let rdev = entry.rdev.ok_or_else(|| {
+                    BackupError::phase(
+                        Phase::Apply,
+                        format!("missing device number: {}", entry.path),
+                    )
+                })?;
+                let kind = if entry.kind == "chardev" {
+                    SFlag::S_IFCHR
+                } else {
+                    SFlag::S_IFBLK
+                };
+                mknod(&path, kind, Mode::from_bits_truncate(OWNER_ONLY_FILE), rdev).map_err(
+                    |e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())),
+                )?;
+            }
             _ => {}
         }
     }
@@ -369,6 +500,9 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
             .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())))?;
         }
         if entry.kind != "symlink" {
+            // Files, directories, FIFOs and device nodes all get their exact
+            // mode here; a symlink has none of its own.
+            //
             // chown(2) clears setuid/setgid on regular files. Apply ownership
             // first and the exact permission bits last, otherwise a successful
             // privileged restore silently turns 04755 into 0755.
@@ -399,7 +533,10 @@ fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for entry in &plan.entries {
         let _ = crate::walk::relative_path(&entry.path, Phase::Validate)?;
-        if !matches!(entry.kind.as_str(), "file" | "dir" | "symlink" | "hardlink") {
+        if !matches!(
+            entry.kind.as_str(),
+            "file" | "dir" | "symlink" | "hardlink" | "fifo" | "chardev" | "blockdev"
+        ) {
             return Err(BackupError::phase(
                 Phase::Validate,
                 format!("unknown filesystem entry kind: {}", entry.kind),
@@ -437,6 +574,21 @@ fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
         }
         if let Some(target) = &entry.hardlink_to {
             let _ = crate::walk::relative_path(target, Phase::Validate)?;
+        }
+        // A device node is its device number: without one there is nothing to
+        // create, and carrying one on any other kind would mean the plan
+        // describes something this build does not understand.
+        let is_device = matches!(entry.kind.as_str(), "chardev" | "blockdev");
+        if is_device != entry.rdev.is_some() {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!(
+                    "filesystem entry {:?} of kind {} must {}carry a device number",
+                    entry.path,
+                    entry.kind,
+                    if is_device { "" } else { "not " }
+                ),
+            ));
         }
         // Xattrs are never collected by this build, so a plan carrying them
         // would only fail much later, in verification.
@@ -517,6 +669,9 @@ fn validate_entries(plan: &FilesystemPlan) -> Result<()> {
 /// comes from opening the path with `O_NOFOLLOW` and calling `fchmod` on the
 /// resulting descriptor: if the path is a symlink the open itself fails.
 pub(crate) fn chmod_no_follow(path: &Path, entry: &FilesystemEntry) -> Result<()> {
+    if matches!(entry.kind.as_str(), "fifo" | "chardev" | "blockdev") {
+        return chmod_node_no_follow(path, entry.mode);
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     let flags = if entry.kind == "dir" {
@@ -534,6 +689,33 @@ pub(crate) fn chmod_no_follow(path: &Path, entry: &FilesystemEntry) -> Result<()
         .map_err(|e| io_error(Phase::Apply, path, e))
 }
 
+/// `chmod` a node that must not be opened.
+///
+/// Opening a FIFO blocks until a peer appears at the other end, and opening a
+/// device node talks to the device — neither is acceptable during a restore. An
+/// `O_PATH` descriptor names the inode without opening it, and `/proc/self/fd/N`
+/// resolves back to exactly that inode, which is how a no-follow `chmod` is done
+/// on Linux (`fchmodat` rejects `AT_SYMLINK_NOFOLLOW`). `O_NOFOLLOW` on the
+/// `O_PATH` open is what makes it symlink-safe.
+fn chmod_node_no_follow(path: &Path, mode: u32) -> Result<()> {
+    let fd = nix::fcntl::open(
+        path,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())))?;
+    let by_fd = format!("/proc/self/fd/{fd}");
+    let result = fchmodat(
+        None,
+        by_fd.as_str(),
+        Mode::from_bits_truncate(mode & 0o7777),
+        FchmodatFlags::FollowSymlink,
+    )
+    .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())));
+    let _ = nix::unistd::close(fd);
+    result
+}
+
 fn libc_o_nofollow() -> i32 {
     0o400_000 // O_NOFOLLOW on Linux
 }
@@ -542,7 +724,9 @@ fn libc_o_directory() -> i32 {
     0o200_000 // O_DIRECTORY on Linux
 }
 
-fn has_cap_chown() -> bool {
+/// Is `bit` set in this process's effective capability set? Root has every
+/// capability, and a non-root process reports its own in `/proc/self/status`.
+fn has_cap(bit: u32) -> bool {
     if Uid::effective().is_root() {
         return true;
     }
@@ -554,7 +738,17 @@ fn has_cap_chown() -> bool {
                 .find_map(|line| line.strip_prefix("CapEff:\t").map(str::to_owned))
         })
         .and_then(|raw| u64::from_str_radix(raw.trim(), 16).ok())
-        .is_some_and(|bits| bits & 1 != 0)
+        .is_some_and(|bits| bits & (1u64 << bit) != 0)
+}
+
+/// CAP_CHOWN — restoring uid/gid.
+fn has_cap_chown() -> bool {
+    has_cap(0)
+}
+
+/// CAP_MKNOD — creating device nodes. FIFOs need no capability.
+fn has_cap_mknod() -> bool {
+    has_cap(27)
 }
 
 fn current_uid() -> u32 {

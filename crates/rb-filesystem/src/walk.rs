@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 
 use rb_core::error::{BackupError, Phase, Result};
@@ -146,6 +146,34 @@ fn visit(
                 }
             }
             entries.push(entry);
+        } else if file_type.is_fifo() {
+            // A FIFO carries no data: what has to survive is the node itself
+            // plus its metadata. Whatever is queued inside it belongs to the
+            // processes at either end, not to the filesystem.
+            entry.kind = "fifo".into();
+            entry.size = 0;
+            entries.push(entry);
+        } else if file_type.is_char_device() || file_type.is_block_device() {
+            entry.kind = if file_type.is_char_device() {
+                "chardev".into()
+            } else {
+                "blockdev".into()
+            };
+            entry.size = 0;
+            entry.rdev = Some(meta.rdev());
+            entries.push(entry);
+        } else if file_type.is_socket() {
+            // A unix socket exists only while a process holds it bound: the
+            // inode can be recreated, but it would be a dead node that no
+            // listener owns. Copying it would certify something the source
+            // does not have.
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "unsupported filesystem entry (a unix socket cannot be reproduced): {}",
+                    path.display()
+                ),
+            ));
         } else {
             return Err(BackupError::phase(
                 Phase::Analyze,
@@ -187,6 +215,7 @@ fn entry_from_meta(rel: &Path, meta: &fs::Metadata) -> FilesystemEntry {
         mtime_nsec: meta.mtime_nsec().max(0) as u32,
         target: None,
         hardlink_to: None,
+        rdev: None,
         xattrs: BTreeMap::new(),
     }
 }
