@@ -9,23 +9,23 @@
 //! The live driver calls are exercised by the mongodb e2e; the pure
 //! [`build_plan`] / [`now_rfc3339`] logic is unit-tested here.
 
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::doc;
 use mongodb::results::CollectionType;
 use mongodb::IndexModel;
 
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
 
+use crate::connect::{ReadOnlyConnection, ReadOnlyDatabase};
 use crate::model::{MongoCollection, MongoDatabase, MongoPlanPayload, MongoUser};
-use crate::{MongoConnection, MongoDbParams};
+use crate::MongoDbParams;
 
 /// System databases never included in a backup, and never restored into.
 pub(crate) const SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
 
 /// Connect and introspect the whole reachable cluster (read-only).
 pub async fn introspect_cluster(params: &MongoDbParams) -> Result<MongoPlanPayload> {
-    let conn = MongoConnection::connect(params).await?;
+    let conn = ReadOnlyConnection::connect(params).await?;
     let db_names = select_databases(&conn, params).await?;
 
     let mut databases = Vec::new();
@@ -42,7 +42,10 @@ pub async fn introspect_cluster(params: &MongoDbParams) -> Result<MongoPlanPaylo
 
 /// The databases to back up: the single `--database` when set, else every
 /// non-system database.
-async fn select_databases(conn: &MongoConnection, params: &MongoDbParams) -> Result<Vec<String>> {
+async fn select_databases(
+    conn: &ReadOnlyConnection,
+    params: &MongoDbParams,
+) -> Result<Vec<String>> {
     if let Some(db) = &params.database {
         return Ok(vec![db.clone()]);
     }
@@ -60,27 +63,15 @@ async fn select_databases(conn: &MongoConnection, params: &MongoDbParams) -> Res
 /// Introspect one database: its collections (+ options + indexes + estimates)
 /// and (best-effort) its users.
 async fn introspect_database(
-    conn: &MongoConnection,
+    conn: &ReadOnlyConnection,
     db_name: &str,
     params: &MongoDbParams,
 ) -> Result<MongoDatabase> {
     let db = conn.client.database(db_name);
 
-    let specs = db
-        .list_collections()
-        .await
-        .map_err(|e| {
-            BackupError::phase_src(Phase::Analyze, format!("list collections {db_name}"), e)
-        })?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|e| {
-            BackupError::phase_src(
-                Phase::Analyze,
-                format!("read collection specs {db_name}"),
-                e,
-            )
-        })?;
+    let specs = db.list_collections().await.map_err(|e| {
+        BackupError::phase_src(Phase::Analyze, format!("list collections {db_name}"), e)
+    })?;
 
     let mut collections = Vec::new();
     let mut skipped = Vec::new();
@@ -131,25 +122,15 @@ async fn introspect_database(
 
 /// Introspect one collection's options, indexes, and size estimates.
 async fn introspect_collection(
-    db: &mongodb::Database,
+    db: &ReadOnlyDatabase,
     db_name: &str,
     coll_name: &str,
     options: &mongodb::options::CreateCollectionOptions,
 ) -> Result<MongoCollection> {
-    let coll = db.collection::<Document>(coll_name);
-
     // Index specs: the JSON form of each IndexModel, minus the implicit _id_.
-    let models: Vec<IndexModel> = coll
-        .list_indexes()
-        .await
-        .map_err(|e| {
-            BackupError::phase_src(Phase::Analyze, format!("list indexes {coll_name}"), e)
-        })?
-        .try_collect()
-        .await
-        .map_err(|e| {
-            BackupError::phase_src(Phase::Analyze, format!("read indexes {coll_name}"), e)
-        })?;
+    let models: Vec<IndexModel> = db.list_indexes(coll_name).await.map_err(|e| {
+        BackupError::phase_src(Phase::Analyze, format!("list indexes {coll_name}"), e)
+    })?;
     let mut indexes = Vec::new();
     for m in models {
         if index_name(&m).as_deref() == Some("_id_") {
@@ -162,8 +143,8 @@ async fn introspect_collection(
         indexes.push(v);
     }
 
-    let estimated_docs = coll
-        .estimated_document_count()
+    let estimated_docs = db
+        .estimated_document_count(coll_name)
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {coll_name}"), e))?;
 
@@ -245,7 +226,7 @@ fn create_options_value(
 
 /// Best-effort on-disk size via `collStats`; `0` when unavailable (e.g. the
 /// command is restricted). Size is informational only (estimate/progress).
-async fn coll_size_bytes(db: &mongodb::Database, coll_name: &str) -> u64 {
+async fn coll_size_bytes(db: &ReadOnlyDatabase, coll_name: &str) -> u64 {
     match db.run_command(doc! { "collStats": coll_name }).await {
         Ok(stats) => stats
             .get_i64("size")
@@ -260,7 +241,7 @@ async fn coll_size_bytes(db: &mongodb::Database, coll_name: &str) -> u64 {
 /// Best-effort user listing via `usersInfo`; an empty list on any error (the
 /// connected user may lack the privilege). Users are captured for plan display
 /// and the fingerprint but are NOT recreated on restore (see `dest.rs`).
-async fn introspect_users(db: &mongodb::Database) -> Vec<MongoUser> {
+async fn introspect_users(db: &ReadOnlyDatabase) -> Vec<MongoUser> {
     let Ok(info) = db.run_command(doc! { "usersInfo": 1 }).await else {
         return Vec::new();
     };

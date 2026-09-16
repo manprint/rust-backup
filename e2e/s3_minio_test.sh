@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# T-S3-MINIO + T-S3-IMMUT: real streaming S3 source -> destination.
+# T-S3-MINIO + T-S3-IMMUT + T-IMMUT-S3-LP: real streaming S3 source ->
+# destination, including a full run driven by a least-privilege identity whose
+# read-onlyness is proven from MinIO's own API trace.
 # Requires docker and cargo. The script leaves no containers or host files behind.
 set -euo pipefail
 
@@ -16,7 +18,7 @@ dst_pid=
 cleanup() {
   status=$?
   if [[ $status -ne 0 ]]; then
-    for log in server source destination overwrite-source overwrite-destination abort-source abort-destination; do
+    for log in server source destination overwrite-source overwrite-destination abort-source abort-destination lp-source lp-destination; do
       printf -- '--- %s log ---\n' "$log" >&2
       sed -n '1,240p' "$work/$log.log" >&2 2>/dev/null || true
     done
@@ -67,9 +69,19 @@ for _ in {1..30}; do
   sleep 1
 done
 (( minio_ready == 1 )) || { echo 'MinIO health checks did not become ready' >&2; exit 1; }
+MC_IMAGE=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
 mc() {
-  docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+  docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh "$MC_IMAGE" -c \
     'mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && mc alias set dst http://127.0.0.1:19001 minioadmin minioadmin >/dev/null && mc "$@"' sh "$@"
+}
+# Run a shell snippet inside the mc image with the source alias already set. The
+# snippet is expanded by *this* shell but reaches the container as text, so a
+# `"$RB_RO_SECRET"` inside it is resolved by the container's shell from the
+# environment (`-e RB_RO_SECRET`) and never appears in any argument vector.
+mc_sh() { # shell-snippet
+  docker run --rm --network host -e RB_RO_SECRET -v "$work/seed:/seed:ro" \
+    --entrypoint /bin/sh "$MC_IMAGE" -c \
+    "mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && $1"
 }
 mc mb src/source >/dev/null
 mc cp --recursive /seed/ src/source/in/ >/dev/null
@@ -143,4 +155,50 @@ if mc ls --incomplete --recursive --json dst/destination 2>/dev/null | grep -q .
   echo 'orphan multipart upload after injected abort' >&2
   exit 1
 fi
-printf 'S3 MinIO e2e passed (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability)\n'
+# T-IMMUT-S3-LP: the same backup, run by an identity that holds only the
+# documented read policy, with MinIO's own trace as the evidence. The harness
+# first drops the bucket's anonymous download grant, so the reads that follow
+# can only be authorized by the user policy under test.
+mc anonymous set none src/source >/dev/null
+export RB_RO_SECRET=rb-e2e-readonly-secret
+rb_minio_readonly_policy source >"$work/seed/rb-ro-policy.json"
+mc_sh 'mc admin user add src rb-ro "$RB_RO_SECRET"' >/dev/null
+mc_sh 'mc admin policy create src rb-readonly /seed/rb-ro-policy.json' >/dev/null
+mc_sh 'mc admin policy attach src rb-readonly --user rb-ro' >/dev/null
+
+trace_name=rb-s3-trace-$$
+containers+=("$trace_name")
+docker run -d --name "$trace_name" --network host --entrypoint /bin/sh "$MC_IMAGE" -c \
+  'mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && mc admin trace --json src' >/dev/null
+sleep 2
+
+source_pid='' dst_pid=''
+# The source's credentials go through the environment of this one child process:
+# a flag would publish the secret key in the host process list.
+(
+  export RUST_BACKUP_ACCESS_KEY=rb-ro RUST_BACKUP_SECRET_KEY="$RB_RO_SECRET"
+  exec "$RB_E2E_BIN" s3 source --to 127.0.0.1:7840 --channel minio-lp --no-udp --bucket source --prefix in/ --endpoint http://127.0.0.1:19000 --path-style >"$work/lp-source.log" 2>&1
+) &
+source_pid=$!
+sleep 1
+"$RB_E2E_BIN" s3 destination --to 127.0.0.1:7840 --channel minio-lp --no-udp --yes --overwrite --bucket destination --prefix lp/ --endpoint http://127.0.0.1:19001 --access-key minioadmin --secret-key minioadmin --path-style >"$work/lp-destination.log" 2>&1 &
+dst_pid=$!
+wait "$source_pid"
+wait "$dst_pid"
+rb_assert_formal_verification "$work/lp-source.log" "$work/lp-destination.log"
+docker stop "$trace_name" >/dev/null
+docker logs "$trace_name" >"$work/trace.json" 2>/dev/null || true
+rb_minio_assert_readonly_trace "$work/trace.json"
+mc diff --quiet src/source/in/ dst/destination/lp/
+
+# And the server refuses a write with those credentials — the guarantee does not
+# depend on this tool being well-behaved.
+if mc_sh 'mc alias set ro http://127.0.0.1:19000 rb-ro "$RB_RO_SECRET" >/dev/null && mc cp /seed/stale.txt ro/source/in/denied.txt' >/dev/null 2>&1; then
+  echo 'the least-privilege identity was allowed to write to the source bucket' >&2
+  exit 1
+fi
+after_lp=$(mc ls --recursive --json src/source | sort)
+[[ "$before" == "$after_lp" ]]
+printf 'PASS T-IMMUT-S3-LP\n'
+
+printf 'S3 MinIO e2e passed (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability, least-privilege run with server-side trace)\n'

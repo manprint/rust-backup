@@ -16,7 +16,11 @@ of `BackupPlan.payload`), a `Source` (read-only analyze + stream out), and a
 
 1. `cargo new --lib crates/rb-<name>`, depend on `rb-core`.
 2. Define `Params` (serde) + `<Name>Plan` payload (serde).
-3. `impl Source` (`analyze`, `stream_out`, `fingerprint`) — **read-only**.
+3. `impl Source` (`analyze`, `stream_out`, `fingerprint`) — **read-only**. The
+   runner measures `fingerprint` before the run and again after it, on every
+   exit path: success, failure, and a pipeline that panicked (the source run is
+   wrapped in `catch_unwind`). It must therefore stand on its own and not
+   depend on anything `stream_out` left behind.
 4. `impl Destination` (`validate`, `stream_in`).
 5. `impl BackupModule` + `pub fn module() -> Arc<dyn BackupModule>`.
 6. Register it in the binary's module registry.

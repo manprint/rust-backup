@@ -26,7 +26,7 @@ pub(crate) async fn fingerprint(params: &FilesystemParams) -> Result<String> {
         }
         if entry.kind == "file" {
             let path = crate::walk::at_root(&root, &entry.path, Phase::Analyze)?;
-            read_noatime(&path, |bytes| {
+            read_noatime(&path, params.allow_atime_updates, Phase::Analyze, |bytes| {
                 hasher.update(bytes);
                 Ok(())
             })?;

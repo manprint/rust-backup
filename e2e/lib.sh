@@ -506,16 +506,6 @@ rb_pg_assert_readonly_log() { # container user [since]
   echo "read-only log check: $checked statements from $user, all reads"
 }
 
-rb_pg_assert_connections() { # container user max
-  local container=$1 user=$2 max=$3 count
-  count=$(docker logs "$container" 2>&1 | grep -cE "connection authorized: user=${user}\b" || true)
-  if (( count > max )); then
-    echo "FAIL: $count connections authorized for $user, at most $max allowed" >&2
-    return 1
-  fi
-  echo "connection count for $user: $count (max $max)"
-}
-
 # T-PG-CONN. Connection count is a property of a *running* transfer, so it is
 # sampled while the transfer runs and judged afterwards. Only sessions whose
 # `application_name` is the tool are counted: the harness's own psql calls, and
@@ -545,6 +535,168 @@ rb_pg_assert_connections() { # samples-file max
     return 1
   fi
   echo "peak source connections: $peak (budget $max)"
+}
+
+# T-IMMUT-S3-LP. The least-privilege policy for an S3 source bucket: the exact
+# set of read actions this tool issues, and nothing else. `s3:ListBucket` covers
+# `ListObjectsV2`, `s3:GetObject` covers both `GetObject` and `HeadObject`,
+# `s3:GetBucketVersioning` is what the refusal of versioned buckets is decided
+# on (so a backup cannot start without it), and the rest cover the metadata the
+# plan records: object tags and the bucket policy. Object ACLs are read too,
+# but MinIO rejects `s3:GetObjectAcl` as an unsupported action and authorizes
+# `GetObjectAcl` under `s3:GetObject`; on AWS the same recipe needs
+# `s3:GetObjectAcl` added to the object statement. `GetBucketPolicy`
+# is the one grant the tool tolerates losing - without it the plan simply
+# records no policy, which is a silent fidelity loss, so it belongs in the
+# recipe. `e2e/s3_minio_test.sh` drops the bucket's anonymous download grant
+# before it runs with this policy, so a backup that completes there is
+# authorized by this policy alone.
+rb_minio_readonly_policy() { # bucket
+  local bucket=$1
+  cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketPolicy", "s3:GetBucketVersioning"],
+      "Resource": ["arn:aws:s3:::${bucket}"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectTagging"],
+      "Resource": ["arn:aws:s3:::${bucket}/*"]
+    }
+  ]
+}
+JSON
+}
+
+# T-IMMUT-S3-LP. `mc admin trace --json` is MinIO's server-side record of every
+# S3 API call it served, so it plays the part the PostgreSQL log and the mongod
+# log play for the other two modules: the proof that what left this tool was
+# read-only does not come from this tool. Any non-read API in the window fails
+# the assertion, and an empty window fails too - silence is not evidence. Only
+# the backup runs against this server during the traced window, so every record
+# in it belongs to the source.
+rb_minio_assert_readonly_trace() { # trace-file
+  local trace=$1
+  python3 -c '
+import json, sys
+
+READS = {
+    "s3.ListObjectsV2", "s3.ListObjects", "s3.GetObject", "s3.HeadObject",
+    "s3.HeadBucket", "s3.GetObjectTagging", "s3.GetObjectACL",
+    "s3.GetBucketPolicy", "s3.GetBucketLocation", "s3.GetBucketVersioning",
+    "s3.GetBucketTagging", "s3.ListBuckets", "s3.ListMultipartUploads",
+}
+checked = 0
+offenders = []
+with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        api = record.get("api") or (record.get("trace") or {}).get("funcName")
+        if not api or not api.startswith("s3."):
+            continue
+        checked += 1
+        if api not in READS:
+            offenders.append("%s %s" % (api, record.get("path", "")))
+if checked == 0:
+    print("FAIL: no S3 API records in the MinIO trace; "
+          "the read-only assertion proved nothing", file=sys.stderr)
+    raise SystemExit(1)
+if offenders:
+    for offender in offenders[:5]:
+        print("FAIL: write API from the source: %s" % offender, file=sys.stderr)
+    raise SystemExit(1)
+print("MinIO S3 APIs checked: %d, all reads" % checked)
+' "$trace"
+}
+
+# T-IMMUT-MONGO-LP. A mongod started with `--profile 0 --slowms 0` writes a
+# "Slow query" record for every command it runs (level 0 keeps `system.profile`
+# untouched, so the evidence collection cannot itself mutate the source), which
+# makes the server's own log the record of what this tool did. The driver tags
+# its connections with `appName=rust-backup`, so only those records are
+# examined: MongoDB's own housekeeping (the logical session cache refresh writes
+# to `config`) is not our traffic and must not be read as our traffic. Any
+# command whose first key writes fails the assertion, and a window with no
+# records of ours fails too, because silence would otherwise look like proof.
+# Needs MongoDB >= 4.4 (JSON log format) — which is why `image_for 4` is
+# `mongo:4.4`.
+rb_mongo_assert_readonly_log() { # container [since] [app_name]
+  local container=$1 since=${2:-} app=${3:-rust-backup}
+  local -a log_args=()
+  [[ -n $since ]] && log_args+=(--since "$since")
+  docker logs ${log_args[@]+"${log_args[@]}"} "$container" 2>&1 | python3 -c '
+import json, sys
+
+# `aggregate` is classified by its pipeline, not by its name: the Rust driver
+# implements `count_documents` as an `aggregate` with `$match`/`$group`, so
+# read-only aggregates are expected traffic from this tool. Only `$out` and
+# `$merge` write, and a record whose pipeline the server truncated is treated as
+# a write so that unreadable evidence fails loudly instead of passing quietly.
+WRITES = {
+    "insert", "update", "delete", "create", "drop", "dropDatabase",
+    "createIndexes", "dropIndexes", "renameCollection", "findAndModify",
+    "collMod", "applyOps", "setProfilingLevel", "createUser", "updateUser",
+    "dropUser", "createRole", "updateRole", "dropRole", "grantRolesToUser",
+    "revokeRolesFromUser", "grantPrivilegesToRole", "killOp",
+    "mapReduce", "compact", "fsync", "shutdown",
+}
+
+
+def aggregate_writes(command):
+    pipeline = command.get("pipeline")
+    if not isinstance(pipeline, list):
+        return True
+    return any(
+        key in ("$out", "$merge")
+        for stage in pipeline
+        if isinstance(stage, dict)
+        for key in stage
+    )
+
+
+app = sys.argv[1]
+checked = 0
+offenders = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        record = json.loads(line)
+    except ValueError:
+        continue
+    if record.get("c") != "COMMAND":
+        continue
+    attr = record.get("attr") or {}
+    if app and attr.get("appName") != app:
+        continue
+    command = attr.get("command")
+    if not isinstance(command, dict) or not command:
+        continue
+    name = next(iter(command))
+    checked += 1
+    if name in WRITES or (name == "aggregate" and aggregate_writes(command)):
+        offenders.append("%s %s" % (name, command[name]))
+if checked == 0:
+    print("FAIL: no %s command records in the mongod log; "
+          "the read-only assertion proved nothing" % (app or "COMMAND"), file=sys.stderr)
+    raise SystemExit(1)
+if offenders:
+    for offender in offenders[:5]:
+        print("FAIL: write command from the source: %s" % offender, file=sys.stderr)
+    raise SystemExit(1)
+print("mongod commands checked: %d, all reads" % checked)
+' "$app"
 }
 
 rb_pg_assert_no_temp_files() { # container

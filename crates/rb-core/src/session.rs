@@ -7,13 +7,15 @@
 //! frames use independent substreams.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::channel::{
     self, ChunkSink, DataChannel, MultiStreamChunkSink, MultiStreamChunkSource, StreamChunkSink,
@@ -324,7 +326,15 @@ pub async fn run_source_limited(
     // 1. Immutability baseline (read-only).
     let fp_before = source.fingerprint().await?;
 
-    let outcome = source_run(source, channel, progress, max_rate, &fp_before).await;
+    // A panic must not become a way to skip the audit. I-IMMUT (`CLAUDE.md`)
+    // holds on *every* exit path, and the run that panicked halfway through
+    // reading the source is exactly the one whose source state is least
+    // certain. `catch_unwind` turns the unwind into an ordinary error, which
+    // then goes through the same failure-path fingerprint check as any other.
+    let outcome = AssertUnwindSafe(source_run(source, channel, progress, max_rate, &fp_before))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|payload| Err(panicked(payload)));
 
     // 6. Immutability audit — the central invariant. It runs on EVERY exit path,
     // including a run that failed or was aborted mid-stream: an aborted transfer
@@ -354,6 +364,20 @@ pub async fn run_source_limited(
             Err(_) => Err(run_error),
         },
     }
+}
+
+/// Turn a caught panic payload into a phase-free error that names it. The
+/// payload is a `&str` for `panic!("literal")` and a `String` for a formatted
+/// panic; anything else (a custom payload type) is reported as such rather than
+/// silently becoming an empty message.
+fn panicked(payload: Box<dyn std::any::Any + Send>) -> BackupError {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    error!("source pipeline panicked: {message}");
+    BackupError::Other(anyhow::anyhow!("source pipeline panicked: {message}"))
 }
 
 /// The source run proper (analyze → plan exchange → stream → Done), without the

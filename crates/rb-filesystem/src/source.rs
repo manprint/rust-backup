@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
@@ -92,7 +93,7 @@ pub(crate) async fn stream_out(
             )
         })?;
         let path = at_root(&root, &entry.path, Phase::Transfer)?;
-        let mut reader = NoAtimeReader::open(&path)?;
+        let mut reader = NoAtimeReader::open(&path, params.allow_atime_updates, Phase::Transfer)?;
         let mut offset = 0_u64;
         let mut digest = blake3::Hasher::new();
         loop {
@@ -116,8 +117,13 @@ pub(crate) async fn stream_out(
     Ok(())
 }
 
-pub(crate) fn read_noatime(path: &Path, mut visit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
-    let mut reader = NoAtimeReader::open(path)?;
+pub(crate) fn read_noatime(
+    path: &Path,
+    allow_atime_updates: bool,
+    phase: Phase,
+    mut visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut reader = NoAtimeReader::open(path, allow_atime_updates, phase)?;
     loop {
         let bytes = reader.read_chunk()?;
         if bytes.is_empty() {
@@ -138,19 +144,64 @@ pub(crate) fn payload(plan: &BackupPlan, phase: Phase) -> Result<FilesystemPlan>
         .map_err(|e| BackupError::phase(phase, format!("bad filesystem plan payload: {e}")))
 }
 
-struct NoAtimeReader {
+/// Warned once per run, not once per file: a tree of a million foreign-owned
+/// files would otherwise print a million identical lines.
+static ATIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+pub(crate) struct NoAtimeReader {
     fd: std::os::fd::RawFd,
 }
 
 impl NoAtimeReader {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path, allow_atime_updates: bool, phase: Phase) -> Result<Self> {
+        Self::open_with(path, allow_atime_updates, phase, |path, flags| {
+            open(path, flags, Mode::empty())
+        })
+    }
+
+    /// `opener` is a seam: `O_NOATIME` fails with `EPERM` only for a file this
+    /// process neither owns nor has `CAP_FOWNER` over, which a unit test cannot
+    /// create without root. The tests inject that answer instead.
+    pub(crate) fn open_with(
+        path: &Path,
+        allow_atime_updates: bool,
+        phase: Phase,
+        mut opener: impl FnMut(&Path, OFlag) -> nix::Result<std::os::fd::RawFd>,
+    ) -> Result<Self> {
         let flags = OFlag::O_RDONLY | OFlag::O_NOATIME;
-        let fd = match open(path, flags, Mode::empty()) {
-            Ok(fd) => Ok(fd),
-            Err(Errno::EPERM) => open(path, OFlag::O_RDONLY, Mode::empty()),
-            Err(error) => Err(error),
-        }
-        .map_err(|e| BackupError::phase(Phase::Transfer, format!("{}: {e}", path.display())))?;
+        let fd = match opener(path, flags) {
+            Ok(fd) => fd,
+            // The kernel refuses `O_NOATIME` on a file we do not own: reading it
+            // WILL move its access time, which is a change to the source. That
+            // is a failure unless the operator accepted it explicitly — and the
+            // first reader is the fingerprint-before pass, so the refusal lands
+            // before a single byte has been transferred.
+            Err(Errno::EPERM) if !allow_atime_updates => {
+                return Err(BackupError::phase(
+                    phase,
+                    format!(
+                        "cannot open {} without updating its access time (O_NOATIME needs file \
+                         ownership or CAP_FOWNER); run as the file owner or root, or pass \
+                         --allow-atime-updates to accept atime changes on the source",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(Errno::EPERM) => {
+                if !ATIME_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("atime updates on the source accepted by --allow-atime-updates");
+                }
+                opener(path, OFlag::O_RDONLY)
+                    .map_err(|e| BackupError::phase(phase, format!("{}: {e}", path.display())))?
+            }
+            Err(error) => {
+                return Err(BackupError::phase(
+                    phase,
+                    format!("{}: {error}", path.display()),
+                ))
+            }
+        };
         Ok(Self { fd })
     }
 

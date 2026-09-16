@@ -2642,6 +2642,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "futures-util",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2661,12 +2662,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "rb-mongodb"
 version = "0.0.6"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "futures-util",
@@ -2682,6 +2685,7 @@ dependencies = [
 name = "rb-postgres"
 version = "0.0.6"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "bytes",

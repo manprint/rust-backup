@@ -41,12 +41,35 @@ sudo rust-backup filesystem destination \
 |------|-----------|---------|------|--------------|
 | `--root <percorso>` | `RUST_BACKUP_ROOT` | — (obbligatorio) | entrambi | sorgente: directory da copiare. Destinazione: directory in cui ripristinare, che deve essere **assente o vuota** |
 | `--no-preserve-ownership[=bool]` | `RUST_BACKUP_NO_PRESERVE_OWNERSHIP` | falso (cioè: ownership preservata) | destinazione | rinuncia esplicita al ripristino di uid/gid. I file diventano dell'utente che esegue il processo; contenuti, permessi, date e link restano verificati |
+| `--allow-atime-updates[=bool]` | `RUST_BACKUP_ALLOW_ATIME_UPDATES` | falso | sorgente | accetta che la lettura aggiorni l'**access time** dei file. Serve solo quando il processo non è proprietario dei file e non ha `CAP_FOWNER`: in quel caso `O_NOATIME` viene rifiutato dal kernel e senza questo flag la corsa termina prima di trasferire qualsiasi byte |
 | `--follow-symlinks[=bool]` | `RUST_BACKUP_FOLLOW_SYMLINKS` | falso | entrambi | **rifiutato da questa build**: seguire un link potrebbe uscire dalla root dichiarata e non preserverebbe il link come tale. I symlink vengono comunque copiati *come symlink* |
 | `--preserve-xattr[=bool]` | `RUST_BACKUP_PRESERVE_XATTR` | falso | entrambi | **rifiutato da questa build**: gli attributi estesi saranno supportati quando esisterà un'implementazione sicura compatibile con `forbid(unsafe_code)` |
 | `-P preserve_ownership=true\|false` | — | `true` | destinazione | stesso parametro di `--no-preserve-ownership`, ma con il nome positivo: è la forma usata nello YAML |
 
 Valgono inoltre tutti i flag di trasporto di [02 — Trasporto](02-trasporto.md).
 Qui `--carriers` è utile davvero: fino a **32**.
+
+### Access time e `O_NOATIME`
+
+La sorgente apre ogni file con `O_NOATIME`, così una copia non lascia traccia
+nemmeno nell'access time. Il kernel concede `O_NOATIME` solo al proprietario del
+file (o a chi ha `CAP_FOWNER`): su un albero di file altrui la `open` risponde
+`EPERM` e leggerli **cambierebbe** il loro atime, cioè modificherebbe la
+sorgente. Senza il flag la corsa si ferma subito, durante la prima impronta:
+
+```text
+[Analyze] cannot open /srv/data/file.bin without updating its access time
+(O_NOATIME needs file ownership or CAP_FOWNER); run as the file owner or root,
+or pass --allow-atime-updates to accept atime changes on the source
+```
+
+Rimedi, in ordine di preferenza: eseguire come proprietario dei file o come
+root, oppure passare `--allow-atime-updates` per accettare la modifica. Con il
+flag la corsa prosegue e stampa una volta:
+
+```text
+WARN atime updates on the source accepted by --allow-atime-updates
+```
 
 Passare `--follow-symlinks` o `--preserve-xattr` con valore vero fa terminare il
 comando con:

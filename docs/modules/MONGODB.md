@@ -69,6 +69,34 @@ as an array of integers, which MongoDB accepts as a *different* value, and
 re-introspection reproduces the same array so verification would agree with the
 corruption. Such a spec fails analysis, naming the offending field path.
 
+## Immutability
+
+The source only reads, and the type says so: source-side code holds a
+`ReadOnlyClient` and its `ReadOnlyDatabase`, which expose `list_collections`,
+`list_collection_names`, `find`, `count_documents`,
+`estimated_document_count`, `list_indexes` and `run_command` — and nothing
+else. There is no accessor returning a `Collection` or a raw `Database`, so a
+write on the source path does not compile.
+
+`run_command` is the one call that takes the operation as data, so it is also
+guarded: the command's first key must be one of `collStats`,
+`listCollections`, `listIndexes`, `usersInfo`, `rolesInfo`, `dbStats`,
+`buildInfo`, `connectionStatus`, `hello`, `isMaster` or `ping`. Anything else —
+`insert`, `drop`, `createIndexes`, `aggregate` (whatever its pipeline),
+`applyOps`, `setProfilingLevel` — is refused with
+`I-IMMUT guard refused command <name> on the source`.
+
+The source client also pins `readPreference=primary` and `readConcern=local`,
+overriding whatever an operator's URI asked for: the two fingerprint audits that
+bracket a run must read the same node under the same visibility rules, or
+replication lag on a secondary would be reported as source mutation.
+
+MongoDB has no server-side read-only session switch, so the remaining layer is
+the role: use a `read`-only backup user. The run is bracketed by two
+fingerprints, and drift ends it as a source mutation. The vector list, the
+fingerprint contract and the read-only role recipe are in
+[docs/IMMUTABILITY.md](../IMMUTABILITY.md).
+
 ## Privileges
 
 The source needs read access to listed databases/collections and catalog commands

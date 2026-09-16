@@ -22,17 +22,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tokio_postgres::Client;
-
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
 
-use crate::connect::SourcePool;
+use crate::connect::{ReadOnlyClient, SourcePool};
 use crate::ddl::quote_qualified;
 use crate::model::*;
 use crate::PostgresParams;
 
-fn analyze_err(ctx: &str, e: tokio_postgres::Error) -> BackupError {
+/// Tag a read failure with the introspection step it came from. The cause is
+/// whatever the read-only client returned (a driver error, or the I-IMMUT
+/// guard refusing a statement).
+fn analyze_err(ctx: &str, e: BackupError) -> BackupError {
     BackupError::phase_src(Phase::Analyze, format!("introspect: {ctx}"), e)
 }
 
@@ -84,7 +85,7 @@ pub async fn introspect_cluster(pool: &SourcePool) -> Result<PgPlanPayload> {
 
 // --- cluster-global ----------------------------------------------------------
 
-async fn gather_roles(client: &Client) -> Result<Vec<PgRole>> {
+async fn gather_roles(client: &ReadOnlyClient) -> Result<Vec<PgRole>> {
     let rows = client
         .query(
             "SELECT r.rolname::text, r.rolsuper, r.rolcreatedb, r.rolcreaterole, \
@@ -117,7 +118,7 @@ async fn gather_roles(client: &Client) -> Result<Vec<PgRole>> {
         .collect())
 }
 
-async fn gather_memberships(client: &Client) -> Result<Vec<PgMembership>> {
+async fn gather_memberships(client: &ReadOnlyClient) -> Result<Vec<PgMembership>> {
     let rows = client
         .query(
             "SELECT g.rolname::text, m.rolname::text, am.admin_option \
@@ -140,7 +141,7 @@ async fn gather_memberships(client: &Client) -> Result<Vec<PgMembership>> {
         .collect())
 }
 
-async fn gather_tablespaces(client: &Client) -> Result<Vec<PgTablespace>> {
+async fn gather_tablespaces(client: &ReadOnlyClient) -> Result<Vec<PgTablespace>> {
     let rows = client
         .query(
             "SELECT t.spcname::text, pg_catalog.pg_get_userbyid(t.spcowner)::text, \
@@ -162,7 +163,10 @@ async fn gather_tablespaces(client: &Client) -> Result<Vec<PgTablespace>> {
         .collect())
 }
 
-async fn target_database_names(params: &PostgresParams, client: &Client) -> Result<Vec<String>> {
+async fn target_database_names(
+    params: &PostgresParams,
+    client: &ReadOnlyClient,
+) -> Result<Vec<String>> {
     if let Some(db) = &params.database {
         return Ok(vec![db.clone()]);
     }
@@ -204,7 +208,7 @@ fn parse_locale_provider(value: &str) -> Result<PgLocaleProvider> {
 }
 
 async fn gather_databases_meta(
-    client: &Client,
+    client: &ReadOnlyClient,
     names: &[String],
     server_major: u32,
 ) -> Result<Vec<PgDatabase>> {
@@ -257,7 +261,7 @@ async fn gather_databases_meta(
 
 // --- per-database ------------------------------------------------------------
 
-async fn gather_extensions(client: &Client) -> Result<Vec<PgExtension>> {
+async fn gather_extensions(client: &ReadOnlyClient) -> Result<Vec<PgExtension>> {
     let rows = client
         .query(
             "SELECT e.extname::text, e.extversion::text, n.nspname::text \
@@ -283,7 +287,7 @@ async fn gather_extensions(client: &Client) -> Result<Vec<PgExtension>> {
 /// the extension owns is recreated by `CREATE EXTENSION`. Skipping them loses
 /// real user data — a custom PostGIS `spatial_ref_sys` row, a tuned
 /// configuration table — with nothing in the catalog read-back to notice.
-async fn gather_extension_configs(client: &Client) -> Result<Vec<PgExtensionConfig>> {
+async fn gather_extension_configs(client: &ReadOnlyClient) -> Result<Vec<PgExtensionConfig>> {
     let rows = client
         .query(
             "SELECT e.extname::text, n.nspname::text, c.relname::text, \
@@ -311,7 +315,7 @@ async fn gather_extension_configs(client: &Client) -> Result<Vec<PgExtensionConf
 }
 
 /// Build the full schema tree for the connected database.
-async fn gather_schemas(client: &Client, major: u32) -> Result<Vec<PgSchema>> {
+async fn gather_schemas(client: &ReadOnlyClient, major: u32) -> Result<Vec<PgSchema>> {
     // Schemas (ordered) + name→index map.
     let schema_rows = client
         .query(
@@ -375,7 +379,7 @@ async fn gather_schemas(client: &Client, major: u32) -> Result<Vec<PgSchema>> {
 }
 
 /// Returns `(table_oid, schema_name, table)` — oid/schema used only for assembly.
-async fn gather_tables(client: &Client) -> Result<Vec<(i64, String, PgTable)>> {
+async fn gather_tables(client: &ReadOnlyClient) -> Result<Vec<(i64, String, PgTable)>> {
     let rows = client
         .query(
             "SELECT c.oid::int8, n.nspname::text, c.relname::text, \
@@ -449,7 +453,10 @@ async fn gather_tables(client: &Client) -> Result<Vec<(i64, String, PgTable)>> {
         .collect())
 }
 
-async fn gather_columns(client: &Client, major: u32) -> Result<HashMap<i64, Vec<PgColumn>>> {
+async fn gather_columns(
+    client: &ReadOnlyClient,
+    major: u32,
+) -> Result<HashMap<i64, Vec<PgColumn>>> {
     // `attgenerated` exists only on pg 12+. On 10/11 there are no generated
     // columns, so `default` is always the attrdef expr and `generated` is NULL.
     let (default_expr, generated_expr) = if major >= 12 {
@@ -521,7 +528,7 @@ const CONSTRAINTS_QUERY: &str = "SELECT con.conrelid::int8, con.conname::text, c
        AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
      ORDER BY con.conrelid, con.conname";
 
-async fn gather_constraints(client: &Client) -> Result<HashMap<i64, Vec<PgConstraint>>> {
+async fn gather_constraints(client: &ReadOnlyClient) -> Result<HashMap<i64, Vec<PgConstraint>>> {
     let rows = client
         .query(CONSTRAINTS_QUERY, &[])
         .await
@@ -543,7 +550,7 @@ async fn gather_constraints(client: &Client) -> Result<HashMap<i64, Vec<PgConstr
     Ok(map)
 }
 
-async fn gather_indexes(client: &Client) -> Result<HashMap<i64, Vec<PgIndex>>> {
+async fn gather_indexes(client: &ReadOnlyClient) -> Result<HashMap<i64, Vec<PgIndex>>> {
     let rows = client
         .query(
             "SELECT i.indrelid::int8, ic.relname::text, \
@@ -583,7 +590,7 @@ async fn gather_indexes(client: &Client) -> Result<HashMap<i64, Vec<PgIndex>>> {
     Ok(map)
 }
 
-async fn gather_sequences(client: &Client) -> Result<Vec<(String, PgSequence)>> {
+async fn gather_sequences(client: &ReadOnlyClient) -> Result<Vec<(String, PgSequence)>> {
     let rows = client
         .query(
             "SELECT n.nspname::text, c.relname::text, \
@@ -678,7 +685,7 @@ async fn gather_sequences(client: &Client) -> Result<Vec<(String, PgSequence)>> 
 }
 
 /// Returns `(view_oid, schema_name, view)`; the oid attaches matview indexes.
-async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
+async fn gather_views(client: &ReadOnlyClient) -> Result<Vec<(i64, String, PgView)>> {
     let rows = client
         .query(
             "SELECT n.nspname::text, c.relname::text, \
@@ -731,7 +738,10 @@ async fn gather_views(client: &Client) -> Result<Vec<(i64, String, PgView)>> {
         .collect())
 }
 
-async fn gather_functions(client: &Client, major: u32) -> Result<Vec<(String, PgFunction)>> {
+async fn gather_functions(
+    client: &ReadOnlyClient,
+    major: u32,
+) -> Result<Vec<(String, PgFunction)>> {
     // `prokind` exists on pg 11+; on 10 use proisagg/proiswindow. Exclude
     // aggregates/window funcs (pg_get_functiondef errors on them).
     let kind_filter = if major >= 11 {
@@ -794,7 +804,7 @@ const MAX_REPORTED: usize = 5;
 /// unmodelled class is lost silently and then certified as a faithful copy.
 /// Each probe below is one `SELECT` over `pg_catalog`.
 async fn find_unsupported_objects(
-    client: &Client,
+    client: &ReadOnlyClient,
     database: &str,
     major: u32,
 ) -> Result<Vec<UnsupportedClass>> {

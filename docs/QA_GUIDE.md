@@ -13,6 +13,19 @@ cargo build --release --all-features
 `--all-features` includes the direct UDP/QUIC path. `cargo build
 --no-default-features` produces the relay-only binary, which is also gated in CI.
 
+The full quality gate is one command, and it is what CI's `rust-quality` job
+runs:
+
+```bash
+bash scripts/gates.sh
+```
+
+It chains `cargo fmt --all --check`, `cargo clippy --all-targets --all-features
+-- -D warnings`, both builds, `cargo test --all-features`,
+`scripts/crate_invariants.sh`, `scripts/source_readonly_lint.sh` (plus its
+`--selftest`, so a lint that can no longer detect a write fails the gate) and
+`scripts/help_parity.sh`.
+
 ## The shape of every run
 
 Three processes: one coordination server, and a source and a destination that
@@ -139,6 +152,14 @@ Attach both peer logs and the exact command lines when reporting a failure. The
 first line to look at is the process's own last line: it is the error it exited
 with, and it starts with its phase — `[Connect]`, `[Analyze]`, `[Validate]`,
 `[Transfer]`, `[Apply]`, `[Verify]` or `[Teardown]`.
+
+## Source immutability
+
+Every run is bracketed by two source measurements, and the guards that make a
+write impossible in the first place — read-only sessions, statement and command
+allowlists, the read-only lint in the gates, and the server-log assertions in
+the e2e suite — are documented per module, with the test that proves each one,
+in [docs/IMMUTABILITY.md](IMMUTABILITY.md).
 
 ## The test matrix
 

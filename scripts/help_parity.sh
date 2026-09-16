@@ -38,8 +38,10 @@ cli_flags() {
 # Every long switch the operator guide mentions. `--` runs in markdown table
 # rules are not switches, hence the leading-alphanumeric requirement; the
 # exclusion list holds switches that belong to other programs the documents
-# legitimately show (cargo, docker, git, and the pg_dump oracle in e2e/README.md).
-not_ours='^--(all-features|no-default-features|release|locked|rm|network|entrypoint|name|env-file|detach|check|ff-only|now|lib|schema-only|no-sync)$'
+# legitimately show (cargo, docker, git, our own gate scripts, the pg_dump
+# oracle in e2e/README.md, and the mongod/mc switches the I-IMMUT evidence
+# recipes quote: `--profile 0 --slowms 0` and `mc admin trace --json`).
+not_ours='^--(all|all-features|all-targets|no-default-features|release|locked|rm|network|entrypoint|name|env-file|detach|check|selftest|ff-only|now|lib|schema-only|no-sync|profile|slowms|json)$'
 doc_flags() {
   grep -hEo -- '--[a-z0-9][a-z0-9-]*' "$@" | grep -Ev "$not_ours" | sort -u
 }

@@ -22,6 +22,10 @@ cargo test --locked --all-features
 echo "==> crate lint invariants"
 bash scripts/crate_invariants.sh
 
+echo "==> source read-only lint (I-IMMUT)"
+bash scripts/source_readonly_lint.sh
+bash scripts/source_readonly_lint.sh --selftest
+
 echo "==> help/USAGE parity"
 bash scripts/help_parity.sh
 

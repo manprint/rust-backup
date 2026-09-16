@@ -14,6 +14,7 @@ deletes pre-existing entries as part of a restore.
 | symlinks / hardlinks | always | recreated | none |
 | **uid / gid (ownership)** | always (recorded in plan) | **only when privileged** | **root or `CAP_CHOWN`** |
 | xattrs | not yet supported | not yet supported | — |
+| **access time (atime) of the source** | left untouched (`O_NOATIME`) | — | **file ownership or `CAP_FOWNER`**; without it the run fails unless `--allow-atime-updates` is passed |
 
 On privileged restores ownership is applied before the final permission bits:
 POSIX `chown` clears setuid/setgid on regular files, so the reverse order would
@@ -91,6 +92,31 @@ instead of being clamped to the epoch.
 The source walk is depth-bounded (1024 levels): it recurses, and an
 adversarially deep tree would abort the process rather than return an error.
 
+## Immutability
+
+Files are read with `O_RDONLY` and `O_NOATIME`, so a backup leaves even the
+access times untouched. The kernel allows `O_NOATIME` only to the file owner or
+to a process with `CAP_FOWNER`; for anything else it answers `EPERM`, and
+reading the file would move its atime — a change to the source. That is a
+failure, not a fallback:
+
+```text
+[Analyze] cannot open /srv/data/file.bin without updating its access time
+(O_NOATIME needs file ownership or CAP_FOWNER); run as the file owner or root,
+or pass --allow-atime-updates to accept atime changes on the source
+```
+
+The refusal comes from the first fingerprint, so it lands before any byte is
+transferred and nothing on either host has been touched. Run as the owner or as
+root, or pass `--allow-atime-updates` to accept the atime change explicitly —
+with the flag the run continues and warns once,
+`atime updates on the source accepted by --allow-atime-updates`.
+
+Nothing on the source is written, and the run is bracketed by two fingerprints
+over paths, metadata, link targets and contents. The vector list, the
+fingerprint contract and the access-time rule are in
+[docs/IMMUTABILITY.md](../IMMUTABILITY.md).
+
 ## Current limits
 
 - `--follow-symlinks` is rejected. Following a link could escape the declared
@@ -98,9 +124,9 @@ adversarially deep tree would abort the process rather than return an error.
 - `--preserve-xattr` is rejected for now. The module uses only safe `std` +
   `nix` APIs under the workspace `forbid(unsafe_code)` rule; xattr support will
   be added when a safe implementation fits that constraint.
-- Regular file reads try Linux `O_NOATIME` first. If the caller does not own the
-  file and has no capability to use it, the kernel rejects that flag and the
-  read falls back to ordinary read-only open.
+- Regular file reads use Linux `O_NOATIME`. If the caller neither owns the file
+  nor holds `CAP_FOWNER`, the kernel rejects that flag and the run fails unless
+  `--allow-atime-updates` accepts the access-time change (see "Immutability").
 - The destination root's own metadata is never restored (see above).
 - `SIGINT`/`SIGTERM` abort the run: the active item is removed, no `VERIFIED`
   line is printed, and the process exits non-zero with an explicit "interrupted

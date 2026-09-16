@@ -223,6 +223,37 @@ impl Source for MutatingSource {
     }
 }
 
+/// A source that panics while streaming (T-IMMUT-PANIC). `fingerprints` counts
+/// the audit calls, so a test can prove the after-audit still ran; `drifting`
+/// makes the second fingerprint differ, which is the source-mutated variant.
+struct PanickingSource {
+    fingerprints: Arc<AtomicUsize>,
+    drifting: bool,
+}
+#[async_trait]
+impl Source for PanickingSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        Ok(demo_plan())
+    }
+    async fn stream_out(&self, _p: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
+        // An out-of-bounds index on a `Vec`, not `panic!`: the production lints
+        // forbid the macro, and this is the shape a real bug takes anyway. The
+        // length is not a constant, so it panics at run time rather than being
+        // rejected at compile time.
+        let empty: Vec<u8> = Vec::new();
+        let _ = empty[empty.capacity()];
+        Ok(())
+    }
+    async fn fingerprint(&self) -> Result<String> {
+        let n = self.fingerprints.fetch_add(1, Ordering::SeqCst);
+        if self.drifting {
+            Ok(format!("fp-{n}"))
+        } else {
+            Ok("fp-stable".to_string())
+        }
+    }
+}
+
 struct MockDest {
     received: Arc<Mutex<Vec<u8>>>,
 }
@@ -1140,6 +1171,83 @@ async fn mutating_source_caught() {
         derr.is_err(),
         "destination must not report success before source immutability proof"
     );
+}
+
+/// T-IMMUT-PANIC: a panic inside the source pipeline must not skip the
+/// immutability audit. The run is reported as a failure that names the panic,
+/// and the source has been fingerprinted twice — before and after.
+#[tokio::test]
+async fn panic_in_stream_out_still_runs_the_after_audit() {
+    let channel = TestChannel::pair();
+    let fingerprints = Arc::new(AtomicUsize::new(0));
+    let source = PanickingSource {
+        fingerprints: fingerprints.clone(),
+        drifting: false,
+    };
+    let destination = MockDest {
+        received: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let channel2 = channel.clone();
+    let s = tokio::spawn(async move { session::run_source(&source, &*channel, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&destination, &*channel2, &p2, &mut yes).await
+    });
+    let error = s
+        .await
+        .unwrap()
+        .expect_err("a panicking source must not report success");
+    assert!(
+        matches!(error, rb_core::error::BackupError::Other(_)),
+        "the panic must surface as an error, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("panicked"),
+        "the error must name the panic: {error}"
+    );
+    assert_eq!(
+        fingerprints.load(Ordering::SeqCst),
+        2,
+        "the audit must have run after the panic, not only before it"
+    );
+    assert!(
+        d.await.unwrap().is_err(),
+        "the destination must not report success for a run that panicked"
+    );
+}
+
+/// T-IMMUT-PANIC: and when the source really did change, the panic is not the
+/// headline — `SourceMutated` is, because that is the invariant the caller has
+/// to act on.
+#[tokio::test]
+async fn panic_with_mutated_fingerprint_reports_source_mutated() {
+    let channel = TestChannel::pair();
+    let fingerprints = Arc::new(AtomicUsize::new(0));
+    let source = PanickingSource {
+        fingerprints: fingerprints.clone(),
+        drifting: true,
+    };
+    let destination = MockDest {
+        received: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let channel2 = channel.clone();
+    let s = tokio::spawn(async move { session::run_source(&source, &*channel, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&destination, &*channel2, &p2, &mut yes).await
+    });
+    let error = s
+        .await
+        .unwrap()
+        .expect_err("a drifted source must not report success");
+    assert!(
+        matches!(error, rb_core::error::BackupError::SourceMutated(_)),
+        "drift found on the panic path must be reported as SourceMutated, got: {error}"
+    );
+    assert_eq!(fingerprints.load(Ordering::SeqCst), 2);
+    assert!(d.await.unwrap().is_err());
 }
 
 /// A destination that applied the payload and then failed must be told, so the

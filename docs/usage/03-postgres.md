@@ -175,6 +175,19 @@ GRANT pg_read_all_data TO backup_readonly;          -- PostgreSQL 14+
 --   GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO backup_readonly;
 ```
 
+Se il ruolo usato sulla sorgente **può scrivere** (superutente, `CREATEDB`,
+`CREATEROLE`, oppure un `GRANT INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` su qualche
+tabella), la corsa non viene rifiutata ma stampa una volta:
+
+```text
+WARN source role app_owner can write to the source; a read-only role is recommended, see docs/IMMUTABILITY.md
+```
+
+La sorgente resta comunque protetta dal lato del programma — il codice sorgente
+non compila una scrittura, ogni statement passa da una allowlist e la sessione
+è aperta con `default_transaction_read_only=on` — ma un ruolo a soli privilegi
+di lettura è la difesa che non dipende da questo programma.
+
 **Destinazione — utente amministrativo.** Crea ruoli e database, applica
 proprietà e privilegi: in pratica `CREATEROLE` + `CREATEDB`, e superutente se si
 devono ripristinare ACL a livello di database.

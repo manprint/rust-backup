@@ -42,6 +42,14 @@ pub struct FilesystemParams {
     /// Reserved for a later safe, cross-platform xattr implementation.
     #[serde(default)]
     pub preserve_xattr: bool,
+    /// Source only: accept that reading a file moves its access time.
+    ///
+    /// `O_NOATIME` needs file ownership or `CAP_FOWNER`; without either the
+    /// kernel answers `EPERM` and reading the file updates its atime, which is
+    /// a change to the source (I-IMMUT). Off by default, so such a run fails
+    /// during the first fingerprint instead of silently touching the tree.
+    #[serde(default)]
+    pub allow_atime_updates: bool,
 }
 
 fn default_preserve_ownership() -> bool {
@@ -264,7 +272,71 @@ mod tests {
             follow_symlinks: false,
             preserve_ownership: false,
             preserve_xattr: false,
+            allow_atime_updates: false,
         }
+    }
+
+    // --- the atime guard (I-IMMUT) ------------------------------------------
+
+    #[test]
+    fn noatime_open_succeeds_for_owner() {
+        // The test process owns the file it just created, so `O_NOATIME` is
+        // permitted and nothing falls back.
+        let root = tempdir("noatime-owner");
+        let file = root.join("f");
+        fs::write(&file, b"x").unwrap();
+        let reader = crate::source::NoAtimeReader::open(&file, false, Phase::Analyze);
+        assert!(reader.is_ok(), "owner open must succeed");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn noatime_eperm_is_refused_without_flag() {
+        let root = tempdir("noatime-eperm");
+        let file = root.join("f");
+        fs::write(&file, b"x").unwrap();
+        let mut attempts = 0;
+        let error =
+            crate::source::NoAtimeReader::open_with(&file, false, Phase::Analyze, |_, _| {
+                attempts += 1;
+                Err(nix::errno::Errno::EPERM)
+            })
+            .expect_err("EPERM without the flag must fail the run");
+        assert_eq!(attempts, 1, "the refusal must not retry without O_NOATIME");
+        let text = error.to_string();
+        assert!(text.contains("without updating its access time"), "{text}");
+        assert!(text.contains("--allow-atime-updates"), "{text}");
+        assert!(text.contains("[Analyze]"), "the caller's phase: {text}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn noatime_eperm_falls_back_with_flag() {
+        let root = tempdir("noatime-accepted");
+        let file = root.join("f");
+        fs::write(&file, b"payload").unwrap();
+        let mut flags_seen = Vec::new();
+        let reader =
+            crate::source::NoAtimeReader::open_with(&file, true, Phase::Transfer, |path, flags| {
+                flags_seen.push(flags);
+                if flags.contains(nix::fcntl::OFlag::O_NOATIME) {
+                    return Err(nix::errno::Errno::EPERM);
+                }
+                nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())
+            });
+        assert!(reader.is_ok(), "the flag must allow the plain open");
+        assert_eq!(flags_seen.len(), 2, "one O_NOATIME attempt, one fallback");
+        assert!(!flags_seen[1].contains(nix::fcntl::OFlag::O_NOATIME));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn allow_atime_updates_defaults_to_refusing() {
+        // A plan or session file written before the flag existed must not
+        // silently opt in.
+        let params: FilesystemParams =
+            serde_json::from_value(serde_json::json!({ "root": "/tmp" })).unwrap();
+        assert!(!params.allow_atime_updates);
     }
 
     fn fixture(root: &Path) {

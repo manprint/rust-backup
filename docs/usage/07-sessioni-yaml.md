@@ -84,6 +84,8 @@ targets:
       sslmode: require
       # solo destinazione: source (default) | default
       extension_version: source
+      # solo filesystem, solo sorgente: accetta l'aggiornamento dell'atime
+      allow_atime_updates: false
 
     auto_accept: false         # true = come --yes; ignorato sul lato sorgente
 

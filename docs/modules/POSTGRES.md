@@ -288,6 +288,45 @@ post-run audit or as the destination's re-introspection, because the callers
 that use them in another phase re-wrap the error with that phase
 (`dest.rs` `verify_catalog`, `lib.rs` `verify`).
 
+## Immutability
+
+The source is opened read-only and never written, and three independent layers
+say so:
+
+- **The type.** Source-side code holds a `ReadOnlyClient`, not a
+  `tokio_postgres::Client`. It exposes `query`, `query_one`, `query_opt` and
+  `copy_out` and nothing else — no `execute`, `batch_execute`, `copy_in`,
+  `transaction` or `simple_query`, and no accessor that hands the inner client
+  out. A write on the source path does not compile.
+- **The statement allowlist.** Much of the SQL is built at runtime from catalog
+  names, so every statement still passes a guard before it reaches the server.
+  The guard removes literals, dollar-quoted bodies, quoted identifiers and
+  comments, then requires a single statement whose head is `SELECT`, `WITH`,
+  `SHOW`, `TABLE`, `VALUES` or `COPY … TO STDOUT`, with no writing keyword
+  (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`,
+  `GRANT`, `SET`, `ANALYZE`, `VACUUM`, …) and no mutating function
+  (`nextval`, `setval`, `lo_import`, `pg_advisory_lock`,
+  `pg_terminate_backend`, …). A refusal reads
+  `I-IMMUT guard refused a statement on the source: <first 120 characters>`.
+  A table named `"delete"` or a literal `'DROP TABLE x'` is data, not syntax,
+  and passes.
+- **The server.** The session carries `default_transaction_read_only=on`, so a
+  write that somehow got past both layers still fails at the backend.
+
+On top of that the run is bracketed by two fingerprints, so any drift ends it as
+a source mutation.
+
+At connect time the source role is probed once
+(`rolsuper`/`rolcreatedb`/`rolcreaterole`, plus
+`information_schema.role_table_grants` for `INSERT`/`UPDATE`/`DELETE`/
+`TRUNCATE`). A role that can write the source is only **warned** about —
+`source role <user> can write to the source; a read-only role is recommended,
+see docs/IMMUTABILITY.md` — never refused: which role to use stays the
+operator's call.
+
+The full vector list, the fingerprint contract and the read-only role recipes
+per major are in [docs/IMMUTABILITY.md](../IMMUTABILITY.md).
+
 ## Privileges
 
 Use a read-only source account able to inspect the required catalogs and `SELECT`

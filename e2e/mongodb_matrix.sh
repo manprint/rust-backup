@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# T-MONGO-MATRIX + T-MONGO-IMMUT (plan Phase 3.7): full backup -> restore -> diff
-# over the relay, across MongoDB majors, plus the source-immutability assertion
-# (incl. a run aborted mid-transfer).
+# T-MONGO-MATRIX + T-MONGO-IMMUT (plan Phase 3.7) + T-IMMUT-MONGO-LP (plan
+# Phase 4.7): full backup -> restore -> diff over the relay, across MongoDB
+# majors, plus the source-immutability assertion (incl. a run aborted
+# mid-transfer) and a full run driven by a least-privilege user whose
+# read-onlyness is proven from the server's own command log.
 #
 # For each major: two Docker MongoDB containers (source seeded, destination
 # empty), then `rust-backup server` + `mongodb source` + `mongodb destination`
@@ -23,6 +25,16 @@ FAIL=0
 SKIPPED=0
 BIN="./target/release/rust-backup"
 CTRL_PORT=$(rb_free_port)
+# Source credentials used by `run_transfer`. Empty means "no authentication",
+# which is how every case except the least-privilege one runs; the LP case sets
+# them to the read-only user it created. The password never reaches argv.
+SOURCE_USER=""
+SOURCE_PASSWORD=""
+SOURCE_AUTH_DB=""
+# Throwaway credentials for the least-privilege source container. They exist for
+# the lifetime of one container on the loopback interface only.
+LP_ROOT_PASSWORD="rb-e2e-root"
+LP_RO_PASSWORD="rb-e2e-ro"
 
 CONTAINERS=()
 PIDS=()
@@ -58,22 +70,35 @@ image_for() { # major -> docker image tag
 
 # Run a JS snippet inside a container, preferring mongosh, falling back to the
 # legacy `mongo` shell (MongoDB 4.x images ship `mongo`, 5+ ship `mongosh`).
+# When RB_MONGO_USER is set the shell authenticates with it — the
+# authentication-enabled least-privilege container needs it. These credentials
+# only ever travel inside `docker exec` to a throwaway container; neither shell
+# reads a password from the environment.
 mongo_eval() { # container db js
   local c="$1" db="$2" js="$3"
+  local -a auth=()
+  if [[ -n ${RB_MONGO_USER:-} ]]; then
+    auth=(-u "$RB_MONGO_USER" -p "${RB_MONGO_PASSWORD:-}"
+      --authenticationDatabase "${RB_MONGO_AUTHDB:-admin}")
+  fi
   if docker exec "$c" sh -c 'command -v mongosh' >/dev/null 2>&1; then
-    docker exec "$c" mongosh --quiet "$db" --eval "$js"
+    docker exec "$c" mongosh --quiet ${auth[@]+"${auth[@]}"} "$db" --eval "$js"
   else
-    docker exec "$c" mongo --quiet "$db" --eval "$js"
+    docker exec "$c" mongo --quiet ${auth[@]+"${auth[@]}"} "$db" --eval "$js"
   fi
 }
 
 # Returns 2 when this host cannot run the requested MongoDB major at all, which
 # is an environment limit and not a defect in this tool: reporting it as a
 # failure would hide real ones, and reporting it as a pass would be a lie.
+# RB_MONGO_RUN_ARGS (docker) and RB_MONGO_MONGOD_ARGS (mongod) let a caller add
+# authentication and command logging without a second copy of this function.
 start_mongo() { # name port image -> start container, wait ready
   local name="$1" port="$2" image="$3"
   CONTAINERS+=("$name")
-  docker run -d --name "$name" -p "${port}:27017" "$image" >/dev/null
+  docker run -d --name "$name" -p "${port}:27017" \
+    ${RB_MONGO_RUN_ARGS[@]+"${RB_MONGO_RUN_ARGS[@]}"} "$image" \
+    ${RB_MONGO_MONGOD_ARGS[@]+"${RB_MONGO_MONGOD_ARGS[@]}"} >/dev/null
   # First startup of a newly pulled Mongo image can exceed 40 seconds on CI.
   for _ in $(seq 1 90); do
     if mongo_eval "$name" admin 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
@@ -144,6 +169,36 @@ cluster_digest() { # container db
   ' | sed -E 's/"_id":\{"\$oid":"([0-9a-f]{24})"\}/"_id":"\1"/g'
 }
 
+# Run a helper (mongo_eval, cluster_digest, start_mongo) against the
+# authentication-enabled least-privilege container as its root user. The
+# assignments live only for the duration of the call.
+as_lp_root() { # command args...
+  RB_MONGO_USER=root RB_MONGO_PASSWORD="$LP_ROOT_PASSWORD" RB_MONGO_AUTHDB=admin "$@"
+}
+
+# The privilege set this tool actually needs on a MongoDB source: `read` on the
+# target database, plus `viewUser`/`viewRole` on it so the plan can record the
+# database's user inventory. Nothing cluster-wide: the source never runs
+# `listDatabases` or `serverStatus`. `buildInfo`, `hello` and `ping` need no
+# privilege at all. This is the recipe documented in docs/IMMUTABILITY.md, and
+# the LP case fails if it is not sufficient.
+create_readonly_user() { # container
+  as_lp_root mongo_eval "$1" admin '
+    db.createRole({
+      role: "rbView",
+      privileges: [
+        { resource: { db: "appdb", collection: "" }, actions: ["viewUser", "viewRole"] }
+      ],
+      roles: []
+    });
+    db.createUser({
+      user: "rb_ro",
+      pwd: "'"$LP_RO_PASSWORD"'",
+      roles: [{ role: "read", db: "appdb" }, { role: "rbView", db: "admin" }]
+    });
+  ' >/dev/null
+}
+
 run_transfer() { # src_port dst_port channel [abort|overwrite]
   local src_port="$1" dst_port="$2" channel="$3" mode="${4:-}"
   "$BIN" server --bind-addr 127.0.0.1 --control-port "$CTRL_PORT" >/tmp/rb-mongo-server.log 2>&1 &
@@ -151,13 +206,25 @@ run_transfer() { # src_port dst_port channel [abort|overwrite]
   sleep 1
 
   # Source registers as provider first, then destination consumes.
-  "$BIN" mongodb source --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
-    --no-udp --insecure --host 127.0.0.1 --port "$src_port" --database appdb \
-    >/tmp/rb-mongo-src.log 2>&1 &
+  local -a source_args=(mongodb source --to "127.0.0.1:${CTRL_PORT}" --channel "$channel"
+    --no-udp --insecure --host 127.0.0.1 --port "$src_port" --database appdb)
+  if [[ -n $SOURCE_USER ]]; then
+    source_args+=(--user "$SOURCE_USER" --auth-db "${SOURCE_AUTH_DB:-admin}")
+  fi
+  # The password goes through the environment of this one child process, never
+  # argv: a flag would publish it in the host process list. `exec` keeps $! the
+  # binary's own pid, which the abort case kills.
+  (
+    [[ -n $SOURCE_USER ]] && export RUST_BACKUP_PASSWORD="$SOURCE_PASSWORD"
+    exec "$BIN" "${source_args[@]}" >/tmp/rb-mongo-src.log 2>&1
+  ) &
   local src_pid=$!; PIDS+=("$src_pid")
 
   if [[ "$mode" == "abort" ]]; then
     sleep 2; kill -9 "$src_pid" >/dev/null 2>&1 || true
+    # Reap it here, silently: an unreaped SIGKILLed job makes bash print its own
+    # "Killed" notice into the middle of the matrix output.
+    wait "$src_pid" 2>/dev/null || true
     kill "$server_pid" >/dev/null 2>&1 || true
     return 0
   fi
@@ -256,6 +323,52 @@ for CASE in "${CASES[@]}"; do
   else
     echo "FAIL: --overwrite did not recreate exact state"; FAIL=$((FAIL+1))
   fi
+
+  # 6) Least-privilege source with server-side evidence (T-IMMUT-MONGO-LP).
+  # A second source container, seeded identically but with authentication on and
+  # every command logged, is read by a user that holds only the privileges of
+  # the documented recipe. Three things must hold together: the transfer
+  # succeeds, the destination is an exact copy of that source, and the server's
+  # own log shows nothing but reads from this tool.
+  LP_SRC="rb-mongo-lp-${CASE_ID}-$$"
+  LP_PORT=$(rb_free_port)
+  while [[ $LP_PORT == "$SRC_PORT" || $LP_PORT == "$DST_PORT" ]]; do LP_PORT=$(rb_free_port); done
+  RB_MONGO_RUN_ARGS=(-e "MONGO_INITDB_ROOT_USERNAME=root"
+    -e "MONGO_INITDB_ROOT_PASSWORD=$LP_ROOT_PASSWORD")
+  # `--profile 0 --slowms 0` logs every command without writing a profile
+  # collection: the evidence must not itself mutate the source.
+  RB_MONGO_MONGOD_ARGS=(--auth --profile 0 --slowms 0)
+  lp_status=0
+  as_lp_root start_mongo "$LP_SRC" "$LP_PORT" "$SOURCE_IMAGE" || lp_status=$?
+  unset RB_MONGO_RUN_ARGS RB_MONGO_MONGOD_ARGS
+  if (( lp_status == 0 )); then
+    as_lp_root seed_source "$LP_SRC"
+    create_readonly_user "$LP_SRC"
+    lp_before="$(as_lp_root cluster_digest "$LP_SRC" appdb)"
+    # The seeding and role creation above are writes by root. Mark the log
+    # window strictly after them, so only this tool's traffic is asserted on.
+    sleep 2
+    lp_mark=$(date +%s)
+    SOURCE_USER="rb_ro"
+    SOURCE_PASSWORD="$LP_RO_PASSWORD"
+    SOURCE_AUTH_DB="admin"
+    lp_ok=1
+    run_transfer "$LP_PORT" "$DST_PORT" "mongojob-lp-${CASE_ID}" overwrite || lp_ok=0
+    SOURCE_USER=""; SOURCE_PASSWORD=""; SOURCE_AUTH_DB=""
+    if (( lp_ok == 1 )); then
+      diff <(printf '%s\n' "$lp_before" | sed '/^$/d') \
+        <(cluster_digest "$DST" appdb | sed '/^$/d') >/tmp/rb-mongo-lp.diff || lp_ok=0
+      [[ "$lp_before" == "$(as_lp_root cluster_digest "$LP_SRC" appdb)" ]] || lp_ok=0
+      rb_mongo_assert_readonly_log "$LP_SRC" "$lp_mark" || lp_ok=0
+    fi
+    if (( lp_ok == 1 )); then
+      echo "PASS T-IMMUT-MONGO-LP"; PASS=$((PASS+1))
+    else
+      echo "FAIL: least-privilege source run (see /tmp/rb-mongo-lp.diff, /tmp/rb-mongo-src.log)"
+      FAIL=$((FAIL+1))
+    fi
+  fi
+  docker rm -f "$LP_SRC" >/dev/null 2>&1 || true
 
   docker rm -f "$SRC" "$DST" >/dev/null 2>&1 || true
 done

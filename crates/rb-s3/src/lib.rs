@@ -25,11 +25,13 @@ use tokio::io::AsyncReadExt;
 use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
-use rb_core::plan::{
-    BackupMode, BackupPlan, IntegritySpec, PlanItem, Preflight, PLAN_FORMAT_VERSION,
-};
+use rb_core::plan::{BackupPlan, PlanItem, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 use rb_core::wire::CHUNK_SIZE;
+
+mod source;
+
+use source::S3Source;
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
 /// Bytes reserved for the part buffer before it grows. The part size itself is
@@ -150,7 +152,7 @@ impl BackupModule for Module {
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {
         let params: S3Params = params.deserialize()?;
         validate_params(&params)?;
-        Ok(Box::new(S3Source { params }))
+        Ok(Box::new(S3Source::new(params).await))
     }
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>> {
         let params: S3Params = params.deserialize()?;
@@ -161,9 +163,6 @@ impl BackupModule for Module {
 
 pub fn module() -> Arc<dyn BackupModule> {
     Arc::new(Module)
-}
-struct S3Source {
-    params: S3Params,
 }
 struct S3Destination {
     params: S3Params,
@@ -219,7 +218,7 @@ async fn create_destination_bucket(client: &Client, params: &S3Params) -> Result
     Ok(())
 }
 
-fn unsupported_object_features(object: &S3Object) -> Vec<String> {
+pub(crate) fn unsupported_object_features(object: &S3Object) -> Vec<String> {
     let mut unsupported = Vec::new();
     if object.size > MAX_S3_OBJECT_BYTES {
         unsupported.push("object exceeds S3's 5 TiB object limit".into());
@@ -241,7 +240,7 @@ fn unsupported_object_features(object: &S3Object) -> Vec<String> {
     unsupported
 }
 
-fn acl_is_owner_only_full_control(
+pub(crate) fn acl_is_owner_only_full_control(
     owner_id: Option<&str>,
     grants: &[aws_sdk_s3::types::Grant],
 ) -> bool {
@@ -260,78 +259,7 @@ fn acl_is_owner_only_full_control(
         && grantee.uri().is_none()
 }
 
-async fn validate_source_fidelity(params: &S3Params, objects: &[S3Object]) -> Result<()> {
-    let client = client(params).await;
-    let versioning = client
-        .get_bucket_versioning()
-        .bucket(&params.bucket)
-        .send()
-        .await
-        .map_err(|e| {
-            BackupError::phase(Phase::Analyze, format!("read S3 bucket versioning: {e}"))
-        })?;
-    if versioning.status().is_some() {
-        return Err(BackupError::phase(
-            Phase::Analyze,
-            "versioned S3 buckets are unsupported: versions/delete markers cannot be reproduced",
-        ));
-    }
-    for object in objects {
-        let unsupported = unsupported_object_features(object);
-        if !unsupported.is_empty() {
-            return Err(BackupError::phase(
-                Phase::Analyze,
-                format!("S3 object {:?}: {}", object.key, unsupported.join("; ")),
-            ));
-        }
-        let tags = client
-            .get_object_tagging()
-            .bucket(&params.bucket)
-            .key(&object.key)
-            .send()
-            .await
-            .map_err(|e| {
-                BackupError::phase(
-                    Phase::Analyze,
-                    format!("read S3 object tags {:?}: {e}", object.key),
-                )
-            })?;
-        if !tags.tag_set().is_empty() {
-            return Err(BackupError::phase(
-                Phase::Analyze,
-                format!(
-                    "S3 object {:?} has tags; object tags are not preserved",
-                    object.key
-                ),
-            ));
-        }
-        let acl = client
-            .get_object_acl()
-            .bucket(&params.bucket)
-            .key(&object.key)
-            .send()
-            .await
-            .map_err(|e| {
-                BackupError::phase(
-                    Phase::Analyze,
-                    format!("read S3 object ACL {:?}: {e}", object.key),
-                )
-            })?;
-        let owner_id = acl.owner().and_then(|owner| owner.id());
-        if !acl_is_owner_only_full_control(owner_id, acl.grants()) {
-            return Err(BackupError::phase(
-                Phase::Analyze,
-                format!(
-                    "S3 object {:?} has a non-default ACL; object ACLs are not preserved",
-                    object.key
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn client(params: &S3Params) -> Client {
+pub(crate) async fn client(params: &S3Params) -> Client {
     let region = Region::new(params.region.clone().unwrap_or_else(|| "us-east-1".into()));
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if let (Some(access), Some(secret)) = (&params.access_key, &params.secret_key) {
@@ -354,68 +282,6 @@ async fn client(params: &S3Params) -> Client {
             .unwrap_or_else(|| params.endpoint.is_some()),
     );
     Client::from_conf(config.build())
-}
-
-async fn list_objects(params: &S3Params, phase: Phase) -> Result<Vec<S3Object>> {
-    let client = client(params).await;
-    let mut token = None;
-    let mut objects = Vec::new();
-    loop {
-        let page = client
-            .list_objects_v2()
-            .bucket(&params.bucket)
-            .set_prefix(params.prefix.clone())
-            .set_continuation_token(token)
-            .send()
-            .await
-            .map_err(|e| BackupError::phase(phase, format!("list S3 objects: {e}")))?;
-        for object in page.contents() {
-            let key = object
-                .key()
-                .ok_or_else(|| BackupError::phase(phase, "S3 object without key"))?;
-            let head = client
-                .head_object()
-                .bucket(&params.bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(|e| BackupError::phase(phase, format!("head S3 object {key:?}: {e}")))?;
-            objects.push(S3Object {
-                key: key.to_owned(),
-                size: head.content_length().unwrap_or(0).max(0) as u64,
-                etag: head.e_tag().map(str::to_owned),
-                content_type: head.content_type().map(str::to_owned),
-                storage_class: head.storage_class().map(|v| v.as_str().to_owned()),
-                server_side_encryption: head
-                    .server_side_encryption()
-                    .map(|v| v.as_str().to_owned()),
-                metadata: head
-                    .metadata()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-                content_encoding: head.content_encoding().map(str::to_owned),
-                cache_control: head.cache_control().map(str::to_owned),
-                content_disposition: head.content_disposition().map(str::to_owned),
-                content_language: head.content_language().map(str::to_owned),
-                expires: head.expires_string().map(str::to_owned),
-                website_redirect_location: head.website_redirect_location().map(str::to_owned),
-            });
-        }
-        // Drive the loop off the continuation token alone. Treating a missing
-        // `IsTruncated` as "complete" silently truncated the plan at 1 000 keys
-        // — and because the plan, the destination scope and the read-back all
-        // derive from this same listing, the run then certified itself as a
-        // verified copy of a bucket it had only partly read. Trusting
-        // `IsTruncated=true` with no token re-fetched page one forever.
-        token = page.next_continuation_token().map(str::to_owned);
-        if token.is_none() {
-            break;
-        }
-    }
-    objects.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(objects)
 }
 
 async fn list_keys(
@@ -450,7 +316,7 @@ async fn list_keys(
     Ok(keys)
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -475,128 +341,12 @@ fn now_rfc3339() -> String {
     )
 }
 
-fn decode_plan(plan: &BackupPlan, phase: Phase) -> Result<S3Plan> {
+pub(crate) fn decode_plan(plan: &BackupPlan, phase: Phase) -> Result<S3Plan> {
     if plan.module != "s3" {
         return Err(BackupError::phase(phase, "plan is not an S3 plan"));
     }
     serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(phase, format!("invalid S3 plan payload: {e}")))
-}
-
-#[async_trait]
-impl Source for S3Source {
-    async fn analyze(&self) -> Result<BackupPlan> {
-        let objects = list_objects(&self.params, Phase::Analyze).await?;
-        validate_source_fidelity(&self.params, &objects).await?;
-        let policy = client(&self.params)
-            .await
-            .get_bucket_policy()
-            .bucket(&self.params.bucket)
-            .send()
-            .await
-            .ok()
-            .and_then(|r| r.policy().map(str::to_owned));
-        let payload = S3Plan {
-            source_endpoint: self.params.endpoint.clone(),
-            source_bucket: self.params.bucket.clone(),
-            source_prefix: self.params.prefix.clone(),
-            objects: objects.clone(),
-            policy,
-        };
-        let items = objects
-            .iter()
-            .enumerate()
-            .map(|(id, object)| PlanItem {
-                id: id as u32,
-                ordinal: id as u32,
-                kind: "object".into(),
-                name: object.key.clone(),
-                estimated_bytes: object.size,
-                meta: serde_json::to_value(object).unwrap_or(serde_json::Value::Null),
-            })
-            .collect();
-        Ok(BackupPlan {
-            format_version: PLAN_FORMAT_VERSION,
-            module: "s3".into(),
-            mode: BackupMode::Copy1to1,
-            created_at: now_rfc3339(),
-            source_summary: format!("S3 bucket {}", self.params.bucket),
-            estimated_bytes: objects.iter().map(|o| o.size).sum(),
-            integrity: IntegritySpec::default(),
-            items,
-            payload: serde_json::to_value(payload).map_err(|e| {
-                BackupError::phase(Phase::Analyze, format!("serialize S3 plan: {e}"))
-            })?,
-        })
-    }
-
-    async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
-        let payload = decode_plan(plan, Phase::Transfer)?;
-        let client = client(&self.params).await;
-        for item in &plan.items {
-            let object = payload
-                .objects
-                .get(item.id as usize)
-                .ok_or_else(|| BackupError::phase(Phase::Transfer, "plan item has no S3 object"))?;
-            let response = client
-                .get_object()
-                .bucket(&self.params.bucket)
-                .key(&object.key)
-                .send()
-                .await
-                .map_err(|e| {
-                    BackupError::phase(
-                        Phase::Transfer,
-                        format!("get S3 object {:?}: {e}", object.key),
-                    )
-                })?;
-            let mut body = response.body.into_async_read();
-            let mut hasher = blake3::Hasher::new();
-            let mut offset = 0_u64;
-            let mut buffer = vec![0_u8; CHUNK_SIZE];
-            loop {
-                let read = body.read(&mut buffer).await.map_err(|e| {
-                    BackupError::phase(
-                        Phase::Transfer,
-                        format!("read S3 object {:?}: {e}", object.key),
-                    )
-                })?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-                sink.send_chunk(item.id, offset, &buffer[..read]).await?;
-                offset += read as u64;
-            }
-            if offset != item.estimated_bytes {
-                return Err(BackupError::phase(
-                    Phase::Transfer,
-                    format!("S3 object {:?} changed size during transfer", object.key),
-                ));
-            }
-            let digest = hasher.finalize().to_hex();
-            sink.finish_item(item.id, offset, digest.as_ref()).await?;
-        }
-        Ok(())
-    }
-
-    async fn fingerprint(&self) -> Result<String> {
-        let objects = list_objects(&self.params, Phase::Analyze).await?;
-        let policy = client(&self.params)
-            .await
-            .get_bucket_policy()
-            .bucket(&self.params.bucket)
-            .send()
-            .await
-            .ok()
-            .and_then(|response| response.policy().map(str::to_owned));
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"rust-backup/s3-fingerprint/v2\n");
-        hash.update(&serde_json::to_vec(&objects).unwrap_or_default());
-        hash.update(b"\npolicy:");
-        hash.update(&canonical_policy_bytes(policy.as_deref(), Phase::Analyze)?);
-        Ok(hash.finalize().to_hex().to_string())
-    }
 }
 
 fn target_key(payload: &S3Plan, target_prefix: Option<&str>, source_key: &str) -> Result<String> {
@@ -676,7 +426,7 @@ fn canonicalize_policy(value: &mut serde_json::Value) {
     }
 }
 
-fn canonical_policy_bytes(policy: Option<&str>, phase: Phase) -> Result<Vec<u8>> {
+pub(crate) fn canonical_policy_bytes(policy: Option<&str>, phase: Phase) -> Result<Vec<u8>> {
     let Some(policy) = policy else {
         return Ok(Vec::new());
     };

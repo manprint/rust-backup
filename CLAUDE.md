@@ -111,7 +111,9 @@ the ⟦OPUS GATE⟧ rows in the plan.
 3. **Gates** (every sub-phase): `bash scripts/gates.sh` ⇒ `cargo fmt --all --check`
    · `cargo clippy --all-targets --all-features -- -D warnings` · `cargo build
    --all-features` · `cargo build --no-default-features` · `cargo test
-   --all-features`. Plus the relevant `e2e/` script.
+   --all-features` · `scripts/crate_invariants.sh` ·
+   `scripts/source_readonly_lint.sh` (+ `--selftest`) · `scripts/help_parity.sh`.
+   Plus the relevant `e2e/` script.
 4. **Docs** — every behavior/API/invariant change updates the matching markdown.
 
 ## Build / test

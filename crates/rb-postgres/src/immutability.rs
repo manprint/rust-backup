@@ -14,9 +14,8 @@
 use futures_util::StreamExt;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::wire::blake3_hex;
-use tokio_postgres::Client;
 
-use crate::connect::SourcePool;
+use crate::connect::{ReadOnlyClient, SourcePool};
 use crate::ddl::quote_qualified;
 use crate::introspect;
 use crate::model::PgPlanPayload;
@@ -208,7 +207,7 @@ fn hash_catalog(p: &PgPlanPayload) -> String {
 /// Row count and order-independent row commitment for one table, from a
 /// single streaming scan.
 async fn table_stat(
-    client: &Client,
+    client: &ReadOnlyClient,
     db: &str,
     schema: &str,
     table: &str,

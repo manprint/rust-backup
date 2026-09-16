@@ -2,7 +2,7 @@
 
 > **READ THIS FILE FIRST at the start of every session, before any other plan
 > file. OPEN a unit in §1 before touching code; CLOSE it after the gates pass.**
-> **Last updated:** 2026-09-16 | **By:** `agent:opus` | **Session:** None-09-16
+> **Last updated:** 2026-09-16 (phase 4 closed) | **By:** `agent:opus` | **Session:** 2026-09-16
 
 ## 0. Protocol
 
@@ -43,13 +43,13 @@ that state as `wip(<id>): <what remains>`.
 ## 1. Current unit
 
 - **Type:** `sub-phase`
-- **ID:** 4.1
+- **ID:** 5.1
 - **Status:** `none`
-- **Intent:** formal threat model: docs/IMMUTABILITY.md
-- **Phase:** phase_05.md — Phase 4
-- **Next action:** read phase_05.md § 4.1
+- **Intent:** Filesystem special files: FIFOs and devices round-trip, sockets refused
+- **Phase:** phase_06.md — Phase 5
+- **Next action:** read phase_06.md § 5.1 and open it
 - **Assigned:** `agent:opus`
-- **Repo state:** phase 3 committed on dev
+- **Repo state:** phases 0-4 committed on dev; nothing in flight
 
 ## 2. Feature context (self-contained recap)
 
@@ -140,6 +140,15 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | 21 | sub-phase | 3.4 | `agent:opus` | e2e/postgres_large_table.sh: one 2 GiB table end to end with both peers' peak RSS sampled and capped at 256 MiB; CI job postgres-large | postgres_large_table.sh, e2e.yml, e2e/README.md, QA_GUIDE.md | gates.sh PASS; ShellCheck PASS; actionlint 1.7.12 clean; T-PG-RSS on 16 => 5 pass, 0 fail (source 14056 KiB, destination 22592 KiB) | `75ea492` |
 | 22 | sub-phase | 3.5 | `agent:opus` | abort and race proofs: destination kill, concurrent writer, source kill, refused plan — and the product fix they found (a run that fails after apply now removes the databases it created) | module.rs, session.rs, dest.rs, lib.rs, session_test.rs, fault_matrix.sh, POSTGRES.md | gates.sh PASS (18 rb-core session tests, 2 new); fault_matrix.sh postgres => CASES=8 PASS=21 FAIL=0; fault_matrix.sh (all) => CASES=28 PASS=69 FAIL=0 | `75ea492` |
 | 23 | sub-phase | 3.6 | `agent:opus` | README: lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes and exit 6 | README.md | gates.sh PASS; closing matrix 10..18 => 1025 pass, 0 fail; relay_smoke PASS; session_two_targets PASS | `75ea492` |
+| 32 | sub-phase | 4.9 | `agent:opus` | README gains a "Source safety" section: what makes the source read-only and what the audit does on every exit path, the least-privilege account per backend with a pointer to the full recipes, the writable-role warning, and the access-time rule with the refusal message and both remedies | README.md | gates.sh PASS (help/docs parity included); phase-4 regression guard: postgres 10/16/18, mongodb 4, MinIO all green | uncommitted |
+| 31 | sub-phase | 4.8 | `agent:opus` | the source pipeline runs inside `catch_unwind`, so a panic becomes an ordinary error and takes the same failure path as any other: the source is fingerprinted again and the run reports `SourceMutated` on drift, otherwise `source pipeline panicked: <message>` | crates/rb-core/src/session.rs, crates/rb-core/Cargo.toml, crates/rb-core/tests/session_test.rs, docs/IMMUTABILITY.md, docs/modules/README.md | gates.sh PASS (20 session_test tests, 2 new); T-E2E0 PASS=5 FAIL=0; T-SESSION-2 PASS | uncommitted |
+| 30 | sub-phase | 4.7 | `agent:opus` | all three server-side least-privilege proofs: PostgreSQL runs a whole transfer as `rb_ro` (both grant recipes) and the server log is asserted for that role; MongoDB runs one as a `read`-only user against a mongod that logs every command; MinIO runs one under a 5-action read policy with `mc admin trace` as the record and a refused write as the counter-proof | e2e/lib.sh, e2e/postgres_matrix.sh, e2e/mongodb_matrix.sh, e2e/s3_minio_test.sh, e2e/README.md, docs/IMMUTABILITY.md, scripts/help_parity.sh | gates.sh PASS; ShellCheck v0.11.0 PASS on the four scripts; T-IMMUT-PG-LP PASS on 10, 13, 14, 16, 18; T-IMMUT-MONGO-LP PASS on 4, 6, 7 (110 commands checked, all reads); T-IMMUT-S3-LP PASS (25 S3 APIs checked, all reads; the same credential is refused a write) | uncommitted |
+| 29 | sub-phase | 4.6 | `agent:opus` | `scripts/gates.sh` now runs the read-only lint and its `--selftest`, so I-IMMUT layer 3 is a gate rather than a script someone remembers; gate lists in CLAUDE.md, the QA guide and IMMUTABILITY.md say so | scripts/gates.sh, scripts/help_parity.sh, CLAUDE.md, docs/QA_GUIDE.md, docs/IMMUTABILITY.md | gates.sh PASS with the lint inside (12 files, selftest detects the injected write); ShellCheck v0.11.0 PASS on the three scripts | uncommitted |
+| 28 | sub-phase | 4.5 | `agent:opus` | reading a file the process does not own moves its atime, so `O_NOATIME` + `EPERM` is now a refusal during the first fingerprint instead of a silent fallback; `--allow-atime-updates` (env + YAML) accepts it and warns once | rb-filesystem/src/{source,lib,immutability}.rs, rb-filesystem/Cargo.toml, rust-backup/src/main.rs, filesystem_netns_test.sh, 05-filesystem.md, 10-variabili-ambiente.md, 07-sessioni-yaml.md, FILESYSTEM.md, IMMUTABILITY.md | gates.sh PASS (17 rb-filesystem tests, 4 new; 23 rust-backup tests, 1 new); help_parity PASS; env_inventory 51 names; live proof on /etc/skel both ways; relay_smoke PASS=5 FAIL=0 | uncommitted |
+| 27 | sub-phase | 4.4 | `agent:opus` | the whole S3 read side moved into `crates/rb-s3/src/source.rs` (S3Source, its `Source` impl, `list_objects`, `validate_source_fidelity`) and holds a `ReadOnlyS3` newtype — eight read builders, no write method, no accessor for the SDK client; the lint now checks that file and fails if it disappears | rb-s3/src/{lib,source}.rs, scripts/source_readonly_lint.sh, IMMUTABILITY.md, S3.md | gates.sh PASS (13 rb-s3 unit tests, unchanged); source_readonly_lint PASS (12 files) + selftest PASS; e2e/s3_minio_test.sh PASS (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability) | uncommitted |
+| 26 | sub-phase | 4.3 | `agent:opus` | source-side MongoDB code now holds `ReadOnlyClient`/`ReadOnlyDatabase` (named-collection reads only, no `Collection` or raw `Database` ever handed out); `run_command` passes an 11-command read allowlist; the source client pins `readPreference=primary` and `readConcern=local`; the read-only lint now also covers both `connect.rs` files | rb-mongodb/{connect,introspect,source,immutability}.rs, rb-mongodb/Cargo.toml, scripts/source_readonly_lint.sh, IMMUTABILITY.md, MONGODB.md | gates.sh PASS (36 rb-mongodb unit tests, 5 new); source_readonly_lint PASS (11 files) + selftest PASS; mongodb_matrix 4 => PASS=5 FAIL=0, 7 and 4:7 => PASS=10 FAIL=0, 8 SKIP (host kernel, SERVER-121912) | uncommitted |
+| 25 | sub-phase | 4.2 | `agent:opus` | source-side PostgreSQL code now holds `ReadOnlyClient` (only `query`/`query_one`/`query_opt`/`copy_out`, no accessor to the raw client); every statement passes `guard_read_only` (literal/comment stripping, single-statement, head allowlist, deny words and deny functions); the source role is probed once and a writable role is warned about, never refused | connect.rs, introspect.rs, immutability.rs, Cargo.toml, IMMUTABILITY.md, POSTGRES.md, 03-postgres.md, README.md | gates.sh PASS (116 rb-postgres unit tests, 8 new); source_readonly_lint PASS + selftest PASS; matrix 10 16 18 => 339 pass, 0 fail, 35 skip; role probe warns as `postgres`, silent as `rb_ro` | uncommitted |
+| 24 | sub-phase | 4.1 | `agent:opus` | docs/IMMUTABILITY.md written: the invariant and what 'altered' means, 4 vector tables, the fingerprint contract per module, least-privilege recipes, the 4-layer guard architecture; linked from the module docs, README and QA guide | IMMUTABILITY.md, POSTGRES.md, MONGODB.md, S3.md, FILESYSTEM.md, README.md, QA_GUIDE.md | gates.sh PASS (ghost-flag scan included) | uncommitted |
 
 ## 5. Files touched
 
@@ -147,6 +156,51 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 |------|---------------|------|
 | `docs/testing/POSTGRES_MATRIX.md` | new: 106 rows (TAB 18, SEQ 7, VIEW 9, MV 7, IDX 18, CON 18, EXT 8, GIS 6, REF 15) with the oracle legend | 0.1 |
 | `docs/testing/FILESYSTEM_MATRIX.md` | new: 32 rows with the oracle legend | 0.1 |
+| `README.md` | new "Source safety" section; the filesystem section points at it for `--allow-atime-updates` | 4.9 |
+| `crates/rb-core/src/session.rs` | `run_source_limited` wraps `source_run` in `catch_unwind`; `panicked()` renders the payload | 4.8 |
+| `crates/rb-core/Cargo.toml` | `futures-util` dependency (`FutureExt::catch_unwind`) | 4.8 |
+| `crates/rb-core/tests/session_test.rs` | `PanickingSource` + the two T-IMMUT-PANIC tests | 4.8 |
+| `docs/IMMUTABILITY.md` | the fingerprint contract's panic row names the mechanism, the exit code and the two tests | 4.8 |
+| `docs/modules/README.md` | step 3 states that `fingerprint` is called after a panicked run too | 4.8 |
+| `e2e/lib.sh` | `rb_mongo_assert_readonly_log`, `rb_minio_readonly_policy`, `rb_minio_assert_readonly_trace` | 4.7 |
+| `e2e/postgres_matrix.sh` | `SOURCE_USER`/`SOURCE_PASSWORD`, `create_readonly_role`, step 12b: a whole transfer as `rb_ro` with log and connection assertions | 4.7 |
+| `e2e/mongodb_matrix.sh` | credential-aware `mongo_eval`/`run_transfer`, `create_readonly_user`, step 6: the LP source container (`--auth --profile 0 --slowms 0`) | 4.7 |
+| `e2e/s3_minio_test.sh` | `mc_sh`, the least-privilege user and policy, the traced LP transfer and the refused-write probe | 4.7 |
+| `e2e/README.md` | the three LP test IDs in the script table; the helper table renamed and extended with the MongoDB and MinIO helpers | 4.7 |
+| `docs/IMMUTABILITY.md` | the final MongoDB and S3 least-privilege recipes; guard layer 4 names the three log assertions; the "evidence lands in § 4.7" markers removed | 4.7 |
+| `scripts/help_parity.sh` | `--profile`, `--slowms`, `--json` added to the foreign-flag exclusion list | 4.7 |
+| `scripts/gates.sh` | runs the read-only lint and its `--selftest` before the help parity | 4.6 |
+| `scripts/help_parity.sh` | `--all`, `--all-targets`, `--selftest` added to the foreign-flag exclusion list | 4.6 |
+| `CLAUDE.md` | the gate line lists every script `gates.sh` runs | 4.6 |
+| `docs/QA_GUIDE.md` | a "Build" paragraph naming the one gate command and everything it chains | 4.6 |
+| `crates/rb-filesystem/src/source.rs` | `NoAtimeReader::open`/`open_with` refuse `EPERM` without the opt-in, warn once with it; `read_noatime` takes the flag and the caller's phase | 4.5 |
+| `crates/rb-filesystem/src/lib.rs` | `FilesystemParams.allow_atime_updates`; 4 new unit tests | 4.5 |
+| `crates/rb-filesystem/src/immutability.rs` | the fingerprint reads with the flag, tagged `Analyze` | 4.5 |
+| `crates/rb-filesystem/Cargo.toml` | `tracing` dependency (the one-shot warning) | 4.5 |
+| `crates/rust-backup/src/main.rs` | `--allow-atime-updates` / `RUST_BACKUP_ALLOW_ATIME_UPDATES`, merged as `allow_atime_updates`; 1 new test | 4.5 |
+| `e2e/filesystem_netns_test.sh` | case (d): T-FS-ATIME, both polarities under root | 4.5 |
+| `docs/usage/05-filesystem.md` | flag row plus the "Access time e `O_NOATIME`" section with both messages | 4.5 |
+| `docs/usage/10-variabili-ambiente.md` | `RUST_BACKUP_ALLOW_ATIME_UPDATES` row | 4.5 |
+| `docs/usage/07-sessioni-yaml.md` | `allow_atime_updates` key | 4.5 |
+| `docs/modules/FILESYSTEM.md` | the atime rule, the refusal message, the guarantees-table row, the reworded limit | 4.5 |
+| `crates/rb-s3/src/source.rs` | new: the whole S3 read side (`ReadOnlyS3`, `S3Source`, its `Source` impl, `list_objects`, `validate_source_fidelity`) | 4.4 |
+| `crates/rb-s3/src/lib.rs` | `mod source;`, `open_source` builds `S3Source::new`, six helpers made `pub(crate)`, the moved blocks removed | 4.4 |
+| `docs/modules/S3.md` | "Immutability" names the newtype, the read operations and the one-file read side | 4.4 |
+| `crates/rb-mongodb/src/connect.rs` | `ReadOnlyClient`/`ReadOnlyDatabase`/`ReadOnlyConnection`, `guard_read_command` + the 11-command allowlist, `pin_read_settings`, `sort_by_id`; 5 new unit tests | 4.3 |
+| `crates/rb-mongodb/src/introspect.rs` | introspection runs on `ReadOnlyConnection`/`ReadOnlyDatabase`; the spec listings no longer collect a cursor at the call site | 4.3 |
+| `crates/rb-mongodb/src/source.rs` | `stream_out` reads through `ReadOnlyConnection` with the shared `_id` sort | 4.3 |
+| `crates/rb-mongodb/src/immutability.rs` | `coll_stat` counts and reads through `ReadOnlyDatabase` | 4.3 |
+| `crates/rb-mongodb/Cargo.toml` | `anyhow` dependency (the guard refusal) | 4.3 |
+| `scripts/source_readonly_lint.sh` | the postgres and mongodb file lists now include `connect.rs`, where the wrappers live | 4.3 |
+| `docs/modules/MONGODB.md` | "Immutability" rewritten: typed client, command allowlist, pinned read preference and concern | 4.3 |
+| `crates/rb-postgres/src/connect.rs` | `ReadOnlyClient` (query/query_one/query_opt/copy_out only), `ReadOnlyConnection`, `guard_read_only` + its stripper and allowlist, the role probe, `SourcePool` now pools read-only connections; 8 new unit tests | 4.2 |
+| `crates/rb-postgres/src/introspect.rs` | 16 helper signatures take `&ReadOnlyClient`; `analyze_err` takes `BackupError` | 4.2 |
+| `crates/rb-postgres/src/immutability.rs` | `table_stat` takes `&ReadOnlyClient` | 4.2 |
+| `crates/rb-postgres/Cargo.toml` | `anyhow` dependency (the guard refusal) | 4.2 |
+| `docs/IMMUTABILITY.md` | PostgreSQL vector table rewritten: type/guard/server layers, 6 new rows, unit-test evidence IDs; guard-architecture layers 1-2 name what has landed | 4.2 |
+| `docs/modules/POSTGRES.md` | "Immutability" now describes the three layers and the role probe | 4.2 |
+| `docs/usage/03-postgres.md` | the warning a writable source role triggers, with what still protects the source | 4.2 |
+| `README.md` | the PostgreSQL section states the warning and the three protections | 4.2 |
 | `docs/QA_GUIDE.md` | link line to both matrix documents in `## The test matrix` | 0.1 |
 | `e2e/README.md` | link line to both matrix documents after the script table | 0.1 |
 | `e2e/lib.sh` | appended RB_PG_LOG_ARGS, RB_PG_PASSWORD, RB_PG_CONTAINERS and rb_pg_{start,container_ip,load_fixtures,oracle_schema,oracle_counts,assert_readonly_log,assert_connections,assert_no_temp_files} | 0.2 |
@@ -250,6 +304,13 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | `e2e/fault_matrix.sh` | pg-destination-kill, pg-concurrent-writer, pg-plan-rejected; RUST_BACKUP_E2E_KEEP honoured | 3.5 |
 | `docs/modules/POSTGRES.md` | "Failure behaviour" table | 3.5 |
 | `README.md` | lock timeout, connections, fingerprint cost and the source-mutation exit | 3.6 |
+| `docs/IMMUTABILITY.md` | new: threat model, vectors, fingerprint contract, recipes, guard architecture | 4.1 |
+| `docs/modules/POSTGRES.md` | "Immutability" pointer paragraph | 4.1 |
+| `docs/modules/MONGODB.md` | "Immutability" pointer paragraph | 4.1 |
+| `docs/modules/S3.md` | "Immutability" pointer paragraph | 4.1 |
+| `docs/modules/FILESYSTEM.md` | "Immutability" pointer paragraph | 4.1 |
+| `README.md` | link line under "Documentation of record" | 4.1 |
+| `docs/QA_GUIDE.md` | "Source immutability" section linking the document | 4.1 |
 
 ## 6. In-flight work
 none — tree consistent
@@ -294,11 +355,39 @@ none — tree consistent
 | § 3.4 large table | bash e2e/postgres_large_table.sh 16 | PASS — 5 pass, 0 fail; peak RSS source 14056 KiB, destination 22592 KiB, cap 262144 KiB; 2000000 rows verified | 2026-09-16 |
 | § 3.5 fault matrix | bash e2e/fault_matrix.sh postgres, then all groups | PASS — postgres CASES=8 PASS=21 FAIL=0; full run CASES=28 PASS=69 FAIL=0 | 2026-09-16 |
 | phase 3 closing matrix | bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18 | PASS — 1025 pass, 0 fail, 99 skip; CONN-BUDGET green on all nine majors; relay_smoke and session_two_targets PASS | 2026-09-16 |
+| § 4.1 gates | bash scripts/gates.sh | PASS | 2026-09-16 |
+| § 4.2 gates | bash scripts/gates.sh | PASS (116 rb-postgres unit tests, 8 new: the guard, the type assertion and the role-probe SQL) | 2026-09-16 |
+| § 4.2 lint | bash scripts/source_readonly_lint.sh (+ --selftest) | PASS — 9 files clean, selftest still detects an injected write | 2026-09-16 |
+| § 4.2 matrix (T-PG-ORACLE) | bash e2e/postgres_matrix.sh 10 16 18 | PASS — 339 pass, 0 fail, 35 skip (10: 105/0/19, 16: 116/0/9, 18: 118/0/7) | 2026-09-16 |
+| § 4.3 gates | bash scripts/gates.sh | PASS (36 rb-mongodb unit tests, 5 new: the command allowlist both ways, the refusal message, the type assertion, the pinned read settings) | 2026-09-16 |
+| § 4.3 lint | bash scripts/source_readonly_lint.sh (+ --selftest) | PASS — 11 files (the two `connect.rs` wrappers added), selftest still detects an injected write | 2026-09-16 |
+| § 4.6 gates (T-IMMUT-LINT) | bash scripts/gates.sh | PASS — the run now prints `source read-only lint: PASS (12 files, no write-shaped call)` and `selftest PASS (injected write detected)` between the crate invariants and the help parity | 2026-09-16 |
+| § 4.6 shellcheck | docker run --rm koalaman/shellcheck:v0.11.0 --severity=warning scripts/{gates,help_parity,source_readonly_lint}.sh | PASS — no findings | 2026-09-16 |
+| § 4.5 gates | bash scripts/gates.sh | PASS (17 rb-filesystem unit tests, 4 new; 23 rust-backup unit tests, 1 new); help_parity PASS; `scripts/env_inventory.sh --check-count 40` => 51 names | 2026-09-16 |
+| § 4.5 atime refusal (T-FS-ATIME, non-root part) | release binary, source root `/etc/skel` (root-owned, world-readable), no flag | PASS — exit 1 with `[Analyze] cannot open /etc/skel/.bash_logout without updating its access time (O_NOATIME needs file ownership or CAP_FOWNER); run as the file owner or root, or pass --allow-atime-updates to accept atime changes on the source`; the tree's atimes unchanged; no destination root created | 2026-09-16 |
+| § 4.5 atime accepted (T-FS-ATIME, non-root part) | same tree with `--allow-atime-updates`, destination `--no-preserve-ownership` | PASS — both peers exit 0, exactly one `WARN atime updates on the source accepted by --allow-atime-updates`, `BACKUP VERIFIED` / `RESTORE VERIFIED` over 11 items / 119569 bytes | 2026-09-16 |
+| § 4.5 regression | bash e2e/relay_smoke.sh | PASS — T-E2E0 PASS=5 FAIL=0 (an owner run is unaffected by the guard) | 2026-09-16 |
+| § 4.4 gates | bash scripts/gates.sh | PASS (13 rb-s3 unit tests, unchanged — the move is mechanical) | 2026-09-16 |
+| § 4.4 lint | bash scripts/source_readonly_lint.sh (+ --selftest) | PASS — 12 files, `crates/rb-s3/src/source.rs` now checked instead of skipped | 2026-09-16 |
+| § 4.4 minio (T-S3-MINIO, T-S3-IMMUT) | bash e2e/s3_minio_test.sh | PASS — `S3 MinIO e2e passed (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability)` | 2026-09-16 |
+| § 4.3 matrix (T-MONGO-MATRIX) | bash e2e/mongodb_matrix.sh 4 8 then 7 4:7 | PASS — 4: PASS=5 FAIL=0; 7: PASS=5 FAIL=0; 4:7: PASS=5 FAIL=0. `8` SKIP: `mongo:8 refuses to start on Linux 7.0.0-31-generic (SERVER-121912)` — the documented host limit, 7 runs in its place | 2026-09-16 |
+| § 4.2 role probe | rust-backup plan postgres on postgres:16-alpine, as `postgres` then as `rb_ro` (pg_read_all_data) | PASS — one `WARN source role postgres can write to the source; a read-only role is recommended, see docs/IMMUTABILITY.md` for the superuser, no warning for `rb_ro`, both plans exit 0 | 2026-09-16 |
 
 **Failing output (verbatim, trimmed to the error):**
 ```
 <none>
 ```
+| § 4.7 T-IMMUT-PG-LP | `bash e2e/postgres_matrix.sh 16 10` then `13 14 18` | PASS on every major — 16: 117 pass/0 fail, 10: 106/0, 13: 115/0, 14: 115/0, 18: 115/0; each prints `PASS T-IMMUT-PG-LP` after a full overwrite transfer run as `rb_ro` | 2026-09-16 |
+| § 4.7 T-IMMUT-MONGO-LP | `bash e2e/mongodb_matrix.sh 4` then `6 7` | PASS on 4, 6 and 7 — `mongod commands checked: 110, all reads` per case; 8 unrunnable on this kernel (§ 9) | 2026-09-16 |
+| § 4.7 T-IMMUT-S3-LP | `bash e2e/s3_minio_test.sh` | PASS — `MinIO S3 APIs checked: 25, all reads`, the destination matches the LP source, and `mc cp` with the same credential is refused | 2026-09-16 |
+| § 4.7 gates | `bash scripts/gates.sh` | PASS (ghost-flag scan included, after `--profile`/`--slowms`/`--json` were excluded as foreign switches) | 2026-09-16 |
+| R8 MinIO policy action names | `mc admin policy create` against MinIO RELEASE.2025-09-07 | RESOLVED — `s3:GetObjectAcl` is rejected (`unsupported action`) and `s3:GetBucketLocation` is not needed; the working set is `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetObject`, `s3:GetObjectTagging` | 2026-09-16 |
+| R9 mongod JSON log shape | `docker logs` on `mongo:4.4`, `mongo:6.0`, `mongo:7.0` with `--profile 0 --slowms 0` | RESOLVED — every command appears as a `"c":"COMMAND"` record with `attr.command` and `attr.appName`, identical shape on all three majors | 2026-09-16 |
+| § 4.8 T-IMMUT-PANIC | `cargo test -p rb-core --test session_test` | PASS — 20 tests, the two new ones green: the panic surfaces as `BackupError::Other` naming it, the fingerprint ran twice, and drift on the panic path reports `SourceMutated` | 2026-09-16 |
+| § 4.8 gates | `bash scripts/gates.sh` | PASS | 2026-09-16 |
+| § 4.8 regressions | `bash e2e/relay_smoke.sh`, `bash e2e/session_two_targets.sh` | PASS — T-E2E0 5 pass/0 fail, T-SESSION-2 passed (the runner is unchanged on the normal paths) | 2026-09-16 |
+| § 4.9 gates | `bash scripts/gates.sh` | PASS — the ghost-flag scan accepts the README's `--allow-atime-updates` and finds no flag the CLI lacks | 2026-09-16 |
+| phase 4 regression guard | `bash e2e/postgres_matrix.sh 10 16 18`, `bash e2e/mongodb_matrix.sh 4`, `bash e2e/s3_minio_test.sh`, `bash e2e/relay_smoke.sh`, `bash e2e/session_two_targets.sh` | PASS — postgres 10: 106/0, 16: 117/0, 18: 119/0; mongodb 4: 6 pass 0 fail; MinIO passed incl. T-IMMUT-S3-LP; T-E2E0 5/0; T-SESSION-2 passed. T-FS-OWN/T-FS-IMMUT could not run (no passwordless sudo, § 9) | 2026-09-16 |
 
 ## 8. Runtime deviations from the plan
 
@@ -344,11 +433,45 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 | 34 | T-PG-TIMEOUT locks mx.t_tab_01 and expects the destination to clean up | it locks app.rows (the fault fixture's own table) and runs the source alone, asserting that no database was created | the fault matrix has its own faultdb fixture, and the lock fails the run during Analyze — before the source registers the channel — so a destination would only sit out its registration timeout | none — the case additionally proves the same run succeeds once the lock is released |
 | 35 | T-PG-FP2: zero `temporary file` lines on the source during the matrix run; remove the pgsql_tmp Limits bullet | the fingerprint no longer spills (12 => 6 files per case on 16), the data stream still does; the Limits bullet was rewritten instead of removed and NOTEMP stays in reporting mode | the spill has two sources and § 3.3 only owns one: the data stream sorts by the C-collated row text so that the destination read-back reproduces the per-item BLAKE3, which a partitioned parent (read in a different physical order on the two sides) would otherwise break | T-PG-FP2 is partially met and recorded as such in § 9; removing the data sort needs the read-back to compare a commitment instead of the streamed bytes — a transport-level change no phase of this plan owns |
 | 36 | § 3.5 touches crates/*.rs only if a case fails | a case did: the concurrent-writer run left the restored database behind, so rb-core gained a defaulted Destination::abandon() hook and the postgres destination drops what the run created | the cleanup only covered failures during apply; a source that mutates (or a read-back that fails) is reported after the load, and left a complete-looking, uncertified database — exactly what the module documents it never leaves | additive trait method with a default no-op, so mongodb, s3 and filesystem are unchanged; phase 4/5 may implement it for their modules |
+| 57 | § 4.6 wires the lint into `scripts/gates.sh` | also its `--selftest`, and `scripts/help_parity.sh` gained `--all`, `--all-targets` and `--selftest` to its foreign-flag exclusion list | a lint whose regexes stop matching passes silently, which is worse than no lint; and documenting the new gate command in the QA guide named three cargo/script switches that the ghost-flag scan then reported as flags the CLI does not accept | none — the exclusion list exists for exactly this (cargo, docker, git, `pg_dump`), and the CLI's own flags are still checked in both directions |
+| 52 | § 4.5 the flag is `ArgAction::SetTrue` | `Option<bool>` with `boolish()`, `num_args(0..=1)`, `default_missing_value("true")`, `require_equals` | the convention `main.rs` documents for every module bool: `SetTrue` collapses "absent" and "given as false", so a YAML `allow_atime_updates: true` could never be turned off from the CLI, against the documented CLI > env > YAML precedence | none — `--allow-atime-updates` and `--allow-atime-updates=false` both work |
+| 53 | § 4.5 the flag is rejected on non-filesystem modules and on the destination role, following the `--no-preserve-ownership` pattern | no rejection: the flag merges into the params like every other module bool, and only the filesystem source reads it | that pattern does not exist — `--no-preserve-ownership` (like `--follow-symlinks`, `--path-style`, `--admin`) is merged and left to the module, and the param structs ignore unknown keys; inventing a rejection table here would be new machinery in `main.rs`, outside this sub-phase | none — documented as `Lato: sorgente` in `docs/usage/05-filesystem.md`, and `allow_atime_updates_flag_is_filesystem_source_only` locks the key, the typed default and the explicit `false` |
+| 69 | § 4.9 puts the atime refusal and its remedy in a README "Troubleshooting" section | the refusal and both remedies are in the new "Source safety" section | `README.md` has no troubleshooting section — the guide it points to (`docs/usage/`) carries that role — and splitting a message from the rule it enforces would make both harder to find | § 6.5's final README read should confirm this is still the right home |
+| 66 | § 4.8 the panic test mock panics inside `stream_out` with `panic!` | the mock indexes an empty `Vec` out of bounds | `panic!` is forbidden in this workspace's lints, and an out-of-bounds index is the shape a real bug takes; a constant index on an array would be rejected at compile time by `unconditional_panic`, so the index comes from `Vec::capacity()` | none |
+| 67 | § 4.8 `catch_unwind` is applied at `session.rs:326` | applied where `source_run` is awaited, which § 3.2-3.5 moved | the plan's line numbers predate those sub-phases; the call site is the same single statement | none |
+| 68 | (unstated) rb-core dependencies | `futures-util` added to `crates/rb-core/Cargo.toml` | `FutureExt::catch_unwind` lives there and rb-core did not depend on it (rb-transport did) | none — workspace dependency, already in the lock file |
+| 58 | § 4.7 MongoDB LP role: `read` plus a custom `rbView` on `admin` with `viewUser`, `viewRole`, `listDatabases`, `serverStatus` | `rbView` carries only `viewUser` and `viewRole`, and on the copied database rather than the cluster | the source never runs `listDatabases` or `serverStatus`, so granting them would document a privilege the tool does not use — the point of the recipe is the minimum, and the LP case fails if the minimum is wrong | none — the narrower set is what `docs/IMMUTABILITY.md` now documents |
+| 59 | § 4.7 `rb_mongo_assert_readonly_log` fails when a command's first key is a write name, `aggregate` included | `aggregate` is judged by its pipeline: only `$out`/`$merge` (or a pipeline the server truncated) count as writes | the first run failed on five `aggregate` records from our own traffic: the mongodb Rust driver implements `count_documents` as an `aggregate` with `$match`/`$group`, so a read-only aggregate is expected and the source guard only ever sees `run_command` | none — the guard still refuses `aggregate` as a command; the assertion is about what the server saw |
+| 60 | § 4.7 asserts on every `"c":"COMMAND"` record in the window | only records with `attr.appName == "rust-backup"` | mongod's own logical-session-cache refresh writes to `config` and is logged too; attributing the server's housekeeping to this tool would be a false failure, and the driver already tags its connections (`connect.rs:50`) | none — the assertion also fails when the window holds no record of ours, so the filter cannot hide traffic |
+| 61 | § 4.7 MongoDB LP runs against the existing source container | a second source container per case, with `--auth --profile 0 --slowms 0`, seeded identically | authentication cannot be enabled on a running mongod, and a server without `--auth` enforces no role at all, so the LP claim would be untested; profiling stays at level 0 so the evidence itself writes nothing to the source | none — the destination is reused with `--overwrite`, and the case compares it against the LP source's own digest |
+| 62 | § 4.7 S3: "success is the proof" (any write attempt is `AccessDenied`) | plus two explicit proofs: `mc admin trace --json` is captured for the transfer window and every `s3.*` API in it must be a read, and `mc cp` with the same credential must be refused | "the backup succeeded" only proves the read grants are sufficient; the server-side evidence layer of `docs/IMMUTABILITY.md` claims more than that for PostgreSQL and MongoDB, and S3 should not be the weak row | none |
+| 63 | § 4.7 S3 LP runs against the seeded source bucket as it stands | the harness first runs `mc anonymous set none src/source` | the earlier cases make the bucket anonymously downloadable, and an anonymous `s3:GetObject` grant would authorize the reads whatever the user policy said — removing it is what makes the policy under test the thing being tested | none — the object listing before/after is unchanged, so the immutability comparison is unaffected |
+| 64 | (unstated) the ghost-flag scan | `--profile`, `--slowms` and `--json` excluded as foreign switches | `docs/IMMUTABILITY.md` and `e2e/README.md` now quote `mongod --profile 0 --slowms 0` and `mc admin trace --json`; the scan has no notion of which program a switch belongs to | `--json` is generic enough that a future `docs/usage/` page claiming it would no longer be caught — the docs-parity gate of § 6.1 is where that gap belongs |
+| 65 | (unstated) credentials in the e2e harness | the LP source password and the MinIO secret key reach the tool through `RUST_BACKUP_PASSWORD` / `RUST_BACKUP_ACCESS_KEY` / `RUST_BACKUP_SECRET_KEY` in the child's environment, and the container-side secret through `docker run -e RB_RO_SECRET` with no value | a flag would publish the secret in the host process list, which is exactly what the tool's own documentation tells operators not to do | none — the pre-existing `minioadmin` root flags in `e2e/s3_minio_test.sh` are untouched (container defaults, not a deployment) |
+| 57 | (unstated) `e2e/lib.sh` carried two `rb_pg_assert_connections` definitions | the dead first one (container/user/max, reading the log live) is removed | the samples-based version from § 3.2 shadowed it, so the file documented an assertion that could never run | none |
+| 54 | § 4.5 unit tests use an `open_with(flags, fallback: bool)` seam | the seam is `NoAtimeReader::open_with(path, allow_atime_updates, phase, opener)`, where `opener` answers the two `open` attempts | the test needs to control what the *kernel* answers, not which flags we pass; injecting the opener also proves the refusal never retries and the accepted path retries exactly once without `O_NOATIME` | none |
+| 55 | § 4.5 e2e T-FS-ATIME runs under `sudo` in `e2e/filesystem_netns_test.sh` | the case is written (case (d), root-owned tree read by `nobody`, both polarities) but could not be run here; the same two polarities were proven without root against `/etc/skel` | `sudo -n` on this host asks for a password (§ 9), so no privileged e2e can run in this session; `/etc/skel` is root-owned and world-readable, which produces exactly the `EPERM` the guard is about | § 5.3 must run `sudo -n bash e2e/filesystem_netns_test.sh` (and the filesystem matrix) on a host with passwordless sudo, or in CI |
+| 56 | (unstated) rb-filesystem dependencies | `tracing` added to `crates/rb-filesystem/Cargo.toml` | the accepted-atime path warns once per run and the crate had no logging dependency | none — workspace dependency, already in the lock file |
+| 48 | § 4.4 `ReadOnlyS3` exposes `list_objects_v2`, `head_object`, `get_object`, `get_object_tagging`, `get_object_acl`, `get_bucket_policy`, `get_bucket_location` | plus `get_bucket_versioning` | `validate_source_fidelity` refuses a versioned bucket, and it reads that status through the wrapper; without the method the check would need a raw client, which is the thing the type exists to prevent | none — `get_bucket_location` is kept (and marked `allow(dead_code)`) because the plan lists it as part of the read surface |
+| 49 | § 4.4 moves `S3Source` and its `Source` impl into `source.rs` | also `list_objects` and `validate_source_fidelity` | both are source-only and both hold the client; leaving them in `lib.rs` would leave the two functions that do the actual reading outside the file the lint checks | none — `unsupported_object_features` and `acl_is_owner_only_full_control` stay in `lib.rs` (the destination and the unit tests use them, and neither touches a client) |
+| 50 | (unstated) the S3 client is built per call (`client(&self.params).await` in five places) | `S3Source` builds it once in `open_source` and holds it in `ReadOnlyS3` | the plan says the source holds the wrapper, which means one client per run instead of one per phase; SDK credential resolution is lazy, so nothing about error timing changes | none — the destination still builds its own per call |
+| 51 | § 4.4 the lint's rb-s3 branch prints `SKIP` when `source.rs` is absent | the branch now fails instead | the file is the deliverable of this sub-phase; a `SKIP` would silently stop checking S3 if the read side were ever folded back into `lib.rs` | none |
+| 42 | § 4.3 `ClientOptions` field names for read preference / read concern are UNVERIFIED | RESOLVED — mongodb 3.9.1 has `ClientOptions::selection_criteria: Option<SelectionCriteria>` (set to `SelectionCriteria::ReadPreference(ReadPreference::Primary)`) and `ClientOptions::read_concern: Option<ReadConcern>` (set to `ReadConcern::local()`) | read from the locked crate source (`client/options.rs:598,626`, `concern.rs:59`, `selection_criteria.rs:19,102`) instead of assuming | none — no dependency bump; `read_only_options_pin_primary_and_local` locks the behaviour |
+| 43 | § 4.3 `ReadOnlyDatabase` exposes `list_collection_names`, `list_collections`, `find`, `count_documents`, `list_indexes`, `run_command` | plus `estimated_document_count` and `name`; `list_collections` and `list_indexes` return a `Vec` instead of the cursor | introspection counts with `estimated_document_count`, and the two spec listings are small and were already collected at the call site — returning the cursor would keep `TryStreamExt` (and the raw driver types) in the source files | none — the wrapper is the only handle either way |
+| 44 | § 4.3 `read_only_database_exposes_no_write_methods` is type-level, asserted via the lint script | both: a source-text assertion over the two `impl` blocks (no write call, no `-> Database`/`-> Collection`, every `command: Document` method calls the guard) *and* the lint script's file list extended with `crates/rb-mongodb/src/connect.rs` and `crates/rb-postgres/src/connect.rs` | the wrapper file is where a write method would be added, and it was in neither list; the in-crate assertion fails without waiting for the gate | § 4.6 wires the (now wider) lint into `gates.sh` |
+| 45 | (unstated) the command allowlist matches the names given | matched case-insensitively | MongoDB spells `isMaster` lowercase on older majors, and no write command differs from an allowlisted name only by case; a name the server does not recognize fails there anyway | none |
+| 46 | (unstated) rb-mongodb dependencies | `anyhow` added to `crates/rb-mongodb/Cargo.toml` | the refusal the plan specifies is `BackupError::Other(anyhow!(…))` | none — workspace dependency, already in the lock file |
+| 47 | § 4.3 Done: T-MONGO-MATRIX on 4 and 8 | 4, 7 and the cross pair 4:7; `8` is skipped by the runner on this host | every published MongoDB 8 image refuses to start on a kernel newer than 6.19 (SERVER-121912) and this host runs 7.0.0-31-generic — already documented in `docs/QA_GUIDE.md` | major 8 has to be exercised in CI or on an older kernel; nothing in the change is version-specific |
+| 38 | § 4.2 item 1: give `verify()` a `ReadOnlyClient` wrapped around the admin connection's client so the read-back type-checks | nothing to do — since § 3.2 the destination read-back already runs `source::stream_out` on its own `SourcePool`, which now hands out `ReadOnlyClient` | the plan was written before the pool existed; the destination never reads through the admin client any more | none — the read-back is read-only by the same type as the source |
+| 39 | `read_only_client_has_no_write_methods` asserts the guard is invoked by counting through a `#[cfg(test)]` counter | the test asserts on the text of the `impl ReadOnlyClient` block: no `execute`/`copy_in`/`transaction`/`simple_query`/`&Client`/`&self.inner` escape, and every method taking `sql: &str` calls `guard_read_only(sql)?` | every `ReadOnlyClient` method needs a live server, so a counter would never be exercised by a unit test — an unguarded method would pass it silently; the text assertion fails the moment one is added | none — stronger than the counter for the property the plan wanted |
+| 40 | (unstated) `analyze_err(ctx, e: tokio_postgres::Error)` | `analyze_err(ctx, e: BackupError)` | the read methods return `rb_core::Result`, so a call site's `map_err` now receives the crate error; `phase_src` takes `impl Into<anyhow::Error>` so the cause chain is unchanged | none — 21 call sites, same message and phase |
+| 41 | (unstated) rb-postgres dependencies | `anyhow` added to `crates/rb-postgres/Cargo.toml` | the refusal the plan specifies is `BackupError::Other(anyhow::anyhow!(…))` and the crate did not depend on anyhow (rb-core did) | none — workspace dependency, already in the lock file |
+| 37 | the filesystem atime row names --allow-atime-updates | it describes the opt-in without naming the flag; § 4.5 writes the name when the flag exists | scripts/help_parity.sh scans every operator document for flags the CLI does not accept, and gates.sh failed on the not-yet-implemented name | § 4.5 must replace the two placeholders in docs/IMMUTABILITY.md with the real flag name |
 
 ## 9. Blockers and open questions
 
 - No user-deferred question — the user adopted every recommended default at the clarification gate (D11-D27).
-- `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; ~~R7 `tokio-postgres 0.7.x` keepalive setters~~ **RESOLVED § 3.2**: the locked 0.7.18 exposes all four (`keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`); R8 MinIO policy action names (fallback `s3:Get*` + `s3:ListBucket`) — § 4.7; R9 `mongod --profile 0 --slowms 0` JSON logging on 4.4..8 — § 4.7.
+- `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; ~~R7 `tokio-postgres 0.7.x` keepalive setters~~ **RESOLVED § 3.2**: the locked 0.7.18 exposes all four (`keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`); ~~R8 MinIO policy action names~~ **RESOLVED § 4.7**: MinIO rejects `s3:GetObjectAcl` as an unsupported action and needs no `s3:GetBucketLocation`; the working set is `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetObject`, `s3:GetObjectTagging` (AWS additionally takes `s3:GetObjectAcl`); ~~R9 `mongod --profile 0 --slowms 0` JSON logging~~ **RESOLVED § 4.7**: identical `"c":"COMMAND"` + `attr.command` + `attr.appName` shape on 4.4, 6.0 and 7.0 (8 unrunnable on this kernel).
 - Phase 1 § 1.3 status of the § 1.2 FAIL list (runs on 16, 10, 12, 18):
   - M-PG-VIEW-04, M-PG-VIEW-05, M-PG-MV-05 — **FIXED** (view/matview `reloptions` captured and emitted).
   - M-PG-IDX-18 — **FIXED** (index comments were captured but never emitted; found by the read-back).
@@ -375,6 +498,13 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
     The matrix expects these three rows to round-trip, so § 1.3 implements view/matview relation
     options rather than moving the rows to `refused before transfer`.
   - Every other row is still unevaluated: the run aborts before the oracles.
+- **Privileged e2e cannot run in this session**: `sudo -n true` answers `sudo: è necessaria una
+  password` on this host, so every script that needs root — `e2e/filesystem_netns_test.sh`
+  (T-FS-OWN, T-FS-IMMUT, and T-FS-ATIME case (d) added in § 4.5) and `e2e/filesystem_matrix.sh`
+  (§ 5.3) — is written and lint-clean but unexecuted here. Phase 5 must run them on a host with
+  passwordless sudo, or in CI. Where a non-privileged proof of the same behaviour exists it is
+  recorded in §7 (§ 4.5 proved both atime polarities against the root-owned, world-readable
+  `/etc/skel`).
 - § 1.7 CI evidence is **pending**: the workflow is committed locally only (this session never pushes,
   per the user's instruction), so `postgres-postgis` and `postgres-postgis-cross-version` have no run
   URL yet. Record it in §7 after the user pushes `dev`.
@@ -399,7 +529,7 @@ disagree with §1 and §4.
 | 1 — PostgreSQL fidelity matrix | phase_02.md | `DONE` | 1.1-1.8 closed; plain matrix 1396 pass / 0 fail and PostGIS 901 pass / 0 fail |
 | 2 — Restore validation | phase_03.md | `DONE` | 2.1-2.4 closed; matrix 0 fail on 10,12,14,16,18 and every cross pair; full_matrix green after the CONSTR-STATE clone fix |
 | 3 — PostgreSQL latent defects | phase_04.md | `DONE` | 3.1-3.6 closed; pooled connections, timeouts, fingerprint v2, RSS proof, abort/race proofs (one product fix: abandon) |
-| 4 — Source immutability guardrails | phase_05.md | `TODO` | 4.1-4.9 |
+| 4 — Source immutability guardrails | phase_05.md | `DONE` | 4.1-4.9 closed: IMMUTABILITY.md, typed read-only clients in all three database modules, the filesystem atime guard, the lint as a gate, the three least-privilege runs proven from the servers' own logs, a panic-safe audit, and the README source-safety section. T-FS-ATIME stays PARTIAL until a host with passwordless sudo runs the privileged case (§ 9) |
 | 5 — Filesystem deep verification | phase_06.md | `TODO` | 5.1-5.6 |
 | 6 — Documentation audit and parity gate | phase_07.md | `TODO` | 6.1-6.5 |
 
@@ -427,12 +557,12 @@ A `SKIPPED` sub-phase or phase keeps its row and carries the reason.
 | T-PG-RSS | e2e | `PASS` | 2 GiB table: peaks 14056 KiB (source) and 22592 KiB (destination), cap 262144 KiB (§ 3.4) |
 | T-PG-ABORT | e2e | `PASS` | destination kill, source kill and refused plan: correct exits, failure-path audit ran, created databases dropped (§ 3.5) |
 | T-PG-WRITER | e2e | `PASS` | `pg-concurrent-writer`: exit 6, SOURCE-IMMUTABILITY VIOLATION, and the uncertified database is removed (§ 3.5) |
-| T-IMMUT-PG-LP | e2e | `TODO` | source runs as `rb_ro`; log allowlist passes on 10, 13, 14, 18 (§ 4.7) |
-| T-IMMUT-MONGO-LP | e2e | `TODO` | source runs as `read` role; no write command in mongod log on 4 and 8 (§ 4.7) |
-| T-IMMUT-S3-LP | e2e | `TODO` | source runs with Get/List-only MinIO policy (§ 4.7) |
-| T-IMMUT-LINT | gate | `TODO` | readonly lint inside `gates.sh` (§ 4.6) |
-| T-IMMUT-PANIC | unit | `TODO` | `panic_in_stream_out_still_runs_the_after_audit`, `panic_with_mutated_fingerprint_reports_source_mutated` (§ 4.8) |
-| T-FS-ATIME | e2e | `TODO` | non-owner run refused without flag, succeeds with `--allow-atime-updates` (§ 4.5) |
+| T-IMMUT-PG-LP | e2e | `PASS` | a full overwrite transfer runs as `rb_ro` on 10, 13, 14, 16 and 18 (both grant recipes, no extra grant needed); the server log for that role is read-only and the connection budget holds (§ 4.7) |
+| T-IMMUT-MONGO-LP | e2e | `PASS` | source runs as a `read`+`viewUser`/`viewRole` user on 4, 6 and 7; the mongod log shows 110 commands from `appName=rust-backup`, all reads; 8 unrunnable on this kernel (§ 4.7, § 9) |
+| T-IMMUT-S3-LP | e2e | `PASS` | source runs under the 5-action MinIO read policy with the anonymous grant removed; `mc admin trace` shows 25 S3 APIs, all reads, and the same credential is refused a write (§ 4.7) |
+| T-IMMUT-LINT | gate | `PASS` | `scripts/gates.sh` runs `scripts/source_readonly_lint.sh` and its `--selftest`: 12 source-side files clean, injected write detected (§ 4.6) |
+| T-IMMUT-PANIC | unit | `PASS` | both in `crates/rb-core/tests/session_test.rs`: the panic is reported as an error naming it, the after-audit ran (2 fingerprints), and drift on that path is `SourceMutated` (§ 4.8) |
+| T-FS-ATIME | e2e | `PARTIAL` | case (d) written in `e2e/filesystem_netns_test.sh`; the privileged run needs passwordless sudo (§ 9). Both polarities proven without root against `/etc/skel`: refused with the documented message and no atime change; accepted with the flag, one warning, formal verification (§ 4.5) |
 | T-FS-SPECIAL | e2e | `TODO` | FIFO + devices round-trip as root; socket refused; devices refused without CAP_MKNOD (§ 5.1) |
 | T-FS-MATRIX | e2e | `TODO` | `filesystem_matrix.sh` prints `MATRIX FS: 30 pass, 0 fail` (§ 5.3) |
 | T-FS-TOCTOU | unit | `TODO` | `a_planted_symlink_directory_is_refused_during_restore`, `a_symlink_destination_root_is_refused` (§ 5.4) |
@@ -452,17 +582,19 @@ other docs get their own rows.
 | README.md | 1 | `DONE` | extension configuration tables, the version refusal message, `--extension-version default` example and the reported deviation, PostGIS e2e command (§ 1.8) |
 | README.md | 2 | `DONE` | the `rows verified:` / `constraints:` lines with their meaning, and the row-count refusal with its remedy (§ 2.4) |
 | README.md | 3 | `DONE` | lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes, exit 6 (§ 3.6) |
-| README.md | 4 | `TODO` | source safety section, least-privilege recipes, `--allow-atime-updates` (§ 4.9) |
+| README.md | 4 | `DONE` | "Source safety": the read-only source and the audit on every exit path, the least-privilege account per backend, the writable-role warning, the atime rule with its refusal message and both remedies (§ 4.9) |
 | README.md | 5 | `TODO` | filesystem entries preserved/refused, capabilities, troubleshooting (§ 5.6) |
 | README.md | 6 | `TODO` | final full read (§ 6.5) |
 | docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6/5.2; reconciled § 6.3 |
 | docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", the printed proof, "Runtime model and guardrails", "Connections, timeouts and keepalives", "The source fingerprint" and "Failure behaviour" written (§ 1.3-1.5, 2.1-2.3, 3.1-3.5); Limits reconciled in § 6.3 |
-| docs/modules/FILESYSTEM.md | 4, 5, 6 | `TODO` | atime rule, special files, TOCTOU guarantee, fingerprint cost |
-| docs/modules/MONGODB.md, S3.md | 4, 6 | `TODO` | Immutability paragraphs |
-| docs/IMMUTABILITY.md | 4, 6 | `TODO` | created § 4.1; evidence markers removed § 4.7; reconciled § 6.3 |
+| docs/modules/FILESYSTEM.md | 4, 5, 6 | `IN_PROGRESS` | the atime rule, its message and its remedies written, plus the guarantees-table row (§ 4.5); special files, the TOCTOU guarantee and the fingerprint cost land in phase 5 |
+| docs/modules/MONGODB.md | 4, 6 | `IN_PROGRESS` | "Immutability" rewritten for the typed client, the command allowlist and the pinned read settings (§ 4.3); reconciled § 6.3 |
+| docs/modules/README.md | 4, 6 | `IN_PROGRESS` | the module-author checklist states that `fingerprint` runs after a failed or panicked run too (§ 4.8); reconciled § 6.3 |
+| docs/modules/S3.md | 4, 6 | `IN_PROGRESS` | "Immutability" names `ReadOnlyS3`, the eight read operations and the one-file read side (§ 4.4); reconciled § 6.3 |
+| docs/IMMUTABILITY.md | 4, 6 | `IN_PROGRESS` | created § 4.1; PostgreSQL (§ 4.2), MongoDB (§ 4.3), S3 (§ 4.4) and the filesystem atime row (§ 4.5) carry their guard class and evidence IDs; the MongoDB and S3 least-privilege recipes are final and every "evidence lands in" marker is gone (§ 4.7); the fingerprint contract states the panic path (§ 4.8); reconciled § 6.3 |
 | docs/usage/03-postgres.md, 05-filesystem.md, 07-sessioni-yaml.md, 10-variabili-ambiente.md, 11-codici-uscita.md | 1, 2, 4, 5, 6 | `IN_PROGRESS` | `--extension-version` rows, the configuration-table paragraph, "Cosa stampa la verifica" and the exit-code note landed (§ 1.4-1.5, 2.1-2.3); test hook and filesystem rows still owed; full audit § 6.2 |
 | docs/QA_GUIDE.md, e2e/README.md, e2e/fixtures/postgres/README.md | 0, 1, 3, 5, 6 | `IN_PROGRESS` | § 0.1 matrix links; § 0.2 helper table + fixture naming rule; scripts/jobs/gates still to reconcile in § 6 |
-| CLAUDE.md | 4, 6 | `TODO` | gate line gains the two new scripts |
+| CLAUDE.md | 4, 6 | `IN_PROGRESS` | the gate line now lists `crate_invariants.sh`, `source_readonly_lint.sh` (+ `--selftest`) and `help_parity.sh` (§ 4.6); `docs_parity.sh` is added in § 6.1 |
 
 ### Audits
 

@@ -11,13 +11,13 @@ return non-zero on any failure.
 | `session_two_targets.sh` | T-SESSION-2 | 7 | parallel YAML pairs, progress, fail-fast |
 | `transport_netns_test.sh` | T-NET1 | 1 | direct path, setup fallback, active-loss fail-safe |
 | `postgres_introspect.sh` | T-PG-INTROSPECT | 2.2 | seed a pg, run the gated live introspection test |
-| `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT | 2.8 | pg 10..18 same/cross-major restore + catalog/data proof + abort immutability |
+| `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT, T-IMMUT-PG-LP | 2.8, 4.7 | pg 10..18 same/cross-major restore + catalog/data proof + abort immutability + a full run as a read-only role, proven from the server log |
 | `postgres_large_table.sh` | T-PG-RSS | 3.4 | one 2 GiB table end to end, peak RSS of both peers sampled and capped |
-| `mongodb_matrix.sh` | — | 3 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite |
+| `mongodb_matrix.sh` | T-MONGO-IMMUT, T-IMMUT-MONGO-LP | 3, 4.7 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite + a full run as a `read`-only user, proven from the mongod command log |
 | `filesystem_netns_test.sh` | T-FS-OWN, T-FS-IMMUT | 4 | ownership (root vs non-root) + immutability |
 | `filesystem_disk_full.sh` | T-FS-ENOSPC | F2.4 | real ext4 ENOSPC, abort propagation, cleanup + immutability |
 | `bandwidth_netem.sh` | T-BW | 6 | asymmetric bandwidth/RTT, backpressure proof |
-| `s3_minio_test.sh` | — | 5 | MinIO 1:1 |
+| `s3_minio_test.sh` | T-S3-IMMUT, T-IMMUT-S3-LP | 5, 4.7 | MinIO 1:1 + a full run under a read-only policy, proven from `mc admin trace` and by a refused write |
 | `s3_aws_test.sh` | — | 5 | credential-gated real AWS S3 smoke |
 | `resource_hygiene_check.sh` | T-HYGIENE | 8 | static guard: every e2e script parses, and each one only removes namespaces/containers it created. Run by `full_matrix.sh`; no Docker or sudo |
 | `full_matrix.sh` | — | 8 | non-privileged matrix; Docker DBs and sudo tests opt in |
@@ -45,7 +45,7 @@ Each successful E2E path calls `rb_assert_formal_verification`: both peers must
 print their formal verified message, finish at `status="verified"` and `100.0%`,
 and report the same 64-character payload BLAKE3.
 
-## PostgreSQL matrix helpers in `e2e/lib.sh`
+## Backend helpers in `e2e/lib.sh`
 
 Shared by `postgres_matrix.sh` and any script that needs an external oracle or
 I-IMMUT evidence from the server's own log. Fixtures live in
@@ -62,6 +62,9 @@ I-IMMUT evidence from the server's own log. Fixtures live in
 | `rb_pg_assert_readonly_log <container> <user> [since]` | fails when any statement logged for `<user>` is not a read (`SELECT`/`WITH`/`SHOW`/`TABLE`/`VALUES`/`COPY ... TO STDOUT`); `since` is an epoch mark limiting the window to one transfer. Continuation lines of a wrapped statement are rejoined first, so a multi-line `COPY … TO STDOUT` is judged whole |
 | `rb_pg_assert_connections <container> <user> <max>` | fails when `<user>` opened more than `<max>` connections |
 | `rb_pg_assert_no_temp_files <container>` | fails when the server logged a `temporary file:` line (I-NOTEMP) |
+| `rb_mongo_assert_readonly_log <container> [since] [app]` | fails when any command the mongod logged for `appName=<app>` (default `rust-backup`) writes; needs the container started with `--profile 0 --slowms 0`, which logs every command without writing a profile collection. `aggregate` is judged by its pipeline — the driver runs `count_documents` as one — and an empty window is a failure, since silence is not evidence |
+| `rb_minio_readonly_policy <bucket>` | prints the least-privilege MinIO policy for a source bucket: `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning` on the bucket and `s3:GetObject`, `s3:GetObjectTagging` on its objects (on AWS, add `s3:GetObjectAcl`) |
+| `rb_minio_assert_readonly_trace <trace-file>` | fails when any `s3.*` API in a `mc admin trace --json` capture is not a read; an empty capture is a failure too |
 
 Environment switches the scripts read:
 

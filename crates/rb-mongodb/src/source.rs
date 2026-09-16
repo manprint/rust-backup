@@ -20,7 +20,8 @@ use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::BackupPlan;
 use rb_core::wire::CHUNK_SIZE;
 
-use crate::{MongoConnection, MongoDbParams};
+use crate::connect::{sort_by_id, ReadOnlyConnection};
+use crate::MongoDbParams;
 
 /// The per-item descriptor carried in `PlanItem::meta` (set by `build_plan`,
 /// consumed by both source `stream_out` and destination `stream_in`).
@@ -37,7 +38,7 @@ pub async fn stream_out(
     plan: &BackupPlan,
     sink: &mut dyn ChunkSink,
 ) -> Result<()> {
-    let conn = MongoConnection::connect(params).await?;
+    let conn = ReadOnlyConnection::connect(params).await?;
 
     for item in &plan.items {
         if item.kind != "collection" {
@@ -50,15 +51,12 @@ pub async fn stream_out(
             )
         })?;
 
-        let coll = conn
-            .client
-            .database(&meta.database)
-            .collection::<Document>(&meta.collection);
         // A stable order makes the source commitment reproducible when the
         // destination is read back after restore. `_id` is unique and indexed.
-        let cursor = coll
-            .find(doc! {})
-            .sort(doc! { "_id": 1 })
+        let cursor = conn
+            .client
+            .database(&meta.database)
+            .find(&meta.collection, doc! {}, Some(sort_by_id()))
             .await
             .map_err(|e| {
                 BackupError::phase_src(Phase::Transfer, format!("find {}", item.name), e)

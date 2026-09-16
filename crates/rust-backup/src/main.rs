@@ -232,6 +232,16 @@ struct ModuleParamArgs {
     /// filesystem: preserve xattrs.
     #[arg(long = "preserve-xattr", env = "RUST_BACKUP_PRESERVE_XATTR", value_parser = boolish(), num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     preserve_xattr: Option<bool>,
+    /// filesystem source: accept access-time updates when O_NOATIME is not permitted (not the file owner and no CAP_FOWNER).
+    #[arg(
+        long = "allow-atime-updates",
+        env = "RUST_BACKUP_ALLOW_ATIME_UPDATES",
+        value_parser = boolish(),
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    allow_atime_updates: Option<bool>,
 
     /// Extra module params as key=value (repeatable); overrides typed flags.
     #[arg(short = 'P', long = "param")]
@@ -333,6 +343,7 @@ impl ModuleParamArgs {
         put_bool("path_style", self.path_style);
         put_bool("follow_symlinks", self.follow_symlinks);
         put_bool("preserve_xattr", self.preserve_xattr);
+        put_bool("allow_atime_updates", self.allow_atime_updates);
         // The switch is spelled in the negative; the parameter is not.
         put_bool(
             "preserve_ownership",
@@ -1493,6 +1504,72 @@ targets:
         assert_eq!(params.0["overwrite"], true);
         assert_eq!(params.0["admin"], true);
         assert!(auto_accept);
+    }
+
+    /// The atime opt-in is a filesystem *source* concern: it reaches the
+    /// module as `allow_atime_updates`, it defaults to absent (so the module
+    /// refuses an atime-moving read), and it can be turned back off from the
+    /// CLI over a YAML `true` like every other bool.
+    #[test]
+    fn allow_atime_updates_flag_is_filesystem_source_only() {
+        let cli = parse(&[
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--root",
+            "/srv/data",
+            "--allow-atime-updates",
+        ]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "filesystem", Role::Source).expect("resolve");
+        assert_eq!(params.0["allow_atime_updates"], true);
+        let typed: rb_filesystem::FilesystemParams = params.deserialize().expect("typed params");
+        assert!(typed.allow_atime_updates);
+
+        // Absent unless asked for, and the module's default refuses.
+        let cli = parse(&[
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--root",
+            "/srv/data",
+        ]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "filesystem", Role::Source).expect("resolve");
+        assert!(params.0.get("allow_atime_updates").is_none());
+        let typed: rb_filesystem::FilesystemParams = params.deserialize().expect("typed params");
+        assert!(!typed.allow_atime_updates);
+
+        // An explicit `false` is carried, so a YAML `true` can be overridden.
+        let cli = parse(&[
+            "rust-backup",
+            "filesystem",
+            "source",
+            "--to",
+            "coord:7835",
+            "--channel",
+            "c1",
+            "--root",
+            "/srv/data",
+            "--allow-atime-updates=false",
+        ]);
+        let Cmd::Filesystem(a) = cli.cmd else {
+            panic!("expected filesystem subcommand")
+        };
+        let (_, params, _) = resolve_target(&a, "filesystem", Role::Source).expect("resolve");
+        assert_eq!(params.0["allow_atime_updates"], false);
     }
 
     /// The `plan` dry-run subcommand parses and carries module params only.

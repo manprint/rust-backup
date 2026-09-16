@@ -37,15 +37,17 @@ check_file() { # file patterns
 
 check_tree() {
   local file
+  # `connect.rs` holds the read-only client wrapper itself (§ 4.2/§ 4.3): a
+  # write method added to it would be reachable from every source file.
   for file in crates/rb-postgres/src/source.rs crates/rb-postgres/src/introspect.rs \
-      crates/rb-postgres/src/immutability.rs; do
+      crates/rb-postgres/src/immutability.rs crates/rb-postgres/src/connect.rs; do
     check_file "$file" "$POSTGRES_PATTERNS"
   done
 
   # The mongodb module may split its read side into further `source*`/
   # `introspect*` files; every one of them is source-side code.
   for file in crates/rb-mongodb/src/source*.rs crates/rb-mongodb/src/introspect*.rs \
-      crates/rb-mongodb/src/immutability.rs; do
+      crates/rb-mongodb/src/immutability.rs crates/rb-mongodb/src/connect.rs; do
     check_file "$file" "$MONGODB_PATTERNS"
   done
 
@@ -54,10 +56,12 @@ check_tree() {
     check_file "$file" "$FILESYSTEM_PATTERNS"
   done
 
+  # The read side of rb-s3 is one file, `ReadOnlyS3` included (§ 4.4).
   if [[ -f crates/rb-s3/src/source.rs ]]; then
     check_file crates/rb-s3/src/source.rs "$S3_PATTERNS"
   else
-    echo "SKIP rb-s3 (source.rs not split yet)"
+    echo "FAIL: crates/rb-s3/src/source.rs is missing — the S3 read side must stay in one file" >&2
+    HITS=$((HITS + 1))
   fi
 }
 

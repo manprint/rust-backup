@@ -11,14 +11,15 @@
 //! queries are exercised by the mongodb e2e (incl. the mid-transfer-abort case).
 
 use futures_util::StreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::doc;
 
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::wire::blake3_hex;
 
+use crate::connect::{sort_by_id, ReadOnlyConnection};
 use crate::introspect;
 use crate::model::MongoPlanPayload;
-use crate::{MongoConnection, MongoDbParams};
+use crate::MongoDbParams;
 
 /// Snapshot the source fingerprint composes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +48,7 @@ pub async fn fingerprint(params: &MongoDbParams) -> Result<String> {
     normalize(&mut normalized);
     let catalog_hash = hash_catalog(&normalized);
 
-    let conn = MongoConnection::connect(params).await?;
+    let conn = ReadOnlyConnection::connect(params).await?;
     let mut collections = Vec::new();
     for db in &payload.databases {
         for coll in &db.collections {
@@ -104,20 +105,19 @@ fn hash_catalog(p: &MongoPlanPayload) -> String {
 }
 
 /// Exact `count_documents` plus a complete deterministic content checksum.
-async fn coll_stat(conn: &MongoConnection, db: &str, coll: &str) -> Result<CollStat> {
-    let collection = conn.client.database(db).collection::<Document>(coll);
+async fn coll_stat(conn: &ReadOnlyConnection, db: &str, coll: &str) -> Result<CollStat> {
+    let database = conn.client.database(db);
 
-    let docs = collection
-        .count_documents(doc! {})
+    let docs = database
+        .count_documents(coll, doc! {})
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {db}.{coll}"), e))?
         as i64;
 
     // `_id` is unique and indexed, so hashing every document in this order is
     // stable and cannot miss a mutation in a collection larger than a sample.
-    let mut cursor = collection
-        .find(doc! {})
-        .sort(doc! { "_id": 1 })
+    let mut cursor = database
+        .find(coll, doc! {}, Some(sort_by_id()))
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("sample {db}.{coll}"), e))?;
 

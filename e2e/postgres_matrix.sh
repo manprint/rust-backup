@@ -28,6 +28,11 @@ CASES=("${@:-16}")
 IMAGE_REPO=${RB_PG_IMAGE_REPO:-postgres}
 BIN="./target/release/rust-backup"
 PASSWORD="$RB_PG_PASSWORD"
+# The role the SOURCE connects as. Every row but T-IMMUT-PG-LP uses the
+# superuser (the fixtures are loaded with it); the LP row repeats a full
+# backup/restore as the least-privileged `rb_ro` role created below.
+SOURCE_USER=postgres
+SOURCE_PASSWORD="$RB_PG_PASSWORD"
 CTRL_PORT=$(rb_free_port)
 WORK=$(mktemp -d)
 FIXTURES="e2e/fixtures/postgres"
@@ -280,6 +285,36 @@ database_metadata() { # container major
 # Transfer
 # --------------------------------------------------------------------------
 
+# T-IMMUT-PG-LP: the least-privilege source role, per the two recipes in
+# docs/IMMUTABILITY.md. `pg_read_all_data` exists from 14; before that the only
+# way is per-schema grants, which is why the row runs on both sides of that
+# boundary. Nothing here grants a write.
+create_readonly_role() { # container major database
+  local container=$1 major=$2 database=$3
+  docker exec "$container" psql -U postgres -v ON_ERROR_STOP=1 -q -c \
+    "DROP ROLE IF EXISTS rb_ro; CREATE ROLE rb_ro LOGIN PASSWORD 'rb_ro'" >/dev/null
+  docker exec "$container" psql -U postgres -v ON_ERROR_STOP=1 -q -c \
+    "GRANT CONNECT ON DATABASE ${database} TO rb_ro" >/dev/null
+  if (( major >= 14 )); then
+    docker exec "$container" psql -U postgres -v ON_ERROR_STOP=1 -q -c \
+      "GRANT pg_read_all_data TO rb_ro" >/dev/null
+    return 0
+  fi
+  # 10..=13: every non-system schema of the target database, plus its
+  # sequences — `GRANT SELECT ON ALL TABLES` does not cover them, and without
+  # them the source refuses rather than restore a reset sequence.
+  local schema
+  while IFS= read -r schema; do
+    [[ -z $schema ]] && continue
+    docker exec "$container" psql -U postgres -d "$database" -v ON_ERROR_STOP=1 -q -c \
+      "GRANT USAGE ON SCHEMA \"${schema}\" TO rb_ro;
+       GRANT SELECT ON ALL TABLES IN SCHEMA \"${schema}\" TO rb_ro;
+       GRANT SELECT ON ALL SEQUENCES IN SCHEMA \"${schema}\" TO rb_ro" >/dev/null
+  done < <(docker exec "$container" psql -U postgres -d "$database" -At -c \
+    "SELECT nspname FROM pg_namespace
+      WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'")
+}
+
 run_transfer() { # src_port dst_port channel [abort|overwrite|source-only] [database]
   local src_port="$1" dst_port="$2" channel="$3" mode="${4:-}" database="${5:-$DATABASE}"
   "$BIN" server --bind-addr 127.0.0.1 --control-port "$CTRL_PORT" >"$WORK/server.log" 2>&1 &
@@ -288,8 +323,8 @@ run_transfer() { # src_port dst_port channel [abort|overwrite|source-only] [data
 
   # Source registers as provider first, then destination consumes.
   "$BIN" postgres source --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
-    --no-udp --insecure --host 127.0.0.1 --port "$src_port" --user postgres \
-    --password "$PASSWORD" --database "$database" --sslmode disable >"$WORK/src.log" 2>&1 &
+    --no-udp --insecure --host 127.0.0.1 --port "$src_port" --user "$SOURCE_USER" \
+    --password "$SOURCE_PASSWORD" --database "$database" --sslmode disable >"$WORK/src.log" 2>&1 &
   local src_pid=$!; PIDS+=("$src_pid")
 
   if [[ "$mode" == "abort" ]]; then
@@ -981,6 +1016,40 @@ SQL
     fail_row "OVERWRITE" "database metadata differs after the overwrite"
   else
     pass_row "OVERWRITE"
+  fi
+
+  # 12b) T-IMMUT-PG-LP: the same full backup and restore, performed by a role
+  # that can only read. The proof is threefold: the run succeeds (so the recipe
+  # in docs/IMMUTABILITY.md is sufficient), the server's own log shows only
+  # reads from that role (so nothing wrote through a privilege it does not
+  # have), and the connection budget still holds for it.
+  create_readonly_role "$SRC" "$SOURCE_MAJOR" "$DATABASE"
+  LP_MARK=$(date +%s)
+  rb_pg_watch_connections "$SRC" rb_ro "$WORK/lp.samples" &
+  LP_WATCH_PID=$!
+  PIDS+=("$LP_WATCH_PID")
+  SOURCE_USER=rb_ro
+  SOURCE_PASSWORD=rb_ro
+  lp_rc=0
+  run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-lp-${CASE_ID}" overwrite || lp_rc=$?
+  SOURCE_USER=postgres
+  SOURCE_PASSWORD="$PASSWORD"
+  kill "$LP_WATCH_PID" >/dev/null 2>&1 || true
+  data_checksum "$SRC" "$DATABASE" >"$WORK/lp.src"
+  data_checksum "$DST" "$DATABASE" >"$WORK/lp.dst"
+  if (( lp_rc != 0 )); then
+    fail_row "T-IMMUT-PG-LP" "the least-privilege run failed: $(tail -1 "$WORK/src.log")"
+    tail -5 "$WORK/src.log" || true
+  elif ! diff -u <(normalize_counts "$WORK/lp.src" "$CROSS") \
+                 <(normalize_counts "$WORK/lp.dst" "$CROSS") >"$WORK/lp.diff"; then
+    fail_row "T-IMMUT-PG-LP" "restored data differs: $(wc -l <"$WORK/lp.diff") diff lines"
+    head -20 "$WORK/lp.diff"
+  elif ! rb_pg_assert_readonly_log "$SRC" rb_ro "$LP_MARK"; then
+    fail_row "T-IMMUT-PG-LP" "the least-privilege source issued a non-read statement"
+  elif ! rb_pg_assert_connections "$WORK/lp.samples" 3; then
+    fail_row "T-IMMUT-PG-LP" "the least-privilege source exceeded the connection budget"
+  else
+    pass_row "T-IMMUT-PG-LP"
   fi
 
   # 13) M-PG-EXT-08: the extension-version policy. Last, because it removes

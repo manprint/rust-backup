@@ -73,6 +73,7 @@ vince sul default compilato nel programma.
 | `RUST_BACKUP_AUTH_DB` | `--auth-db` | mongodb |
 | `RUST_BACKUP_ROOT` | `--root` | filesystem |
 | `RUST_BACKUP_NO_PRESERVE_OWNERSHIP` | `--no-preserve-ownership` | filesystem (destinazione) |
+| `RUST_BACKUP_ALLOW_ATIME_UPDATES` | `--allow-atime-updates` | filesystem (sorgente) |
 | `RUST_BACKUP_FOLLOW_SYMLINKS` | `--follow-symlinks` | filesystem (rifiutato) |
 | `RUST_BACKUP_PRESERVE_XATTR` | `--preserve-xattr` | filesystem (rifiutato) |
 | `RUST_BACKUP_BUCKET` | `--bucket` | s3 |

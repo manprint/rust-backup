@@ -33,6 +33,10 @@ codes), each opening with its minimal working example and covering every flag.
 The guide is written in Italian; the sections below stay as a quick English
 overview, and `scripts/gates.sh` enforces that the guide and `--help` agree.
 
+[`docs/IMMUTABILITY.md`](docs/IMMUTABILITY.md) is the reference for the one
+promise that outranks all the others — a backup never alters its source: what is
+guarded, how it is proved, and the read-only role to create for each backend.
+
 ## Install
 
 Download a Linux `x86_64` or `aarch64` archive from
@@ -114,6 +118,60 @@ Both messages include the same payload BLAKE3. Apply, catalog, data read-back,
 source audit, timeout, or acknowledgement failures produce a non-zero exit and
 never print verified completion. See each module document for the exact
 restorable contract and its explicit exclusions.
+
+## Source safety
+
+A backup never alters its source, and that is enforced rather than promised. The
+source side of every module holds a read-only handle — it has no write call to
+offer — statements and commands are checked against a read allowlist before they
+are sent, and the complete source fingerprint is measured before the run and
+again afterwards, on every exit path: success, failure, an abort mid-stream, and
+a pipeline that panicked. A source that changed during the run ends the transfer
+with `SOURCE-IMMUTABILITY VIOLATION` and exit `6`, and a destination that had
+already written the payload drops it instead of certifying it.
+
+Give the source a least-privilege account anyway, so the *server* refuses a
+write even if this program were wrong:
+
+```sql
+-- PostgreSQL 14 and later
+CREATE ROLE rb_ro LOGIN PASSWORD 'change-me';
+GRANT pg_read_all_data TO rb_ro;
+GRANT CONNECT ON DATABASE app TO rb_ro;
+```
+
+On PostgreSQL 10 to 13 `pg_read_all_data` does not exist yet, so grant `USAGE`
+plus `SELECT ON ALL TABLES` and `ON ALL SEQUENCES` per non-system schema. On
+MongoDB create a user with `read` on each copied database, plus `viewUser` and
+`viewRole` on it if the plan should also record the database's users. On S3 or
+MinIO use a credential whose policy allows only `s3:ListBucket`,
+`s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetObject` and
+`s3:GetObjectTagging` (`s3:GetObjectAcl` too on AWS, which has that action).
+Every recipe, with the reason for each grant, is in
+[`docs/IMMUTABILITY.md`](docs/IMMUTABILITY.md).
+
+A PostgreSQL role that can write the source is not refused — which role to use
+is the operator's decision — but the run warns once: `source role <user> can
+write to the source; a read-only role is recommended, see docs/IMMUTABILITY.md`.
+
+For a filesystem source the same rule covers access times. Reading a file
+normally moves its `atime`, so the source opens every file with `O_NOATIME`,
+which the kernel allows only to the file's owner or to a process with
+`CAP_FOWNER`. Running as anyone else fails at the first read:
+
+```text
+cannot open /srv/data/report.csv without updating its access time (O_NOATIME
+needs file ownership or CAP_FOWNER); run as the file owner or root, or pass
+--allow-atime-updates to accept atime changes on the source
+```
+
+The remedy is in the message: run the source as the owner of the tree (or as
+root), or, when moving access times is acceptable, pass
+`--allow-atime-updates` (`RUST_BACKUP_ALLOW_ATIME_UPDATES=true`, or
+`allow_atime_updates: true` in a session file — default `false`). The run then
+warns once, `atime updates on the source accepted by --allow-atime-updates`, and
+nothing else about the source is touched: contents, ownership, permissions and
+modification times are read only.
 
 ## Deploy the coordination server
 
@@ -249,7 +307,7 @@ the following sections.
 Binary, in two terminals or hosts:
 
 ```bash
-# Source is read-only and normally does not need root.
+# Source is read-only; run it as the owner of the tree (see "Source safety").
 rust-backup filesystem source \
   --to coordinator.example:7835 --channel fs-prod \
   --secret-file /etc/rust-backup/coordination.secret \
@@ -282,12 +340,19 @@ docker run --rm --network host --user 0:0 \
 ```
 
 `--follow-symlinks` and `--preserve-xattr` are deliberately rejected in the
-current safe backend; symlinks themselves are preserved. See
+current safe backend; symlinks themselves are preserved. Reading files the
+source account does not own needs `--allow-atime-updates`, described under
+[Source safety](#source-safety). See
 [filesystem details](docs/modules/FILESYSTEM.md).
 
 ## PostgreSQL backup
 
-The source account must be read-only. The destination account needs the rights
+The source account must be read-only. A role that can write the source is not
+refused, but the run warns once — `source role <user> can write to the source; a
+read-only role is recommended, see docs/IMMUTABILITY.md` — and the source path
+is protected anyway: its client type exposes no write method, every statement
+passes a read-only allowlist, and the session is opened with
+`default_transaction_read_only=on`. The destination account needs the rights
 reported by preflight (normally cluster administration, role and database
 creation). Existing target databases are rejected unless `--overwrite` (or the
 equivalent `overwrite: true` YAML parameter) is explicitly configured.
