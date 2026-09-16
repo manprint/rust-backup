@@ -91,6 +91,15 @@ pub trait Destination: Send + Sync {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport>;
+
+    /// The run failed *after* the payload was applied — read-back verification
+    /// said no, or the source rejected the completion (it mutated under us).
+    /// What the destination holds is then a complete-looking but uncertified
+    /// copy, which is exactly the thing this tool refuses to leave behind, so a
+    /// module that can tell what this run created removes it here. Best effort
+    /// by construction: the run already failed and its error is the real
+    /// outcome, so this cannot return one. Default: nothing to undo.
+    async fn abandon(&self) {}
 }
 
 /// A backup-capable backend type. One instance per module, registered once.

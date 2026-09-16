@@ -746,9 +746,15 @@ for CASE in "${CASES[@]}"; do
 
   # 2) Full backup -> restore.
   TRANSFER_MARK=$(date +%s)
+  # T-PG-CONN: sample the source's connection count for the whole transfer.
+  rb_pg_watch_connections "$SRC" postgres "$WORK/conns.samples" &
+  CONN_WATCH_PID=$!
+  PIDS+=("$CONN_WATCH_PID")
   if run_transfer "$SRC_PORT" "$DST_PORT" "pgjob-${CASE_ID}"; then
+    kill "$CONN_WATCH_PID" >/dev/null 2>&1 || true
     pass_row "TRANSFER"
   else
+    kill "$CONN_WATCH_PID" >/dev/null 2>&1 || true
     fail_row "TRANSFER" "see $WORK/src.log and $WORK/dst.log"
     echo "--- source log (tail) ---"; tail -20 "$WORK/src.log" || true
     echo "--- destination log (tail) ---"; tail -20 "$WORK/dst.log" || true
@@ -818,6 +824,13 @@ for CASE in "${CASES[@]}"; do
     pass_row "ROWS-VERIFIED"
   fi
 
+  # T-PG-CONN: one boot connection plus one per database, plus one of tolerance.
+  if rb_pg_assert_connections "$WORK/conns.samples" 3; then
+    pass_row "CONN-BUDGET"
+  else
+    fail_row "CONN-BUDGET" "the source opened more connections than the budget"
+  fi
+
   # § 2.3 — the operator must be able to read the proof, not only trust it.
   if rb_strip_ansi <"$WORK/dst.log" | grep -qE 'rows verified: [0-9]+ from tables, [0-9]+ from materialized views, [0-9]+ rows'; then
     pass_row "ROWS-LINE"
@@ -830,16 +843,17 @@ for CASE in "${CASES[@]}"; do
     fail_row "CONSTR-LINE" "the destination printed no 'constraints:' line"
   fi
 
-  # I-NOTEMP: the source must not spill. Today's source sorts every COPY, which
-  # spills on the TOAST-heavy row with the fixture's 4 MB work_mem; the
-  # commutative fingerprint of phase 3 § 3.3 removes that sort. Until it lands
-  # the check reports rather than fails (`RB_PG_NOTEMP_MODE=strict` to enforce).
+  # I-NOTEMP: the source must not spill. Since § 3.3 the fingerprint folds an
+  # order-independent commitment and no longer sorts, so what remains is the
+  # data stream's `ORDER BY`, which the destination read-back depends on (see
+  # the Limits bullet in docs/modules/POSTGRES.md). The check therefore still
+  # reports rather than fails (`RB_PG_NOTEMP_MODE=strict` to enforce).
   if rb_pg_assert_no_temp_files "$SRC"; then
     pass_row "NOTEMP"
   elif [[ ${RB_PG_NOTEMP_MODE:-warn} == "strict" ]]; then
     fail_row "NOTEMP" "the source spilled a temporary file"
   else
-    skip_row "NOTEMP" "the source still sorts each COPY; enforced from phase 3 § 3.3"
+    skip_row "NOTEMP" "the data stream still sorts; the fingerprint no longer does (§ 3.3)"
   fi
 
   # 4) External oracles.

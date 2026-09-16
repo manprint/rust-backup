@@ -20,8 +20,8 @@ use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::BackupPlan;
 use rb_core::wire::CHUNK_SIZE;
 
+use crate::connect::SourcePool;
 use crate::ddl::{quote_ident, quote_qualified};
-use crate::{PgConnection, PostgresParams};
 
 /// The per-item COPY descriptor carried in `PlanItem::meta` (set by `build_plan`,
 /// consumed by both source `stream_out` and destination `stream_in`).
@@ -68,14 +68,10 @@ pub(crate) const DATA_ITEM_KINDS: [&str; 2] = ["table", "extension_config"];
 /// Stream every data-bearing item of `plan` into `sink`. Does NOT close the sink
 /// (the session calls `finish` once all items are done).
 pub async fn stream_out(
-    params: &PostgresParams,
+    pool: &SourcePool,
     plan: &BackupPlan,
     sink: &mut dyn ChunkSink,
 ) -> Result<()> {
-    // Reuse one connection across consecutive items in the same database (the
-    // plan lists items grouped by database).
-    let mut conn: Option<(String, PgConnection)> = None;
-
     for item in &plan.items {
         if !DATA_ITEM_KINDS.contains(&item.kind.as_str()) {
             continue;
@@ -87,22 +83,16 @@ pub async fn stream_out(
             )
         })?;
 
-        let stale = conn
-            .as_ref()
-            .map(|(db, _)| db != &meta.database)
-            .unwrap_or(true);
-        if stale {
-            let c = PgConnection::connect_read_only(params, &meta.database).await?;
-            conn = Some((meta.database.clone(), c));
-        }
-
-        if let Some((_, c)) = &conn {
-            let copy_sql = copy_out_sql(&meta);
-            let stream = c.client.copy_out(&copy_sql).await.map_err(|e| {
-                BackupError::phase_src(Phase::Transfer, format!("copy_out {}", item.name), e)
-            })?;
-            copy_stream_to_sink(item.id, stream, sink).await?;
-        }
+        // One pooled connection per database, reused across the consecutive
+        // items of that database (the plan lists items grouped by database).
+        // The guard covers exactly one `COPY` and is dropped before the next
+        // item asks the pool again.
+        let conn = pool.get(Some(&meta.database)).await?;
+        let copy_sql = copy_out_sql(&meta);
+        let stream = conn.client.copy_out(&copy_sql).await.map_err(|e| {
+            BackupError::phase_src(Phase::Transfer, format!("copy_out {}", item.name), e)
+        })?;
+        copy_stream_to_sink(item.id, stream, sink).await?;
     }
     Ok(())
 }

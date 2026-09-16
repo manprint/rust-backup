@@ -7,6 +7,7 @@
 //! frames use independent substreams.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -779,6 +780,28 @@ where
     F: FnMut(&BackupPlan) -> Fut + Send,
     Fut: std::future::Future<Output = bool> + Send,
 {
+    // Everything that can fail *after* the payload is on disk has to leave the
+    // destination without an uncertified copy of the source, so the run is
+    // wrapped here rather than at each of its return sites.
+    let applied = AtomicBool::new(false);
+    let outcome = run_destination_applied(dest, channel, progress, accept, &applied).await;
+    if outcome.is_err() && applied.load(Ordering::Relaxed) {
+        dest.abandon().await;
+    }
+    outcome
+}
+
+async fn run_destination_applied<F, Fut>(
+    dest: &dyn Destination,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    accept: &mut F,
+    applied: &AtomicBool,
+) -> Result<BackupPlan>
+where
+    F: FnMut(&BackupPlan) -> Fut + Send,
+    Fut: std::future::Future<Output = bool> + Send,
+{
     // 1. Consumer opens the substream and receives the plan.
     let stream = channel.open_stream().await?;
     let mut stream = stream;
@@ -855,13 +878,24 @@ where
     );
 
     if separate_data_streams || agreed_carriers > 1 {
-        return destination_stream_multi(dest, channel, progress, plan, stream, agreed_carriers)
-            .await;
+        return destination_stream_multi(
+            dest,
+            channel,
+            progress,
+            plan,
+            stream,
+            agreed_carriers,
+            applied,
+        )
+        .await;
     }
 
     // 4. Apply the streamed payload (no temp files).
     let mut src = StreamChunkSource::new_counted(stream, progress.clone());
     let apply_result = dest.stream_in(&plan, &mut src).await;
+    if apply_result.is_ok() {
+        applied.store(true, Ordering::Relaxed);
+    }
     let received_items = src.completed_item_ids();
     let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();
@@ -987,6 +1021,7 @@ async fn destination_stream_multi(
     plan: BackupPlan,
     mut control: Box<dyn crate::channel::DuplexStream>,
     carriers: usize,
+    applied: &AtomicBool,
 ) -> Result<BackupPlan> {
     let mut streams = Vec::with_capacity(carriers);
     for index in 0..carriers {
@@ -1041,6 +1076,9 @@ async fn destination_stream_multi(
     let mut src =
         MultiStreamChunkSource::new_ordered(streams, expected_item_ids, progress.clone())?;
     let apply_result = dest.stream_in(&plan, &mut src).await;
+    if apply_result.is_ok() {
+        applied.store(true, Ordering::Relaxed);
+    }
     let received_items = src.completed_item_ids();
     let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();

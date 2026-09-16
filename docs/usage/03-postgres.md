@@ -92,6 +92,23 @@ Il contratto completo, con il dettaglio di partizionamento, ereditarietà,
 `reg*`, ACL e determinismo della rilettura, è in
 [docs/modules/POSTGRES.md](../modules/POSTGRES.md).
 
+## Lock, timeout e connessioni
+
+La sorgente apre **una connessione al database bootstrap più una per ogni
+database copiato**, riusate da tutte le fasi (impronta, analisi, conteggi,
+`COPY`).
+
+Le sessioni di sorgente hanno `lock_timeout=30s`: se qualcun altro tiene una
+tabella in `ACCESS EXCLUSIVE`, la copia fallisce entro trenta secondi con il
+messaggio del server (`canceling statement due to lock timeout`) e il nome
+della relazione, invece di restare in attesa. Non c'è invece alcun
+`statement_timeout`: una `COPY` di una tabella grande dura legittimamente a
+lungo. Sulla destinazione nessuno dei due è impostato, perché DDL e `REFRESH
+MATERIALIZED VIEW` prendono lock e tempo di proposito.
+
+Rimedio: rilasciare il lock (o attendere la fine della manutenzione) e
+rieseguire; la copia riparte da zero, nulla è stato scritto sulla destinazione.
+
 ## Cosa stampa la verifica
 
 Alla fine la destinazione stampa la riga formale di verifica e, solo per

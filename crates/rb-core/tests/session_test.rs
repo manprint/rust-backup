@@ -292,6 +292,41 @@ impl Destination for MockDest {
     }
 }
 
+/// Applies the payload, then fails verification — and records whether the
+/// session gave it the chance to undo what it had already written.
+#[derive(Default)]
+struct AbandonRecordingDest {
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Destination for AbandonRecordingDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        while !matches!(src.next().await?, ChunkEvent::End) {}
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Err(rb_core::error::BackupError::phase(
+            rb_core::error::Phase::Verify,
+            "injected persisted read-back mismatch",
+        ))
+    }
+
+    async fn abandon(&self) {
+        self.abandoned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[async_trait]
 impl Destination for FailingVerifyDest {
     async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
@@ -1104,5 +1139,77 @@ async fn mutating_source_caught() {
     assert!(
         derr.is_err(),
         "destination must not report success before source immutability proof"
+    );
+}
+
+/// A destination that applied the payload and then failed must be told, so the
+/// module can remove the uncertified copy it is holding. A failure *before* the
+/// payload landed has nothing to undo and must not trigger it.
+#[tokio::test]
+async fn a_failure_after_apply_lets_the_destination_undo_what_it_wrote() {
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source = MockSource {
+        fp: "stable".into(),
+        payload: vec![7; 64],
+    };
+    let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let destination = AbandonRecordingDest {
+        abandoned: abandoned.clone(),
+    };
+    let source_task =
+        tokio::spawn(
+            async move { session::run_source(&source, &*channel, &Progress::default()).await },
+        );
+    let destination_task = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        let result =
+            session::run_destination(&destination, &*peer, &Progress::default(), &mut yes).await;
+        (result, destination)
+    });
+
+    let (result, destination) = destination_task.await.unwrap();
+    result.expect_err("destination verification must fail");
+    let _ = source_task.await.unwrap();
+    assert_eq!(
+        destination
+            .abandoned
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the destination was never told the run failed after apply"
+    );
+}
+
+/// The mirror: a preflight refusal happens before anything is written, so the
+/// destination must not be asked to undo a restore it never started.
+#[tokio::test]
+async fn a_refused_plan_does_not_ask_the_destination_to_undo_anything() {
+    let channel = TestChannel::pair();
+    let peer = channel.clone();
+    let source = MockSource {
+        fp: "stable".into(),
+        payload: vec![7; 64],
+    };
+    let source_task =
+        tokio::spawn(
+            async move { session::run_source(&source, &*channel, &Progress::default()).await },
+        );
+    let destination_task = tokio::spawn(async move {
+        let mut no = |_: &BackupPlan| false;
+        let destination = AbandonRecordingDest::default();
+        let result =
+            session::run_destination(&destination, &*peer, &Progress::default(), &mut no).await;
+        (result, destination)
+    });
+
+    let (result, destination) = destination_task.await.unwrap();
+    result.expect_err("a refused plan must fail the destination");
+    let _ = source_task.await.unwrap();
+    assert_eq!(
+        destination
+            .abandoned
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing was applied, so there was nothing to undo"
     );
 }

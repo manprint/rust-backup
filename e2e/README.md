@@ -12,6 +12,7 @@ return non-zero on any failure.
 | `transport_netns_test.sh` | T-NET1 | 1 | direct path, setup fallback, active-loss fail-safe |
 | `postgres_introspect.sh` | T-PG-INTROSPECT | 2.2 | seed a pg, run the gated live introspection test |
 | `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT | 2.8 | pg 10..18 same/cross-major restore + catalog/data proof + abort immutability |
+| `postgres_large_table.sh` | T-PG-RSS | 3.4 | one 2 GiB table end to end, peak RSS of both peers sampled and capped |
 | `mongodb_matrix.sh` | — | 3 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite |
 | `filesystem_netns_test.sh` | T-FS-OWN, T-FS-IMMUT | 4 | ownership (root vs non-root) + immutability |
 | `filesystem_disk_full.sh` | T-FS-ENOSPC | F2.4 | real ext4 ENOSPC, abort propagation, cleanup + immutability |
@@ -76,7 +77,9 @@ Environment switches the scripts read:
 | `RUST_BACKUP_E2E_KEEP` | `0` | most | keep the temporary work directory and print its path |
 | `RUST_BACKUP_AWS_E2E` | `0` | `s3_aws_test.sh` | opt in to the real-AWS smoke; without it the script prints SKIP |
 | `RB_PG_IMAGE_REPO` | `postgres` | `postgres_matrix.sh` | set to `postgis/postgis` to run the `M-PG-GIS-*` rows; the tag per major is resolved by `postgis_tag` and a major with no such image exits 77 (SKIP) |
-| `RB_PG_NOTEMP_MODE` | `warn` | `postgres_matrix.sh` | `strict` turns the I-NOTEMP row from SKIP into a failure (enforced from phase 3 § 3.3) |
+| `RB_PG_NOTEMP_MODE` | `warn` | `postgres_matrix.sh` | `strict` turns the I-NOTEMP row from SKIP into a failure. Since § 3.3 the fingerprint no longer sorts; what still spills is the data stream's `ORDER BY`, which the read-back depends on |
+| `RUST_BACKUP_PG_LARGE_ROWS` | `2000000` | `postgres_large_table.sh` | rows in the single large table (about 1 KiB each) |
+| `RUST_BACKUP_RSS_LIMIT_KIB` | `262144` | `postgres_large_table.sh`, `bandwidth_netem.sh` | per-process peak-RSS cap |
 
 Database arguments accept `source:destination`, for example:
 

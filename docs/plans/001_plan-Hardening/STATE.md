@@ -43,13 +43,13 @@ that state as `wip(<id>): <what remains>`.
 ## 1. Current unit
 
 - **Type:** `sub-phase`
-- **ID:** 3.1
+- **ID:** 4.1
 - **Status:** `none`
-- **Intent:** formal review checklist and runtime-model documentation for the postgres module
-- **Phase:** phase_04.md — Phase 3
-- **Next action:** open 3.1 per phase_04.md: review checklist, docs/modules/POSTGRES.md runtime model
+- **Intent:** formal threat model: docs/IMMUTABILITY.md
+- **Phase:** phase_05.md — Phase 4
+- **Next action:** read phase_05.md § 4.1
 - **Assigned:** `agent:opus`
-- **Repo state:** phase 2 committed on dev
+- **Repo state:** phase 3 committed on dev
 
 ## 2. Feature context (self-contained recap)
 
@@ -134,6 +134,12 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | 15 | sub-phase | 2.2 | `agent:opus` | constraint validity, deferrability and comment captured, emitted verbatim and compared; a state/definition disagreement is refused | model.rs, introspect.rs, ddl.rs, dest.rs, verification.rs, postgres_matrix.sh, POSTGRES.md | gates.sh PASS; postgres_matrix.sh 16 12 => 224 pass, 0 fail (CONSTR-STATE, CONSTR-NOT-VALID-ROW green) | `6e2d810` |
 | 16 | sub-phase | 2.3 | `agent:opus` | the destination prints what it proved under RESTORE VERIFIED: rows verified, constraints, one line per declared deviation; same facts as structured fields | verification.rs, session.rs, lib.rs, dest.rs, postgres_matrix.sh, 03-postgres.md, 11-codici-uscita.md, POSTGRES.md | gates.sh PASS; postgres_matrix.sh 16 => 115 pass, 0 fail (ROWS-LINE, CONSTR-LINE, EXT-08 green); relay_smoke PASS=5 FAIL=0; session_two_targets PASS | `6e2d810` |
 | 17 | sub-phase | 2.4 | `agent:opus` | README documents the verification lines and the row-count refusal; CONSTR-STATE stops comparing partition FK clone names across majors | README.md, postgres_matrix.sh | gates.sh PASS; full_matrix.sh (RUST_BACKUP_FULL_DB_MATRIX=1) 12 pass 1 fail => after the fix postgres_matrix.sh 16:18 12:16 => 228/0 and 10:18 14:17 => 217/0 | `6e2d810` |
+| 18 | sub-phase | 3.1 | `agent:opus` | runtime-model review a-j written into POSTGRES.md with anchors; two phase tags fixed (matview count and item framing were Verify inside apply) | dest.rs, POSTGRES.md | gates.sh PASS (98 rb-postgres unit tests, 2 new) | uncommitted |
+| 19 | sub-phase | 3.2 | `agent:opus` | one pooled read-only connection per database for every source phase; lock_timeout/idle timeouts and TCP keepalives; T-PG-CONN and T-PG-TIMEOUT | connect.rs, introspect.rs, immutability.rs, source.rs, lib.rs, dest.rs, lib.sh, postgres_matrix.sh, fault_matrix.sh, POSTGRES.md, 03-postgres.md | gates.sh PASS (101 rb-postgres tests); matrix 10..18 => 1025 pass, 0 fail; fault_matrix postgres => CASES=5 PASS=15 FAIL=0 | uncommitted |
+| 20 | sub-phase | 3.3 | `agent:opus` | fingerprint v2: order-independent 128-bit row commitment folded client-side, no server sort and no second COUNT(*) — PG9b closed | immutability.rs, POSTGRES.md, postgres_matrix.sh | gates.sh PASS (108 rb-postgres tests, 7 new); matrix 10 16 => 221 pass, 0 fail with IMMUT-ABORT/FULL/READONLY-LOG green; source temp files per case 12 => 6 (the rest is the data stream's sort) | uncommitted |
+| 21 | sub-phase | 3.4 | `agent:opus` | e2e/postgres_large_table.sh: one 2 GiB table end to end with both peers' peak RSS sampled and capped at 256 MiB; CI job postgres-large | postgres_large_table.sh, e2e.yml, e2e/README.md, QA_GUIDE.md | gates.sh PASS; ShellCheck PASS; actionlint 1.7.12 clean; T-PG-RSS on 16 => 5 pass, 0 fail (source 14056 KiB, destination 22592 KiB) | uncommitted |
+| 22 | sub-phase | 3.5 | `agent:opus` | abort and race proofs: destination kill, concurrent writer, source kill, refused plan — and the product fix they found (a run that fails after apply now removes the databases it created) | module.rs, session.rs, dest.rs, lib.rs, session_test.rs, fault_matrix.sh, POSTGRES.md | gates.sh PASS (18 rb-core session tests, 2 new); fault_matrix.sh postgres => CASES=8 PASS=21 FAIL=0; fault_matrix.sh (all) => CASES=28 PASS=69 FAIL=0 | uncommitted |
+| 23 | sub-phase | 3.6 | `agent:opus` | README: lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes and exit 6 | README.md | gates.sh PASS; closing matrix 10..18 => 1025 pass, 0 fail; relay_smoke PASS; session_two_targets PASS | uncommitted |
 
 ## 5. Files touched
 
@@ -216,6 +222,34 @@ otherwise — with WIP commits off this skill does not commit on its own, so
 | `docs/modules/POSTGRES.md` | the printed lines documented under the read-back proof | 2.3 |
 | `README.md` | the verification block gained the rows/constraints lines and the row-count mismatch remedy | 2.4 |
 | `e2e/postgres_matrix.sh` | CONSTR-STATE excludes partition FK clones (cross-major naming) | 2.4 |
+| `crates/rb-postgres/src/dest.rs` | matview_count_error / item_end_mismatch helpers, both Phase::Apply | 3.1 |
+| `docs/modules/POSTGRES.md` | new section "Runtime model and guardrails" (items a-j) | 3.1 |
+| `crates/rb-postgres/src/connect.rs` | SourcePool, session_timeout_options, keepalives | 3.2 |
+| `crates/rb-postgres/src/introspect.rs` | introspect_cluster / gather_row_counts take the pool | 3.2 |
+| `crates/rb-postgres/src/immutability.rs` | fingerprint takes the pool | 3.2 |
+| `crates/rb-postgres/src/source.rs` | stream_out takes the pool, one guard per COPY | 3.2 |
+| `crates/rb-postgres/src/lib.rs` | PostgresSource owns the pool; verify uses a destination-side read pool | 3.2 |
+| `crates/rb-postgres/src/dest.rs` | verify_catalog re-introspects through a pool | 3.2 |
+| `e2e/lib.sh` | rb_pg_watch_connections + rb_pg_assert_connections | 3.2 |
+| `e2e/postgres_matrix.sh` | CONN-BUDGET row sampled during the transfer | 3.2 |
+| `e2e/fault_matrix.sh` | pg-lock-timeout case (T-PG-TIMEOUT) | 3.2 |
+| `docs/modules/POSTGRES.md` | "Connections, timeouts and keepalives" | 3.2 |
+| `docs/usage/03-postgres.md` | "Lock, timeout e connessioni" | 3.2 |
+| `crates/rb-postgres/src/immutability.rs` | RowCommitment fold, TableStat{rows,commitment}, prefix v2, no COUNT(*) | 3.3 |
+| `docs/modules/POSTGRES.md` | new "The source fingerprint" section; Limits bullet now names the data sort only | 3.3 |
+| `e2e/postgres_matrix.sh` | NOTEMP reason updated | 3.3 |
+| `e2e/postgres_large_table.sh` | new: 2 GiB table, VmHWM sampling, rows-verified and proof assertions | 3.4 |
+| `.github/workflows/e2e.yml` | job postgres-large (16, timeout 40) | 3.4 |
+| `e2e/README.md` | script row and the two new environment variables | 3.4 |
+| `docs/QA_GUIDE.md` | how the memory bound is proved | 3.4 |
+| `crates/rb-core/src/module.rs` | Destination::abandon() hook, default no-op | 3.5 |
+| `crates/rb-core/src/session.rs` | the destination run calls abandon() when it fails after apply | 3.5 |
+| `crates/rb-postgres/src/dest.rs` | RestoredRows.created_databases + abandon_created | 3.5 |
+| `crates/rb-postgres/src/lib.rs` | PostgresDestination records what it created and drops it in abandon() | 3.5 |
+| `crates/rb-core/tests/session_test.rs` | AbandonRecordingDest + the two hook tests | 3.5 |
+| `e2e/fault_matrix.sh` | pg-destination-kill, pg-concurrent-writer, pg-plan-rejected; RUST_BACKUP_E2E_KEEP honoured | 3.5 |
+| `docs/modules/POSTGRES.md` | "Failure behaviour" table | 3.5 |
+| `README.md` | lock timeout, connections, fingerprint cost and the source-mutation exit | 3.6 |
 
 ## 6. In-flight work
 none — tree consistent
@@ -251,6 +285,15 @@ none — tree consistent
 | § 2.4 full matrix | RUST_BACKUP_FULL_DB_MATRIX=1 `bash e2e/full_matrix.sh` | 12 passed, 1 failed — the single failure was CONSTR-STATE on 16:18 (partition FK clone naming); after the fix `postgres_matrix.sh 16:18 12:16` => 228 pass, 0 fail | 2026-09-16 |
 | § 2.4 cross pairs | bash e2e/postgres_matrix.sh 10:18 14:17 | PASS — 217 pass, 0 fail (the other two pairs after the CONSTR-STATE clone fix) | 2026-09-16 |
 | § 2.4 gates | bash scripts/gates.sh | PASS | 2026-09-16 |
+| § 3.1 gates | bash scripts/gates.sh | PASS (98 rb-postgres unit tests, 2 new review tests) | 2026-09-16 |
+| § 3.2 conn budget | bash e2e/postgres_matrix.sh 16 | PASS — 116 pass, 0 fail; CONN-BUDGET green (peak 1 connection, budget 3) | 2026-09-16 |
+| § 3.2 lock timeout | bash e2e/fault_matrix.sh postgres | PASS — CASES=5 PASS=15 FAIL=0; pg-lock-timeout fails in 30s, tagged [Analyze], retry succeeds | 2026-09-16 |
+| § 3.2 full range | bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18 | PASS — 1025 pass, 0 fail, 99 skip (CONN-BUDGET green on every major) | 2026-09-16 |
+| § 3.3 fingerprint v2 | bash e2e/postgres_matrix.sh 10 16 | PASS — 221 pass, 0 fail; IMMUT-ABORT/IMMUT-FULL/IMMUT-READONLY-LOG green on both; source temp files 12 => 6 per case | 2026-09-16 |
+| § 3.3 gates | bash scripts/gates.sh | PASS (108 rb-postgres unit tests, 7 new) | 2026-09-16 |
+| § 3.4 large table | bash e2e/postgres_large_table.sh 16 | PASS — 5 pass, 0 fail; peak RSS source 14056 KiB, destination 22592 KiB, cap 262144 KiB; 2000000 rows verified | 2026-09-16 |
+| § 3.5 fault matrix | bash e2e/fault_matrix.sh postgres, then all groups | PASS — postgres CASES=8 PASS=21 FAIL=0; full run CASES=28 PASS=69 FAIL=0 | 2026-09-16 |
+| phase 3 closing matrix | bash e2e/postgres_matrix.sh 10 11 12 13 14 15 16 17 18 | PASS — 1025 pass, 0 fail, 99 skip; CONN-BUDGET green on all nine majors; relay_smoke and session_two_targets PASS | 2026-09-16 |
 
 **Failing output (verbatim, trimmed to the error):**
 ```
@@ -295,11 +338,17 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 | 28 | verification_block_existing_lines_unchanged does a golden string comparison of the pre-existing lines | it asserts the four pre-existing report fields (items, bytes, blake3, detail) verbatim and that extra_lines() is empty for a module that counts none of the new facts | the headline record is a tracing event with structured fields; capturing it would mean adding tracing-subscriber as a dev-dependency of rb-core to prove a call site the change never edited | none — relay_smoke and session_two_targets prove the block format live |
 | 29 | README "Troubleshooting" gains the row-count message | the message went into the "PostgreSQL backup" section, next to the extension-version refusal it sits beside operationally | the README has no Troubleshooting section (same finding as deviation 20 for "Limitations"); inventing one for a single message would fragment the module section | none — 6.1-6.4 audit the README against the sections it actually has |
 | 30 | § 2.2 CONSTR-STATE compares every c_con_% constraint on both sides | it excludes partition FK clones (conparentid <> 0), like the § 1.3 oracle already did | PostgreSQL >= 17 names a partitioned FK clone <parent>_<n> (c_con_07_1), which matches the fixture prefix, while <= 16 names it after the table; the 16:18 pair failed on names the server chose, not on state | none — the parent constraint is still compared in full; found by the phase 2 regression run, fixed in § 2.4 |
+| 31 | item (a): grep connect_admin usages, must be destination only | the read-write constructor is PgConnection::connect; connect_admin does not exist | the plan recon named a function the module never had; the property is the same and holds | none — 3.2 touches connect.rs and uses the real names |
+| 32 | R7: keepalives_interval / keepalives_retries may need a newer tokio-postgres 0.7.x | RESOLVED — the locked 0.7.18 exposes keepalives, keepalives_idle, keepalives_interval and keepalives_retries; all four are set | checked the vendored source of the locked version (config.rs:467-516) instead of assuming | none — no dependency bump needed |
+| 33 | T-PG-CONN asserts rb_pg_assert_connections <src> <user> 3 after the run | a background watcher samples pg_stat_activity during the transfer and the assertion judges the peak afterwards | connections only exist while the run does; an assertion taken after it would always read zero | harness-only; CONN-BUDGET is a matrix row and reads a samples file |
+| 34 | T-PG-TIMEOUT locks mx.t_tab_01 and expects the destination to clean up | it locks app.rows (the fault fixture's own table) and runs the source alone, asserting that no database was created | the fault matrix has its own faultdb fixture, and the lock fails the run during Analyze — before the source registers the channel — so a destination would only sit out its registration timeout | none — the case additionally proves the same run succeeds once the lock is released |
+| 35 | T-PG-FP2: zero `temporary file` lines on the source during the matrix run; remove the pgsql_tmp Limits bullet | the fingerprint no longer spills (12 => 6 files per case on 16), the data stream still does; the Limits bullet was rewritten instead of removed and NOTEMP stays in reporting mode | the spill has two sources and § 3.3 only owns one: the data stream sorts by the C-collated row text so that the destination read-back reproduces the per-item BLAKE3, which a partitioned parent (read in a different physical order on the two sides) would otherwise break | T-PG-FP2 is partially met and recorded as such in § 9; removing the data sort needs the read-back to compare a commitment instead of the streamed bytes — a transport-level change no phase of this plan owns |
+| 36 | § 3.5 touches crates/*.rs only if a case fails | a case did: the concurrent-writer run left the restored database behind, so rb-core gained a defaulted Destination::abandon() hook and the postgres destination drops what the run created | the cleanup only covered failures during apply; a source that mutates (or a read-back that fails) is reported after the load, and left a complete-looking, uncertified database — exactly what the module documents it never leaves | additive trait method with a default no-op, so mongodb, s3 and filesystem are unchanged; phase 4/5 may implement it for their modules |
 
 ## 9. Blockers and open questions
 
 - No user-deferred question — the user adopted every recommended default at the clarification gate (D11-D27).
-- `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; R7 `tokio-postgres 0.7.x` keepalive setters (fallback `keepalives` + `keepalives_idle`) — § 3.2; R8 MinIO policy action names (fallback `s3:Get*` + `s3:ListBucket`) — § 4.7; R9 `mongod --profile 0 --slowms 0` JSON logging on 4.4..8 — § 4.7.
+- `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; ~~R7 `tokio-postgres 0.7.x` keepalive setters~~ **RESOLVED § 3.2**: the locked 0.7.18 exposes all four (`keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`); R8 MinIO policy action names (fallback `s3:Get*` + `s3:ListBucket`) — § 4.7; R9 `mongod --profile 0 --slowms 0` JSON logging on 4.4..8 — § 4.7.
 - Phase 1 § 1.3 status of the § 1.2 FAIL list (runs on 16, 10, 12, 18):
   - M-PG-VIEW-04, M-PG-VIEW-05, M-PG-MV-05 — **FIXED** (view/matview `reloptions` captured and emitted).
   - M-PG-IDX-18 — **FIXED** (index comments were captured but never emitted; found by the read-back).
@@ -310,9 +359,14 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
   - A harness defect found while closing § 1.4: `run_transfer`'s `source-only` mode discarded the
     source's exit code, so all 14 `M-PG-REF-*` rows failed with "the source produced a plan for a
     refused object". Fixed (§ 8 row 4); `bash e2e/postgres_matrix.sh 16` is now 109 pass, 0 fail.
-  - `NOTEMP` — the source still sorts every COPY and spills with the fixture's 4 MB `work_mem`.
-    The runner reports it as a SKIP until phase 3 § 3.3 lands the commutative fingerprint
-    (`RB_PG_NOTEMP_MODE=strict` enforces it today).
+  - `NOTEMP` — **partially closed by § 3.3**. The fingerprint now folds an order-independent
+    commitment and no longer sorts: temporary files per case on 16 went from 12 to 6. The rest is
+    the *data* stream's `ORDER BY (ROW(cols)::text) COLLATE "C"`, which the destination read-back
+    depends on — it reproduces the source's per-item BLAKE3 by re-running the same ordered query,
+    and a partitioned parent is read in a different physical order on the two sides. Removing it
+    needs the read-back to compare an order-independent commitment instead of the streamed bytes,
+    which is a transport/verification change no sub-phase of this plan owns. The runner keeps
+    reporting `NOTEMP` as a SKIP (`RB_PG_NOTEMP_MODE=strict` enforces it today).
 - Phase 1 § 1.2 FAIL rows, input for § 1.3 (first run of the new runner, `bash e2e/postgres_matrix.sh 16`):
   - **M-PG-VIEW-04, M-PG-VIEW-05, M-PG-MV-05** — `find_unsupported_objects` refuses any view or
     materialized view carrying `reloptions`, so the whole run is refused at Analyze:
@@ -344,7 +398,7 @@ disagree with §1 and §4.
 | 0 — Harness foundation | phase_01.md | `DONE` | 0.1-0.5 closed; harness additive, nothing wired into gates.sh yet |
 | 1 — PostgreSQL fidelity matrix | phase_02.md | `DONE` | 1.1-1.8 closed; plain matrix 1396 pass / 0 fail and PostGIS 901 pass / 0 fail |
 | 2 — Restore validation | phase_03.md | `DONE` | 2.1-2.4 closed; matrix 0 fail on 10,12,14,16,18 and every cross pair; full_matrix green after the CONSTR-STATE clone fix |
-| 3 — PostgreSQL latent defects | phase_04.md | `TODO` | 3.1-3.6 |
+| 3 — PostgreSQL latent defects | phase_04.md | `DONE` | 3.1-3.6 closed; pooled connections, timeouts, fingerprint v2, RSS proof, abort/race proofs (one product fix: abandon) |
 | 4 — Source immutability guardrails | phase_05.md | `TODO` | 4.1-4.9 |
 | 5 — Filesystem deep verification | phase_06.md | `TODO` | 5.1-5.6 |
 | 6 — Documentation audit and parity gate | phase_07.md | `TODO` | 6.1-6.5 |
@@ -367,12 +421,12 @@ A `SKIPPED` sub-phase or phase keeps its row and carries the reason.
 | T-PG-ROWS | e2e | `PASS` | no `row-count verification skipped` warning and the destination prints `rows verified:` / `constraints:` (§ 2.1, 2.3) |
 | T-PG-ROWS-NEG | e2e | `PASS` | `fault_matrix.sh postgres` case `pg-row-count-mismatch`: exit 5, `source counted` in the destination log, database removed (§ 2.1) |
 | T-PG-CONSTR | e2e | `PASS` | `convalidated`/deferrable state identical; NOT VALID FK stays NOT VALID with violating row (§ 2.2) |
-| T-PG-CONN | e2e | `TODO` | `<= 3` source connections per single-database run (§ 3.2) |
-| T-PG-TIMEOUT | e2e | `TODO` | exclusively locked table => phase-tagged `lock timeout` failure within 90 s (§ 3.2) |
-| T-PG-FP2 | e2e | `TODO` | zero `temporary file` lines on the source during the matrix run (§ 3.3) |
-| T-PG-RSS | e2e | `TODO` | 2 GiB table, peak RSS < 256 MiB on both sides (§ 3.4) |
-| T-PG-ABORT | e2e | `TODO` | destination kill, source kill, plan rejected: correct exits, after-audit ran, cleanup done (§ 3.5) |
-| T-PG-WRITER | e2e | `TODO` | concurrent writer => `SourceMutated` exit code (§ 3.5) |
+| T-PG-CONN | e2e | `PASS` | peak 1 source connection (boot and database coincide on a single-database run), budget 3 — green on 10..18 (§ 3.2) |
+| T-PG-TIMEOUT | e2e | `PASS` | `pg-lock-timeout`: fails in 30 s with the server message, tagged [Analyze], and the same run succeeds once the lock is released (§ 3.2) |
+| T-PG-FP2 | e2e | `PARTIAL` | the fingerprint no longer sorts or spills (12 => 6 temp files per case); the remaining spill is the data stream sort, see § 9 (§ 3.3) |
+| T-PG-RSS | e2e | `PASS` | 2 GiB table: peaks 14056 KiB (source) and 22592 KiB (destination), cap 262144 KiB (§ 3.4) |
+| T-PG-ABORT | e2e | `PASS` | destination kill, source kill and refused plan: correct exits, failure-path audit ran, created databases dropped (§ 3.5) |
+| T-PG-WRITER | e2e | `PASS` | `pg-concurrent-writer`: exit 6, SOURCE-IMMUTABILITY VIOLATION, and the uncertified database is removed (§ 3.5) |
 | T-IMMUT-PG-LP | e2e | `TODO` | source runs as `rb_ro`; log allowlist passes on 10, 13, 14, 18 (§ 4.7) |
 | T-IMMUT-MONGO-LP | e2e | `TODO` | source runs as `read` role; no write command in mongod log on 4 and 8 (§ 4.7) |
 | T-IMMUT-S3-LP | e2e | `TODO` | source runs with Get/List-only MinIO policy (§ 4.7) |
@@ -397,12 +451,12 @@ other docs get their own rows.
 | README.md | 0 | `DONE (no user-visible change)` | no user-visible change — verify accuracy (§ 0.5) |
 | README.md | 1 | `DONE` | extension configuration tables, the version refusal message, `--extension-version default` example and the reported deviation, PostGIS e2e command (§ 1.8) |
 | README.md | 2 | `DONE` | the `rows verified:` / `constraints:` lines with their meaning, and the row-count refusal with its remedy (§ 2.4) |
-| README.md | 3 | `TODO` | lock timeout, connections, fingerprint cost (§ 3.6) |
+| README.md | 3 | `DONE` | lock-timeout message and remedy, connections and keepalives, the two fingerprint read passes, exit 6 (§ 3.6) |
 | README.md | 4 | `TODO` | source safety section, least-privilege recipes, `--allow-atime-updates` (§ 4.9) |
 | README.md | 5 | `TODO` | filesystem entries preserved/refused, capabilities, troubleshooting (§ 5.6) |
 | README.md | 6 | `TODO` | final full read (§ 6.5) |
 | docs/testing/POSTGRES_MATRIX.md, FILESYSTEM_MATRIX.md | 0, 1, 5, 6 | `IN_PROGRESS` | created § 0.1 (106 + 32 rows); `Fixture file` column filled § 1.1/1.6/5.2; reconciled § 6.3 |
-| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", row counts, constraint state and the printed proof written (§ 1.3-1.5, 2.1-2.3); runtime model and Limits still owed by phases 3 and 6 |
+| docs/modules/POSTGRES.md | 1, 2, 3, 6 | `IN_PROGRESS` | supported objects, "Extension versions", the printed proof, "Runtime model and guardrails", "Connections, timeouts and keepalives", "The source fingerprint" and "Failure behaviour" written (§ 1.3-1.5, 2.1-2.3, 3.1-3.5); Limits reconciled in § 6.3 |
 | docs/modules/FILESYSTEM.md | 4, 5, 6 | `TODO` | atime rule, special files, TOCTOU guarantee, fingerprint cost |
 | docs/modules/MONGODB.md, S3.md | 4, 6 | `TODO` | Immutability paragraphs |
 | docs/IMMUTABILITY.md | 4, 6 | `TODO` | created § 4.1; evidence markers removed § 4.7; reconciled § 6.3 |

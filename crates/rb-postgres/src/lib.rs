@@ -18,6 +18,7 @@ mod introspect;
 mod model;
 mod source;
 
+use connect::SourcePool;
 pub use connect::{parse_major, PgConnection, MIN_PG_MAJOR};
 pub use model::PgPlanPayload;
 
@@ -151,48 +152,56 @@ impl BackupModule for Module {
 
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {
         let pg_params: PostgresParams = params.deserialize()?;
-        Ok(Box::new(PostgresSource { params: pg_params }))
+        Ok(Box::new(PostgresSource {
+            pool: SourcePool::new(pg_params),
+        }))
     }
 
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>> {
         let pg_params: PostgresParams = params.deserialize()?;
         Ok(Box::new(PostgresDestination {
             params: pg_params,
+            created_databases: std::sync::Mutex::new(Vec::new()),
             table_rows: AtomicU64::new(0),
             derived_rows: AtomicU64::new(0),
         }))
     }
 }
 
-/// PostgreSQL source (read-only).
+/// PostgreSQL source (read-only). Owns the connection pool every phase of the
+/// run borrows from, so a whole backup costs one boot connection plus one per
+/// database instead of one per phase.
 struct PostgresSource {
-    params: PostgresParams,
+    pool: SourcePool,
 }
 
 #[async_trait]
 impl Source for PostgresSource {
     async fn analyze(&self) -> Result<BackupPlan> {
-        let mut payload = introspect::introspect_cluster(&self.params).await?;
+        let mut payload = introspect::introspect_cluster(&self.pool).await?;
         // Counted here and not inside `introspect_cluster`: the same
         // introspection runs on both fingerprint audits and on the
         // destination's read-back, and none of those needs a second full scan
         // of every table.
-        introspect::gather_row_counts(&self.params, &mut payload).await?;
+        introspect::gather_row_counts(&self.pool, &mut payload).await?;
         Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
     }
 
     async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
-        source::stream_out(&self.params, plan, sink).await
+        source::stream_out(&self.pool, plan, sink).await
     }
 
     async fn fingerprint(&self) -> Result<String> {
-        immutability::fingerprint(&self.params).await
+        immutability::fingerprint(&self.pool).await
     }
 }
 
 /// PostgreSQL destination (restore).
 struct PostgresDestination {
     params: PostgresParams,
+    /// Databases this run created, recorded while applying so that a failure
+    /// after the load can still remove exactly them (`abandon`).
+    created_databases: std::sync::Mutex<Vec<String>>,
     /// Rows written by the restore, handed from `stream_in` to `verify` — the
     /// trait hands the report back in a later call, and these are counted while
     /// applying. Atomics rather than a mutex: two counters, no poisoning.
@@ -211,7 +220,24 @@ impl Destination for PostgresDestination {
         self.table_rows.store(rows.table_rows, Ordering::Relaxed);
         self.derived_rows
             .store(rows.derived_rows, Ordering::Relaxed);
+        // A poisoned lock here would mean another task panicked while holding
+        // it; the restore itself is single-threaded, and losing the list would
+        // only cost the cleanup, so the run is not failed for it.
+        if let Ok(mut created) = self.created_databases.lock() {
+            *created = rows.created_databases;
+        }
         Ok(())
+    }
+
+    /// The load succeeded and the run failed anyway (the read-back said no, or
+    /// the source changed under us): what is on disk looks complete and is not
+    /// certified, so it goes.
+    async fn abandon(&self) {
+        let created = match self.created_databases.lock() {
+            Ok(created) => created.clone(),
+            Err(_) => return,
+        };
+        dest::abandon_created(&self.params, &created).await;
     }
 
     async fn verify(
@@ -221,7 +247,10 @@ impl Destination for PostgresDestination {
     ) -> Result<VerificationReport> {
         let catalog = dest::verify_catalog(&self.params, plan).await?;
         let mut verifier = VerificationSink::new(evidence);
-        source::stream_out(&self.params, plan, &mut verifier)
+        // The read-back runs the source path against the destination, on its
+        // own read-only pool — it can never reach the source host.
+        let read_back = SourcePool::new(self.params.clone());
+        source::stream_out(&read_back, plan, &mut verifier)
             .await
             .map_err(|error| {
                 BackupError::phase_src(

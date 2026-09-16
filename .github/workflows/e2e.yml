@@ -101,6 +101,24 @@ jobs:
           DATABASE_VERSION: ${{ matrix.version }}
         run: bash e2e/postgres_matrix.sh "$DATABASE_VERSION"
 
+  postgres-large:
+    name: PostgreSQL large table (RSS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-e2e-pg-large-${{ hashFiles('Cargo.lock') }}
+      - run: bash e2e/postgres_large_table.sh 16
+
   postgres-cross-version:
     name: PostgreSQL ${{ matrix.pair }}
     runs-on: ubuntu-24.04

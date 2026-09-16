@@ -27,9 +27,10 @@ use tokio_postgres::Client;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
 
+use crate::connect::SourcePool;
 use crate::ddl::quote_qualified;
 use crate::model::*;
-use crate::{PgConnection, PostgresParams};
+use crate::PostgresParams;
 
 fn analyze_err(ctx: &str, e: tokio_postgres::Error) -> BackupError {
     BackupError::phase_src(Phase::Analyze, format!("introspect: {ctx}"), e)
@@ -37,21 +38,33 @@ fn analyze_err(ctx: &str, e: tokio_postgres::Error) -> BackupError {
 
 /// Connect read-only and build the full cluster payload: cluster-global roles /
 /// memberships / tablespaces, then each target database's object tree.
-pub async fn introspect_cluster(params: &PostgresParams) -> Result<PgPlanPayload> {
-    let boot = PgConnection::connect_read_only(params, &params.bootstrap_database()).await?;
-    let server_version = boot.server_version.clone();
-    let server_major = boot.server_major;
-
-    let roles = gather_roles(&boot.client).await?;
-    let memberships = gather_memberships(&boot.client).await?;
-    let tablespaces = gather_tablespaces(&boot.client).await?;
-    let names = target_database_names(params, &boot.client).await?;
-    let mut databases = gather_databases_meta(&boot.client, &names, server_major).await?;
-    drop(boot);
+pub async fn introspect_cluster(pool: &SourcePool) -> Result<PgPlanPayload> {
+    let params = pool.params();
+    let (server_version, server_major, roles, memberships, tablespaces, names) = {
+        let boot = pool.get(None).await?;
+        let roles = gather_roles(&boot.client).await?;
+        let memberships = gather_memberships(&boot.client).await?;
+        let tablespaces = gather_tablespaces(&boot.client).await?;
+        let names = target_database_names(params, &boot.client).await?;
+        (
+            boot.server_version.clone(),
+            boot.server_major,
+            roles,
+            memberships,
+            tablespaces,
+            names,
+        )
+    };
+    let mut databases = {
+        // The guard is taken again rather than held across the block above:
+        // one pool call at a time is what keeps `SourcePool` deadlock-free.
+        let boot = pool.get(None).await?;
+        gather_databases_meta(&boot.client, &names, server_major).await?
+    };
 
     // Per-database trees require a connection to each database.
     for db in &mut databases {
-        let conn = PgConnection::connect_read_only(params, &db.name).await?;
+        let conn = pool.get(Some(&db.name)).await?;
         db.extensions = gather_extensions(&conn.client).await?;
         db.extension_configs = gather_extension_configs(&conn.client).await?;
         db.schemas = gather_schemas(&conn.client, server_major).await?;
@@ -1127,7 +1140,7 @@ pub(crate) fn count_sql(schema: &str, table: &str, only: bool, condition: Option
 /// cannot prove that nothing was left behind. The count is the other half, and
 /// it is taken on the source's read-only connection during `analyze`, in
 /// exactly the scope the item streams.
-pub async fn gather_row_counts(params: &PostgresParams, payload: &mut PgPlanPayload) -> Result<()> {
+pub async fn gather_row_counts(pool: &SourcePool, payload: &mut PgPlanPayload) -> Result<()> {
     let delta = expected_rows_delta();
     let shift = |value: i64| Some(value.saturating_add(delta).max(0));
 
@@ -1138,7 +1151,7 @@ pub async fn gather_row_counts(params: &PostgresParams, payload: &mut PgPlanPayl
             .flat_map(|s| s.tables.iter())
             .flat_map(|t| t.inherits.iter().cloned())
             .collect();
-        let conn = PgConnection::connect_read_only(params, &db.name).await?;
+        let conn = pool.get(Some(&db.name)).await?;
 
         for schema in &mut db.schemas {
             for table in &mut schema.tables {

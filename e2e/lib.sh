@@ -516,6 +516,37 @@ rb_pg_assert_connections() { # container user max
   echo "connection count for $user: $count (max $max)"
 }
 
+# T-PG-CONN. Connection count is a property of a *running* transfer, so it is
+# sampled while the transfer runs and judged afterwards. Only sessions whose
+# `application_name` is the tool are counted: the harness's own psql calls, and
+# anything else on the server, are not ours to bound.
+rb_pg_watch_connections() { # container user outfile  (run in the background)
+  local container=$1 user=$2 out=$3
+  : >"$out"
+  while :; do
+    docker exec "$container" psql -U postgres -At -c \
+      "SELECT count(*) FROM pg_stat_activity
+        WHERE usename = '$user' AND application_name = 'rust-backup'" 2>/dev/null >>"$out"
+    sleep 0.5
+  done
+}
+
+# The peak the watcher saw, against the documented budget (1 boot + 1 per
+# database + 1 of tolerance for the moment a connection is being replaced).
+rb_pg_assert_connections() { # samples-file max
+  local out=$1 max=$2 peak
+  peak=$(grep -E '^[0-9]+$' "$out" 2>/dev/null | sort -n | tail -n1)
+  if [[ -z ${peak:-} ]]; then
+    echo "FAIL: no connection samples were taken" >&2
+    return 1
+  fi
+  if (( peak > max )); then
+    echo "FAIL: the source held $peak concurrent connections, budget is $max" >&2
+    return 1
+  fi
+  echo "peak source connections: $peak (budget $max)"
+}
+
 rb_pg_assert_no_temp_files() { # container
   local container=$1 hits
   hits=$(docker logs "$container" 2>&1 | grep -c 'temporary file:' || true)

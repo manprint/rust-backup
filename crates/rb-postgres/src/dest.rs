@@ -277,17 +277,74 @@ pub async fn stream_in(
             remove_partially_restored(&boot.client, &payload, &preexisting).await;
             Err(error)
         }
-        Ok(rows) => Ok(rows),
+        Ok(mut rows) => {
+            // What this run brought into existence, so a failure *after* the
+            // load — a read-back that says no, or a source that mutated under
+            // us — can still remove exactly that and nothing else.
+            rows.created_databases = databases_to_remove(
+                payload.databases.iter().map(|db| db.name.as_str()),
+                &preexisting,
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            Ok(rows)
+        }
     }
 }
 
-/// What the restore actually wrote, per origin.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Drop the databases a failed run created, after the load already succeeded.
+/// Best effort, and loud about what it could not remove — the caller's error is
+/// the real outcome of the run.
+pub async fn abandon_created(params: &PostgresParams, created: &[String]) {
+    if created.is_empty() {
+        return;
+    }
+    let bootstrap = params.bootstrap_database();
+    // Never from inside a database that is about to be dropped.
+    let elsewhere = if created.iter().any(|name| name == &bootstrap) {
+        "postgres".to_string()
+    } else {
+        bootstrap
+    };
+    let boot = match PgConnection::connect(params, &elsewhere).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                databases = created.join(", ").as_str(),
+                "the restore was not certified and its databases could not be removed; \
+                 they hold an unverified copy — drop them with DROP DATABASE"
+            );
+            return;
+        }
+    };
+    for name in created {
+        match drop_database_for_overwrite(&boot.client, name).await {
+            Ok(()) => tracing::warn!(
+                database = %name,
+                "the restore was not certified; removed the database this run created"
+            ),
+            Err(error) => tracing::error!(
+                database = %name,
+                %error,
+                "the restore was not certified and the database could not be removed; \
+                 it holds an unverified copy — drop it with DROP DATABASE"
+            ),
+        }
+    }
+}
+
+/// What the restore actually wrote, per origin, plus what it created.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoredRows {
     /// Rows written by `COPY … FROM STDIN`.
     pub table_rows: u64,
     /// Rows a `REFRESH MATERIALIZED VIEW` produced on this side.
     pub derived_rows: u64,
+    /// Databases this run created, in the order of the plan. Empty when every
+    /// target database was already there.
+    pub created_databases: Vec<String>,
 }
 
 /// Steps 2–4 of the restore. Split out of [`stream_in`] so every `?` funnels
@@ -327,7 +384,30 @@ async fn restore_databases(
     Ok(RestoredRows {
         table_rows,
         derived_rows,
+        created_databases: Vec::new(),
     })
+}
+
+/// The refresh that produced these rows runs during apply, so a count that
+/// cannot be taken is an apply failure, not a verification one.
+fn matview_count_error<E>(schema: &str, name: &str, error: E) -> BackupError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    BackupError::phase_src(
+        Phase::Apply,
+        format!("count rows of materialized view {schema}.{name}"),
+        error,
+    )
+}
+
+/// Framing error while loading: the stream ended an item that is not the one
+/// being written, or with a different byte count. It happens inside apply.
+fn item_end_mismatch(item_id: u32, open_id: u32, received: u64) -> BackupError {
+    BackupError::phase(
+        Phase::Apply,
+        format!("ItemEnd item={item_id} does not match open item={open_id} bytes={received}"),
+    )
 }
 
 /// Count every populated materialized view on the destination and compare it
@@ -347,16 +427,11 @@ async fn check_matview_rows(
                     continue;
                 };
                 let sql = crate::introspect::count_sql(&view.schema, &view.name, false, None);
-                let row = conn.client.query_one(&sql, &[]).await.map_err(|e| {
-                    BackupError::phase_src(
-                        Phase::Verify,
-                        format!(
-                            "count rows of materialized view {}.{}",
-                            view.schema, view.name
-                        ),
-                        e,
-                    )
-                })?;
+                let row = conn
+                    .client
+                    .query_one(&sql, &[])
+                    .await
+                    .map_err(|e| matview_count_error(&view.schema, &view.name, e))?;
                 let actual = row.get::<_, i64>(0).max(0) as u64;
                 check_expected_rows(
                     &format!("materialized view {}.{}", view.schema, view.name),
@@ -465,7 +540,8 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     for (index, expected_db) in expected.databases.iter().enumerate() {
         let mut scoped = params.clone();
         scoped.database = Some(expected_db.name.clone());
-        let mut observed = crate::introspect::introspect_cluster(&scoped)
+        let observed_pool = crate::connect::SourcePool::new(scoped);
+        let mut observed = crate::introspect::introspect_cluster(&observed_pool)
             .await
             .map_err(|error| {
                 BackupError::phase_src(
@@ -1242,10 +1318,7 @@ async fn apply_data(
                     )
                 })?;
                 if *open_id != item_id || *received != total {
-                    return Err(BackupError::phase(
-                        Phase::Verify,
-                        format!("ItemEnd item={item_id} does not match open item={open_id} bytes={received}"),
-                    ));
+                    return Err(item_end_mismatch(item_id, *open_id, *received));
                 }
                 close_and_check!();
             }
@@ -1588,6 +1661,32 @@ mod tests {
     /// The read-back must name the constraint and the field that differs: a
     /// restore that dropped `NOT VALID` differs in one boolean, and "the
     /// catalogs differ" would not be actionable.
+    #[test]
+    fn review_g_matview_count_error_is_tagged_apply() {
+        let error = matview_count_error("mx", "mv_01", std::io::Error::other("connection closed"));
+        match error {
+            BackupError::Phase { phase, message, .. } => {
+                assert_eq!(phase, Phase::Apply);
+                assert!(message.contains("mx.mv_01"), "{message}");
+            }
+            other => panic!("expected a phase-tagged error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_g_item_end_mismatch_is_tagged_apply() {
+        match item_end_mismatch(7, 6, 128) {
+            BackupError::Phase { phase, message, .. } => {
+                assert_eq!(phase, Phase::Apply);
+                assert!(
+                    message.contains("item=7") && message.contains("bytes=128"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a phase-tagged error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn constraint_state_mismatch_is_reported_by_name() {
         let expected = crate::model::test_fixture();

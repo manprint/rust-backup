@@ -10,7 +10,11 @@
 //! [`postgres_tls`] for the root store, the optional private CA (`sslrootcert`)
 //! and what each mode does and does not check.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use rb_core::error::{BackupError, Phase, Result};
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -79,12 +83,17 @@ impl PgConnection {
             "-c extra_float_digits=3 -c DateStyle=ISO,MDY -c IntervalStyle=postgres \
              -c TimeZone=UTC -c bytea_output=hex -c lc_monetary=C",
         );
-        if read_only {
-            // Startup option: every transaction in this session is read-only, so
-            // an accidental write fails at the server (defensive I-IMMUT).
-            options.push_str(" -c default_transaction_read_only=on");
-        }
+        options.push_str(&session_timeout_options(read_only));
         cfg.options(&options);
+        // A half-open peer (a NAT that forgot the flow, a host that vanished)
+        // is invisible to a connection that is waiting for a reply: without
+        // keepalives a source blocked in `COPY` would wait forever instead of
+        // failing. The retries multiply the interval, so the socket gives up
+        // about 30 s after the last probe went unanswered.
+        cfg.keepalives(true)
+            .keepalives_idle(Duration::from_secs(30))
+            .keepalives_interval(Duration::from_secs(10))
+            .keepalives_retries(3);
 
         let client = connect_client(&mut cfg, params, database).await?;
 
@@ -103,6 +112,87 @@ impl PgConnection {
             client,
             server_version,
             server_major,
+        })
+    }
+}
+
+/// Session guardrails appended to the rendered startup options.
+///
+/// Source sessions read: they must never wait on someone else's lock, so
+/// `lock_timeout` bounds every read at 30 s, and an idle transaction of ours
+/// must not pin a snapshot — both are failures we want reported, not hangs.
+/// Statements themselves are not bounded: a `COPY` of a large table is
+/// legitimately long. A destination session writes DDL and refreshes
+/// materialized views, both of which legitimately take locks and time, so it
+/// sets neither timeout.
+fn session_timeout_options(read_only: bool) -> String {
+    if read_only {
+        // `default_transaction_read_only=on`: every transaction in this session
+        // is read-only, so an accidental write fails at the server (defensive
+        // I-IMMUT).
+        [
+            " -c default_transaction_read_only=on",
+            " -c lock_timeout=30s",
+            " -c statement_timeout=0",
+            " -c idle_in_transaction_session_timeout=0",
+        ]
+        .concat()
+    } else {
+        String::from(" -c statement_timeout=0")
+    }
+}
+
+/// One read-only connection per database, reused by every phase of a run.
+///
+/// Before this, a single-database run opened about nine connections — two for
+/// each introspection, three for each of the two fingerprint audits, one to
+/// stream — which a `max_connections`-constrained server counts against every
+/// other client. The pool keeps the boot connection and one per database.
+///
+/// **Never call [`SourcePool::get`] while holding a guard from the same pool**:
+/// the map is behind one mutex, so a nested call would deadlock. Every caller
+/// is sequential and drops its guard before asking for the next database.
+pub(crate) struct SourcePool {
+    params: PostgresParams,
+    conns: Mutex<HashMap<String, PgConnection>>,
+}
+
+/// A borrowed pooled connection. Held for one statement or one `COPY`.
+pub(crate) type PooledConn<'a> = MappedMutexGuard<'a, PgConnection>;
+
+impl SourcePool {
+    pub(crate) fn new(params: PostgresParams) -> Self {
+        Self {
+            params,
+            conns: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn params(&self) -> &PostgresParams {
+        &self.params
+    }
+
+    /// The connection for `database`, or for the bootstrap database when
+    /// `None`. A connection the driver has already closed (server restart,
+    /// killed backend) is replaced once rather than handed out dead.
+    pub(crate) async fn get(&self, database: Option<&str>) -> Result<PooledConn<'_>> {
+        let name = database
+            .map(str::to_string)
+            .unwrap_or_else(|| self.params.bootstrap_database());
+        let mut guard = self.conns.lock().await;
+        let stale = guard
+            .get(&name)
+            .map(|conn| conn.client.is_closed())
+            .unwrap_or(true);
+        if stale {
+            let conn = PgConnection::connect_read_only(&self.params, &name).await?;
+            guard.insert(name.clone(), conn);
+        }
+        MutexGuard::try_map(guard, |map| map.get_mut(&name)).map_err(|_| {
+            BackupError::phase(
+                Phase::Connect,
+                format!("pooled connection for database '{name}' disappeared"),
+            )
         })
     }
 }
@@ -245,6 +335,84 @@ mod tests {
         assert_eq!(parse_major(""), None);
         assert_eq!(parse_major("not-a-version"), None);
         assert_eq!(parse_major("beta"), None);
+    }
+
+    #[test]
+    fn read_only_options_include_lock_and_statement_timeouts() {
+        let options = session_timeout_options(true);
+        assert!(
+            options.contains("-c default_transaction_read_only=on"),
+            "{options}"
+        );
+        assert!(options.contains("-c lock_timeout=30s"), "{options}");
+        assert!(options.contains("-c statement_timeout=0"), "{options}");
+        assert!(
+            options.contains("-c idle_in_transaction_session_timeout=0"),
+            "{options}"
+        );
+    }
+
+    #[test]
+    fn destination_options_do_not_set_lock_timeout() {
+        // The destination takes locks on purpose (DDL, REFRESH): a lock timeout
+        // there would abort legitimate work, and a read-only default would
+        // abort all of it.
+        let options = session_timeout_options(false);
+        assert!(options.contains("-c statement_timeout=0"), "{options}");
+        assert!(!options.contains("lock_timeout"), "{options}");
+        assert!(
+            !options.contains("default_transaction_read_only"),
+            "{options}"
+        );
+    }
+
+    /// Live check that the pool hands out one connection per database instead
+    /// of opening a new one per call. Runs only against a real server.
+    #[tokio::test]
+    async fn pool_reuses_connection_per_database() {
+        let Some(params) = live_params() else {
+            eprintln!("SKIP pool_reuses_connection_per_database: set RUST_BACKUP_PG_HOST to run");
+            return;
+        };
+        let database = params.bootstrap_database();
+        let pool = SourcePool::new(params);
+        let first = {
+            let conn = pool.get(Some(&database)).await.expect("first connection");
+            backend_pid(&conn.client).await
+        };
+        let second = {
+            let conn = pool.get(Some(&database)).await.expect("second connection");
+            backend_pid(&conn.client).await
+        };
+        assert_eq!(first, second, "the pool opened a second backend");
+    }
+
+    async fn backend_pid(client: &Client) -> i32 {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0)
+    }
+
+    fn live_params() -> Option<PostgresParams> {
+        let host = std::env::var("RUST_BACKUP_PG_HOST").ok()?;
+        Some(PostgresParams {
+            allow_unsupported_objects: false,
+            host,
+            port: std::env::var("RUST_BACKUP_PG_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            user: std::env::var("RUST_BACKUP_PG_USER").unwrap_or_else(|_| "postgres".into()),
+            password: std::env::var("RUST_BACKUP_PG_PASSWORD").ok(),
+            database: std::env::var("RUST_BACKUP_PG_DATABASE").ok(),
+            sslmode: "prefer".into(),
+            sslrootcert: None,
+            admin: false,
+            overwrite: false,
+            extension_version: crate::ExtensionVersionPolicy::Source,
+        })
     }
 
     #[test]

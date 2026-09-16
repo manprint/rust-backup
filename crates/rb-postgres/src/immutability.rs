@@ -2,8 +2,9 @@
 //!
 //! [`fingerprint`] produces a stable digest of the source: a structural catalog
 //! hash (planner estimates normalized out, since autovacuum/ANALYZE moves them
-//! without user mutation) plus, per data-bearing table, an exact `COUNT(*)` and
-//! a complete deterministic content checksum. The session captures
+//! without user mutation) plus, per data-bearing table, an order-independent
+//! 128-bit commitment over its rows and the number of rows folded into it. The
+//! session captures
 //! it before and after every run and raises `BackupError::SourceMutated` on any
 //! drift (I-IMMUT). All queries are read-only, on a `connect_read_only` session.
 //!
@@ -15,10 +16,10 @@ use rb_core::error::{BackupError, Phase, Result};
 use rb_core::wire::blake3_hex;
 use tokio_postgres::Client;
 
+use crate::connect::SourcePool;
 use crate::ddl::quote_qualified;
 use crate::introspect;
 use crate::model::PgPlanPayload;
-use crate::{PgConnection, PostgresParams};
 
 /// Snapshot the source fingerprint composes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,14 +35,79 @@ pub struct SourceFingerprint {
 pub struct TableStat {
     /// `database.schema.table`.
     pub name: String,
-    pub rows: i64,
-    /// BLAKE3 over every row in deterministic text order.
-    pub checksum: String,
+    /// Rows folded into the commitment — the exact count, taken from the same
+    /// scan rather than from a second `COUNT(*)`.
+    pub rows: u64,
+    /// Order-independent commitment: the wrapping 128-bit sum of `md5(row)`.
+    /// Addition and not XOR, because XOR cancels a duplicated row and would
+    /// read `{A, A, C}` and `{B, B, C}` as the same table.
+    pub commitment: u128,
+}
+
+/// Folds a stream of `md5(row)` lines into `(rows, commitment)`.
+///
+/// The server streams the hashes unordered and unaggregated, so nothing sorts
+/// and nothing spills to `pgsql_tmp`; the commutative fold is what makes the
+/// result independent of the order the rows arrive in. A line can be split
+/// across two `COPY` frames, so the tail of a frame is carried over.
+#[derive(Default)]
+struct RowCommitment {
+    sum: u128,
+    rows: u64,
+    residual: Vec<u8>,
+}
+
+impl RowCommitment {
+    fn update(&mut self, chunk: &[u8], table: &str) -> Result<()> {
+        let mut rest = chunk;
+        while let Some(end) = rest.iter().position(|byte| *byte == b'\n') {
+            let (line, tail) = rest.split_at(end);
+            if self.residual.is_empty() {
+                self.fold(line, table)?;
+            } else {
+                let mut whole = std::mem::take(&mut self.residual);
+                whole.extend_from_slice(line);
+                self.fold(&whole, table)?;
+            }
+            rest = &tail[1..];
+        }
+        self.residual.extend_from_slice(rest);
+        Ok(())
+    }
+
+    fn fold(&mut self, line: &[u8], table: &str) -> Result<()> {
+        let text = std::str::from_utf8(line)
+            .map_err(|_| malformed_row_hash(table))?
+            .trim_end_matches('\r');
+        if text.is_empty() {
+            return Ok(());
+        }
+        let hash = u128::from_str_radix(text, 16).map_err(|_| malformed_row_hash(table))?;
+        self.sum = self.sum.wrapping_add(hash);
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn finish(mut self, table: &str) -> Result<(u64, u128)> {
+        if !self.residual.is_empty() {
+            let residual = std::mem::take(&mut self.residual);
+            self.fold(&residual, table)?;
+        }
+        Ok((self.rows, self.sum))
+    }
+}
+
+/// A row hash that is not 32 hex digits means the stream is not what we asked
+/// for: report it against the table it came from rather than fold garbage.
+fn malformed_row_hash(table: &str) -> BackupError {
+    BackupError::Integrity(format!(
+        "source fingerprint: {table} produced a row hash that is not hexadecimal"
+    ))
 }
 
 /// Compute the source fingerprint (read-only).
-pub async fn fingerprint(params: &PostgresParams) -> Result<String> {
-    let payload = introspect::introspect_cluster(params).await?;
+pub async fn fingerprint(pool: &SourcePool) -> Result<String> {
+    let payload = introspect::introspect_cluster(pool).await?;
 
     let mut normalized = payload.clone();
     normalize(&mut normalized);
@@ -49,7 +115,7 @@ pub async fn fingerprint(params: &PostgresParams) -> Result<String> {
 
     let mut tables = Vec::new();
     for db in &payload.databases {
-        let conn = PgConnection::connect_read_only(params, &db.name).await?;
+        let conn = pool.get(Some(&db.name)).await?;
         // Classic inheritance children hold their own rows and are counted as
         // their own tables, so the parent is measured with `ONLY` — exactly the
         // scope its plan item streams.
@@ -102,11 +168,11 @@ pub fn compose(snap: &SourceFingerprint) -> String {
     tables.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"rust-backup/pg-fingerprint/v1\n");
+    hasher.update(b"rust-backup/pg-fingerprint/v2\n");
     hasher.update(b"catalog:");
     hasher.update(snap.catalog_hash.as_bytes());
     for t in &tables {
-        hasher.update(format!("\n{}|{}|{}", t.name, t.rows, t.checksum).as_bytes());
+        hasher.update(format!("\n{}\t{}\t{:032x}", t.name, t.rows, t.commitment).as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -139,7 +205,8 @@ fn hash_catalog(p: &PgPlanPayload) -> String {
     blake3_hex(&bytes)
 }
 
-/// Exact `COUNT(*)` plus a complete streaming checksum for one table.
+/// Row count and order-independent row commitment for one table, from a
+/// single streaming scan.
 async fn table_stat(
     client: &Client,
     db: &str,
@@ -158,34 +225,29 @@ async fn table_stat(
     // `pg_extension.extcondition`); empty for an ordinary table.
     let cond = condition.map(|c| format!(" {c}")).unwrap_or_default();
 
-    let count_row = client
-        .query_one(&format!("SELECT count(*)::int8 FROM {scope}{cond}"), &[])
-        .await
-        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {qual}"), e))?;
-    let rows: i64 = count_row.get(0);
-
-    // Stream hashes of all rows instead of aggregating them in server memory.
-    // Sorting by row text is order-independent and duplicate rows remain visible.
-    let copy_sql = format!(
-        "COPY (SELECT md5(t::text) FROM {scope} t{cond} ORDER BY t::text COLLATE \"C\") TO STDOUT"
-    );
+    // No `ORDER BY` and no aggregate: the server streams one hash per row, the
+    // fold happens here, and neither side ever holds the table — so the source
+    // writes no temporary file on our behalf (I-NOTEMP). The row count comes
+    // out of the same scan instead of a second one.
+    let copy_sql = format!("COPY (SELECT md5(t::text) FROM {scope} t{cond}) TO STDOUT");
     let stream = client
         .copy_out(&copy_sql)
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("checksum {qual}"), e))?;
     futures_util::pin_mut!(stream);
-    let mut hasher = blake3::Hasher::new();
+    let name = format!("{db}.{schema}.{table}");
+    let mut fold = RowCommitment::default();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
             .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("checksum {qual}"), e))?;
-        hasher.update(&chunk);
+        fold.update(&chunk, &name)?;
     }
-    let checksum = hasher.finalize().to_hex().to_string();
+    let (rows, commitment) = fold.finish(&name)?;
 
     Ok(TableStat {
-        name: format!("{db}.{schema}.{table}"),
+        name,
         rows,
-        checksum,
+        commitment,
     })
 }
 
@@ -200,15 +262,95 @@ mod tests {
                 TableStat {
                     name: "d.app.b".to_string(),
                     rows: 2,
-                    checksum: "y".to_string(),
+                    commitment: 0x2222,
                 },
                 TableStat {
                     name: "d.app.a".to_string(),
                     rows: 1,
-                    checksum: "x".to_string(),
+                    commitment: 0x1111,
                 },
             ],
         }
+    }
+
+    fn fold_rows(table: &str, rows: &[&str]) -> Result<(u64, u128)> {
+        let mut fold = RowCommitment::default();
+        for row in rows {
+            fold.update(format!("{row}\n").as_bytes(), table)?;
+        }
+        fold.finish(table)
+    }
+
+    fn md5_like(seed: u8) -> String {
+        format!("{:032x}", u128::from(seed) * 0x0123_4567_89ab_cdef)
+    }
+
+    #[test]
+    fn row_commitment_is_order_independent() {
+        let (a, b, c) = (md5_like(1), md5_like(2), md5_like(3));
+        let forward = fold_rows("t", &[&a, &b, &c]).expect("fold");
+        let shuffled = fold_rows("t", &[&c, &a, &b]).expect("fold");
+        assert_eq!(forward, shuffled);
+    }
+
+    #[test]
+    fn row_commitment_detects_single_row_change() {
+        let (a, b, c) = (md5_like(1), md5_like(2), md5_like(3));
+        let base = fold_rows("t", &[&a, &b, &c]).expect("fold");
+        let changed = fold_rows("t", &[&a, &b, &md5_like(4)]).expect("fold");
+        assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn row_commitment_detects_duplicate_swap() {
+        // XOR would fold {A, A, C} and {B, B, C} to the same value: both pairs
+        // cancel. The wrapping sum does not, which is why it is the operation.
+        let (a, b, c) = (md5_like(1), md5_like(2), md5_like(3));
+        let left = fold_rows("t", &[&a, &a, &c]).expect("fold");
+        let right = fold_rows("t", &[&b, &b, &c]).expect("fold");
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn row_commitment_counts_every_row() {
+        let a = md5_like(7);
+        let (rows, _) = fold_rows("t", &[&a, &a, &a]).expect("fold");
+        assert_eq!(rows, 3, "duplicate rows are still rows");
+    }
+
+    #[test]
+    fn row_commitment_survives_a_line_split_across_frames() {
+        let a = md5_like(9);
+        let whole = fold_rows("t", &[&a]).expect("fold");
+        let mut fold = RowCommitment::default();
+        let line = format!("{a}\n");
+        let (head, tail) = line.as_bytes().split_at(7);
+        fold.update(head, "t").expect("head");
+        fold.update(tail, "t").expect("tail");
+        assert_eq!(fold.finish("t").expect("fold"), whole);
+    }
+
+    #[test]
+    fn row_commitment_rejects_malformed_line() {
+        let error = fold_rows("d.app.t", &["not-a-hash"]).expect_err("must refuse");
+        assert!(
+            matches!(error, BackupError::Integrity(ref m) if m.contains("d.app.t")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_prefix_is_v2() {
+        // The prefix is what keeps a v1 digest from ever comparing equal to a
+        // v2 one; assert it through a known composition rather than by reading
+        // the constant back.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"rust-backup/pg-fingerprint/v2\n");
+        hasher.update(b"catalog:");
+        hasher.update(b"cat");
+        hasher.update(b"\nd.app.a\t1\t00000000000000000000000000001111");
+        hasher.update(b"\nd.app.b\t2\t00000000000000000000000000002222");
+        assert_eq!(compose(&snap()), hasher.finalize().to_hex().to_string());
     }
 
     #[test]
@@ -228,9 +370,9 @@ mod tests {
         more_rows.tables[0].rows += 1;
         assert_ne!(base, compose(&more_rows), "row count change must show");
 
-        let mut new_checksum = snap();
-        new_checksum.tables[0].checksum = "z".to_string();
-        assert_ne!(base, compose(&new_checksum), "content change must show");
+        let mut new_commitment = snap();
+        new_commitment.tables[0].commitment = 0x3333;
+        assert_ne!(base, compose(&new_commitment), "content change must show");
 
         let mut new_catalog = snap();
         new_catalog.catalog_hash = "cat2".to_string();

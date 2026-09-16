@@ -68,7 +68,11 @@ cleanup() {
   if (( status != 0 || FAIL != 0 )); then
     find "$work" -name '*.log' -exec sh -c 'echo "--- $1"; sed -n "1,40p" "$1"' _ {} \; >&2 2>/dev/null
   fi
-  rm -rf "$work"
+  if [[ ${RUST_BACKUP_E2E_KEEP:-0} == 1 ]]; then
+    echo "work directory kept: $work"
+  else
+    rm -rf "$work"
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -540,10 +544,273 @@ SQL
         pass "$label [B] a row-count mismatch fails the restore and removes the database"
       fi
     }
+    # T-PG-ABORT-a: the destination process is killed mid-stream. The source
+    # must fail with a transport/transfer error, run its failure-path
+    # immutability audit anyway, and not claim the source was mutated.
+    pg_dest_kill_case() {
+      local label=pg-destination-kill
+      case_begin "$label"
+      local slog="$work/$label-source.log" dlog="$work/$label-destination.log"
+      local before; before=$(pg_source_checksum)
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+      start_server "$work/$label-server.log" || { fail "$label server did not start"; return; }
+      local port=$RB_SERVER_PORT server_pid=$RB_SERVER_PID
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --max-rate $((3 * 1024 * 1024)) --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog" 2>&1 &
+      local source_pid=$!; PIDS+=("$source_pid")
+      sleep .5
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres destination --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --yes --admin --overwrite --host 127.0.0.1 --port "$pg_dst_port" \
+        --user postgres --sslmode disable >"$dlog" 2>&1 &
+      local destination_pid=$!; PIDS+=("$destination_pid")
+      if ! wait_for_progress "$dlog"; then
+        fail "$label never began transferring, so the kill would prove nothing"
+        kill -9 "$source_pid" "$destination_pid" "$server_pid" >/dev/null 2>&1
+        reap "$source_pid"; reap "$destination_pid"; reap "$server_pid"
+        return
+      fi
+      sleep 1
+      kill -9 "$destination_pid" >/dev/null 2>&1
+
+      local source_rc
+      reap "$source_pid"; source_rc=$REAP_RC
+      reap "$destination_pid"
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+
+      assert_source_unchanged "$label" "$before" "$(pg_source_checksum)"
+
+      if (( source_rc == 0 )); then
+        fail "$label [B] the source reported success although its peer died"
+      elif (( source_rc == 6 )); then
+        fail "$label [B] the source blamed itself (SourceMutated) for a dead peer"
+      elif ! rb_strip_ansi <"$slog" | grep -q 'source run failed; source verified unchanged'; then
+        fail "$label [B] the failure-path immutability audit did not run"
+      elif ! no_false_success "$slog" "$dlog"; then
+        fail "$label [B] a peer printed verified completion"
+      else
+        pass "$label [B] the source failed, audited itself and did not claim mutation"
+      fi
+      assert_phase "$label" "$slog" 'Transfer|Verify|Connect'
+    }
+
+    # T-PG-WRITER: somebody writes to the source while it is being read. The
+    # fingerprint audit is the only thing that can catch it, and the run must
+    # end as a source-mutation failure (exit 6) rather than as a certified copy.
+    pg_writer_case() {
+      local label=pg-concurrent-writer
+      case_begin "$label"
+      local slog="$work/$label-source.log" dlog="$work/$label-destination.log"
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+      start_server "$work/$label-server.log" || { fail "$label server did not start"; return; }
+      local port=$RB_SERVER_PORT server_pid=$RB_SERVER_PID
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --max-rate $((3 * 1024 * 1024)) --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog" 2>&1 &
+      local source_pid=$!; PIDS+=("$source_pid")
+      sleep .5
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres destination --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --yes --admin --overwrite --host 127.0.0.1 --port "$pg_dst_port" \
+        --user postgres --sslmode disable >"$dlog" 2>&1 &
+      local destination_pid=$!; PIDS+=("$destination_pid")
+      if ! wait_for_progress "$dlog"; then
+        fail "$label never began transferring, so the write would prove nothing"
+        kill -9 "$source_pid" "$destination_pid" "$server_pid" >/dev/null 2>&1
+        reap "$source_pid"; reap "$destination_pid"; reap "$server_pid"
+        return
+      fi
+      # The writer is the superuser, not the tool's role: the point is that a
+      # third party changed the source under a running backup.
+      docker exec "$pg_src" psql -U postgres -d faultdb -q -c \
+        "INSERT INTO app.rows VALUES (999000001, repeat('z', 64))" >/dev/null 2>&1
+
+      local source_rc destination_rc
+      reap "$source_pid"; source_rc=$REAP_RC
+      reap "$destination_pid"; destination_rc=$REAP_RC
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+
+      # Put the source back the way it was, so the later cases still compare
+      # against the fixture they were written for.
+      docker exec "$pg_src" psql -U postgres -d faultdb -q -c \
+        "DELETE FROM app.rows WHERE id = 999000001" >/dev/null 2>&1
+
+      local state; state=$(pg_dest_state)
+      if (( source_rc != 6 )); then
+        fail "$label [B] the source exited $source_rc, expected the source-mutation code 6"
+      elif ! rb_strip_ansi <"$slog" | grep -q 'SOURCE-IMMUTABILITY VIOLATION'; then
+        fail "$label [B] the source did not name the immutability violation"
+      elif (( destination_rc == 0 )); then
+        fail "$label [B] the destination certified a copy of a moving source"
+      elif [[ "$state" != absent ]]; then
+        fail "$label [B] the uncertified database survived ($state)"
+      elif ! no_false_success "$slog" "$dlog"; then
+        fail "$label [B] a peer printed verified completion"
+      else
+        pass "$label [B] a concurrent write ends the run as a source mutation"
+      fi
+    }
+
+    # T-PG-ABORT-d: the destination refuses the plan (the database is already
+    # there and --overwrite was not given). The source must learn it as a plan
+    # rejection and still audit the source before it exits.
+    pg_reject_case() {
+      local label=pg-plan-rejected
+      case_begin "$label"
+      local slog="$work/$label-source.log" dlog="$work/$label-destination.log"
+      local before; before=$(pg_source_checksum)
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+      docker exec "$pg_dst" psql -U postgres -q -c "CREATE DATABASE faultdb" >/dev/null 2>&1
+      start_server "$work/$label-server.log" || { fail "$label server did not start"; return; }
+      local port=$RB_SERVER_PORT server_pid=$RB_SERVER_PID
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog" 2>&1 &
+      local source_pid=$!; PIDS+=("$source_pid")
+      sleep .5
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres destination --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --yes --admin --host 127.0.0.1 --port "$pg_dst_port" \
+        --user postgres --sslmode disable >"$dlog" 2>&1 &
+      local destination_pid=$!; PIDS+=("$destination_pid")
+
+      local source_rc destination_rc
+      reap "$source_pid"; source_rc=$REAP_RC
+      reap "$destination_pid"; destination_rc=$REAP_RC
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+
+      assert_source_unchanged "$label" "$before" "$(pg_source_checksum)"
+
+      if (( destination_rc == 0 || source_rc == 0 )); then
+        fail "$label [B] a refused plan still exited 0 (src=$source_rc dst=$destination_rc)"
+      elif ! rb_strip_ansi <"$slog" | grep -q 'source run failed; source verified unchanged'; then
+        fail "$label [B] the source did not audit itself after the rejection"
+      elif ! no_false_success "$slog" "$dlog"; then
+        fail "$label [B] a peer printed verified completion for a refused plan"
+      else
+        pass "$label [B] a refused plan fails both sides and still audits the source"
+      fi
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+    }
+
+    # T-PG-TIMEOUT: a table the source must read is held under ACCESS EXCLUSIVE
+    # by somebody else. The read-only session sets `lock_timeout=30s`, so the run
+    # must fail within it — phase-tagged, naming the server's own message —
+    # instead of waiting for a lock that may never be released. The source is run
+    # alone: it fails during Analyze, before it registers the channel, so a
+    # destination would only sit out its registration timeout.
+    pg_lock_case() {
+      local label=pg-lock-timeout
+      case_begin "$label"
+      local slog="$work/$label-source.log" dlog="$work/$label-destination.log"
+      local before; before=$(pg_source_checksum)
+      docker exec "$pg_dst" psql -U postgres -q -c \
+        "DROP DATABASE IF EXISTS faultdb" >/dev/null 2>&1
+      # The lock holder: an open transaction that keeps the table for two
+      # minutes, far longer than the source's 30 s budget.
+      docker exec -d "$pg_src" psql -U postgres -d faultdb -c \
+        "BEGIN; LOCK TABLE app.rows IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(120); COMMIT;" \
+        >/dev/null 2>&1
+      local waited=0 held=0
+      while (( waited < 30 )); do
+        held=$(docker exec "$pg_src" psql -U postgres -d faultdb -At -c \
+          "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+            WHERE c.relname = 'rows' AND l.mode = 'AccessExclusiveLock' AND l.granted" 2>/dev/null)
+        [[ "${held:-0}" == 1 ]] && break
+        sleep 1; waited=$((waited + 1))
+      done
+      if [[ "${held:-0}" != 1 ]]; then
+        fail "$label [A] the fixture lock was never taken, so the case proves nothing"
+        return
+      fi
+
+      start_server "$work/$label-server.log" || { fail "$label server did not start"; return; }
+      local port=$RB_SERVER_PORT server_pid=$RB_SERVER_PID
+      local started=$SECONDS
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label" \
+        --no-udp --insecure --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog" 2>&1 &
+      local source_pid=$!; PIDS+=("$source_pid")
+      local source_rc elapsed timed_out=0
+      waited=0
+      while (( waited < 180 )); do
+        kill -0 "$source_pid" 2>/dev/null || break
+        sleep .5; waited=$((waited + 1))
+      done
+      if kill -0 "$source_pid" 2>/dev/null; then
+        kill -9 "$source_pid" >/dev/null 2>&1; timed_out=1
+      fi
+      reap "$source_pid"; source_rc=$REAP_RC
+      elapsed=$(( SECONDS - started ))
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+
+      # Release the lock before judging anything else, so a failed assertion
+      # cannot leave the next case blocked.
+      docker exec "$pg_src" psql -U postgres -d faultdb -q -c \
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE query LIKE 'BEGIN; LOCK TABLE%' AND pid <> pg_backend_pid()" >/dev/null 2>&1
+
+      assert_source_unchanged "$label" "$before" "$(pg_source_checksum)"
+
+      if (( timed_out == 1 )); then
+        fail "$label [B] the source was still waiting on the lock after 90 s"
+      elif (( source_rc == 0 )); then
+        fail "$label [B] the source succeeded while the table was locked"
+      elif (( elapsed > 90 )); then
+        fail "$label [B] the source took ${elapsed}s to give up, expected the 30 s lock timeout"
+      elif ! rb_strip_ansi <"$slog" | grep -qi 'lock timeout'; then
+        fail "$label [B] the source did not report the server's lock timeout"
+      elif [[ "$(pg_dest_state)" != absent ]]; then
+        fail "$label [B] a database was created for a run that never transferred"
+      elif ! no_false_success "$slog" /dev/null; then
+        fail "$label [B] the source printed verified completion"
+      else
+        pass "$label [B] a locked table fails the run in ${elapsed}s with the server's message"
+      fi
+      assert_phase "$label" "$slog" 'Analyze|Connect|Transfer'
+
+      # And the lock, not the tool, was the problem: the same run succeeds now.
+      start_server "$work/$label-retry-server.log" || { fail "$label retry server did not start"; return; }
+      port=$RB_SERVER_PORT; server_pid=$RB_SERVER_PID
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres source --to "127.0.0.1:$port" --channel "$label-retry" \
+        --no-udp --insecure --host 127.0.0.1 --port "$pg_src_port" \
+        --user postgres --database faultdb --sslmode disable >"$slog.retry" 2>&1 &
+      source_pid=$!; PIDS+=("$source_pid")
+      sleep .5
+      RUST_LOG=info RUST_BACKUP_PASSWORD="$PG_PASSWORD" \
+        "$RB_E2E_BIN" postgres destination --to "127.0.0.1:$port" --channel "$label-retry" \
+        --no-udp --insecure --yes --admin --overwrite --host 127.0.0.1 --port "$pg_dst_port" \
+        --user postgres --sslmode disable >"$dlog" 2>&1 &
+      local destination_pid=$!; PIDS+=("$destination_pid")
+      local retry_src_rc retry_dst_rc
+      reap "$source_pid"; retry_src_rc=$REAP_RC
+      reap "$destination_pid"; retry_dst_rc=$REAP_RC
+      kill -9 "$server_pid" >/dev/null 2>&1; reap "$server_pid"
+      if (( retry_src_rc == 0 && retry_dst_rc == 0 )) \
+        && rb_strip_ansi <"$dlog" | grep -q 'RESTORE VERIFIED'; then
+        pass "$label [D] the same run succeeds once the lock is released"
+      else
+        fail "$label [D] the run still fails after the lock was released (src=$retry_src_rc dst=$retry_dst_rc)"
+      fi
+    }
     pg_case pg-source-kill  source
     pg_case pg-relay-reset  server
     pg_case pg-backend-stop backend
     pg_rows_case
+    pg_lock_case
+    pg_dest_kill_case
+    pg_writer_case
+    pg_reject_case
   else
     fail 'postgres fault group could not start its containers'
   fi

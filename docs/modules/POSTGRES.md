@@ -110,6 +110,24 @@ with the destination's own backend stopped mid-apply, nothing can clean up and
 the assertion is instead that the leftover is uncertified and visibly not the
 source.
 
+## Failure behaviour
+
+Four ways a run ends badly, and what each leaves behind — every one of them is a
+case in `e2e/fault_matrix.sh`:
+
+| Failure | Source | Destination |
+|---------|--------|-------------|
+| The destination process dies mid-stream | fails with a `Transfer` error, runs its failure-path immutability audit and reports the source unchanged — never a mutation it did not cause | whatever it had written is uncertified; nothing can clean up after a killed process |
+| Somebody writes to the source while it is read | the fingerprint audit catches it: `SOURCE-IMMUTABILITY VIOLATION`, exit `6` | the load may have completed, so the databases this run created are dropped — a copy of a moving source is never left behind looking complete |
+| The source process dies mid-`COPY` | — | the apply fails and the databases this run created are dropped |
+| The destination refuses the plan (preflight, or an existing database without `--overwrite`) | learns it as a plan rejection (exit `4`) and still audits the source | nothing was written, nothing is removed; an existing database is never touched |
+
+The rule behind the table: a database this run **created** never survives a run
+that did not print `RESTORE VERIFIED`, whether the failure happened while
+loading or after it. A database that was already there is never removed by a
+failure — without `--overwrite` the run never wrote to it, and with
+`--overwrite` it was dropped before the restore began.
+
 ## Restore order, and why it is not a fixed list
 
 Object dependencies point in both directions at once: a column default may call
@@ -152,6 +170,19 @@ outright. A partitioned parent's index is rendered by `pg_get_indexdef` as
 An inheritance child's `CREATE TABLE` lists only its *local* columns; re-listing
 an inherited one merges it but marks it local, a different catalog state from the
 source's.
+
+## The source fingerprint
+
+Before and after every run — including a run that failed — the source is
+measured: the structural catalog hash, plus, for each data-bearing table, the
+number of rows and an **order-independent 128-bit commitment** over them (the
+wrapping sum of `md5(row)`, folded client-side while the server streams one hash
+per row). Addition and not XOR: XOR cancels duplicated rows, so `{A, A, C}` and
+`{B, B, C}` would look identical. Nothing is sorted and nothing is aggregated
+server-side, so the audit itself writes no temporary file, and it costs one full
+read of each table per audit. Any drift between the two measurements is
+`SourceMutated` (I-IMMUT). The digest is prefixed `rust-backup/pg-fingerprint/v2`
+and is not comparable with a digest taken by an older build.
 
 ## Determinism of the read-back
 
@@ -211,6 +242,52 @@ The error names every offender. `allow_unsupported_objects=true`
 (`-P allow_unsupported_objects=true`) accepts a knowingly partial copy; the run
 then logs exactly what it leaves behind.
 
+## Runtime model and guardrails
+
+A formal review of the module's runtime behaviour, one line per checked
+property, with the anchor that proves it. Reviewed 2026-09-16 against the code
+in this repository.
+
+| # | Property | Anchor | Status |
+|---|----------|--------|--------|
+| a | Every source-side connection is read-only. `PgConnection::connect` (read-write) appears only in `dest.rs`; introspection, fingerprint and `stream_out` all use `connect_read_only`, which sets `default_transaction_read_only=on`. | `connect.rs:37,45`; `introspect.rs:41,54`; `immutability.rs:52`; `source.rs:95`; `dest.rs:183,254,306,714` | PASS |
+| b | A destination error mid-item aborts the `COPY` server-side: the unfinished sink is dropped, and a dropped sender makes the driver send `CopyFail` instead of `CopyDone`. The run then drops the databases it created. | `dest.rs` `apply_data`/`finish_current`; `remove_partially_restored`; `tokio-postgres-0.7.18/src/copy_in.rs:56-60` | PASS |
+| c | A destination that disappears mid-item fails the source rather than hanging: every chunk is handed to the channel with `await`, and the channel error propagates out of `copy_stream_to_sink` with its phase. | `source.rs` `copy_stream_to_sink` | PASS |
+| d | A plan received over the wire cannot drive the destination into unbounded work: dependency depths are relaxed iteratively with a pass count bounded by the number of nodes (never recursion), and difference reporting stops at `MAX_REPORTED_DIFFERENCES`. | `ddl.rs` `relax_depths`; `dest.rs` `MAX_REPORTED_DIFFERENCES = 20` | PASS |
+| e | No table is ever collected client-side. The source streams `COPY` frames, the destination streams them into `copy_in`, and the fingerprint hashes the `COPY` stream as it arrives. What is collected is catalog metadata, bounded by the number of objects, not by rows. | `source.rs` `copy_stream_to_sink`; `dest.rs` `apply_data`; `immutability.rs` `table_stat` | PASS |
+| f | Memory per item is the 1 MiB chunk buffer plus the `COPY` frame in flight (the buffer is drained in 1 MiB units, so its peak is `CHUNK_SIZE` + one frame), on both sides — independent of the table's size. Phase 3 § 3.4 proves it on a 2 GiB table. | `rb-core/src/wire.rs:25` (`CHUNK_SIZE`); `source.rs` `copy_stream_to_sink` | PASS |
+| g | Every fallible path carries the phase it happened in. Two sites were wrong and were fixed in this review: counting a materialized view's rows and the item-framing check both run inside apply and were tagged `Verify`. | `dest.rs` `matview_count_error`, `item_end_mismatch`; tests `review_g_matview_count_error_is_tagged_apply`, `review_g_item_end_mismatch_is_tagged_apply` | FIXED |
+| h | Backpressure is the consumer's (I-BANDWIDTH): a chunk write waits on the substream window, so a slow destination stalls the source's `COPY` reads. No buffer decouples them, and the module uses one carrier. | `source.rs` `copy_stream_to_sink`; `lib.rs` `max_carriers() == 1`; `e2e/bandwidth_netem.sh` | PASS |
+| i | The read-back runs the source code path against the **destination**: `verify` passes the destination's own parameters, so it cannot reach the source host. | `lib.rs` `PostgresDestination::verify` | PASS |
+| j | Nothing on the source side issues `BEGIN`, `START TRANSACTION` or `SET TRANSACTION`, so the read-only default of the session cannot be relaxed from inside. Phase 4 § 4.2 turns this into an enforced allowlist. | grep over `source.rs`, `introspect.rs`, `immutability.rs`, `connect.rs` | PASS |
+
+### Connections, timeouts and keepalives
+
+A run opens **one connection to the bootstrap database plus one per database it
+copies**, and every phase — the fingerprint audits, introspection, the row
+counts and the `COPY` stream — borrows them from the same pool. A connection the
+driver reports as closed is replaced once, so a restarted server does not fail
+the run at the first statement after it.
+
+Source sessions carry `lock_timeout=30s`: a table somebody else holds under
+`ACCESS EXCLUSIVE` fails the run inside half a minute, with the server's own
+`canceling statement due to lock timeout` and the relation being read, instead
+of waiting for a lock that may never be released. They do **not** bound
+`statement_timeout` (a `COPY` of a large table is legitimately long) and set
+`idle_in_transaction_session_timeout=0`, since the module opens no long
+transactions of its own. Destination sessions set neither timeout: DDL and
+`REFRESH MATERIALIZED VIEW` take locks and time on purpose.
+
+Both sides enable TCP keepalives (idle 30 s, interval 10 s, 3 retries), so a
+peer that disappears without closing its socket surfaces as a failed run rather
+than a process waiting forever.
+
+Two phase tags are deliberately kept as they are: `immutability.rs` and
+`introspect.rs` tag their reads `Analyze` even when the session runs them as a
+post-run audit or as the destination's re-introspection, because the callers
+that use them in another phase re-wrap the error with that phase
+(`dest.rs` `verify_catalog`, `lib.rs` `verify`).
+
 ## Privileges
 
 Use a read-only source account able to inspect the required catalogs and `SELECT`
@@ -260,14 +337,17 @@ previous contents must survive a failed attempt.
   closed, never open.
 - Table items are streamed ordered by the C-collated text of the whole row so
   that the source stream and the destination read-back agree independently of
-  physical row placement. `ORDER BY` over an expression is a blocking sort: no
-  `COPY` byte leaves the source until the table is sorted, and a table larger
-  than `work_mem` spills to the source's `pgsql_tmp`. That is the one place
-  where a run touches source disk, and it is server-side temporary space rather
-  than a staged copy of the payload — but it does mean the first byte of a very
-  large table is not immediate. Removing it needs an order-independent row
-  commitment (a commutative fold), which is deliberately left to a later
-  version rather than half-built here.
+  physical row placement — a partitioned parent, in particular, is read in a
+  different physical order on the two sides. `ORDER BY` over an expression is a
+  blocking sort: no `COPY` byte leaves the source until the table is sorted, and
+  a table larger than `work_mem` spills to the source's `pgsql_tmp`. That is the
+  one place where a run touches source disk, and it is server-side temporary
+  space rather than a staged copy of the payload — but it does mean the first
+  byte of a very large table is not immediate. The **fingerprint** no longer
+  sorts (it folds an order-independent commitment, below), so this is now the
+  data stream alone; removing it too would require the destination read-back to
+  compare a commitment instead of the streamed bytes, which the transport's
+  per-item digest does not do today.
 - Live version-matrix verification requires Docker: `e2e/postgres_matrix.sh
   10 11 12 13 14 15 16 17 18`. Cross-major syntax is `source:destination`, for
   example `e2e/postgres_matrix.sh 10:18 12:16 14:17 16:18`; destinations older

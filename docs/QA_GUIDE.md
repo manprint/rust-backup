@@ -172,6 +172,17 @@ is refused at preflight without it. In CI this is jobs `postgres-postgis`
 (majors 10–18) and `postgres-postgis-cross-version` (`12:16`); the four
 PostgreSQL e2e jobs carry `timeout-minutes: 80`.
 
+Memory is proved separately, because a matrix row cannot show it: one 2 GiB
+table is moved end to end while the resident set of both peers is sampled once a
+second, and each peak must stay under 256 MiB — the table never fits in either
+process, so a regression that buffered an item would show immediately.
+
+```bash
+bash e2e/postgres_large_table.sh 16
+```
+
+In CI this is the job `postgres-large` (`timeout-minutes: 40`).
+
 MongoDB 8 needs a host kernel older than 6.19: every published MongoDB 8 image
 refuses to start above that (SERVER-121912). On a newer kernel
 `e2e/mongodb_matrix.sh 8` prints a `SKIP` naming the kernel and exits 77, which

@@ -358,6 +358,27 @@ difference is recorded rather than silent. The same choice is available as
 `RUST_BACKUP_EXTENSION_VERSION`, and its default, `source`, is the refusal
 above. An extension the destination does not have at all is always refused.
 
+The source is read with a 30-second lock timeout, so a table somebody else holds
+under `ACCESS EXCLUSIVE` ends the run instead of stalling it:
+
+```text
+[Analyze] introspect: count app.accounts: db error: ERROR: canceling statement
+due to lock timeout
+```
+
+Wait for the lock to be released (a maintenance job, a long `ALTER TABLE`) and
+run it again — nothing was written on the destination. Statements themselves are
+not time-bounded, because copying a large table is legitimately slow, and the
+run opens one connection to the bootstrap database plus one per database it
+copies, with TCP keepalives on both sides.
+
+Before and after every run the source is measured — the catalog, plus the row
+count and an order-independent commitment over the rows of each table — and any
+difference between the two measurements fails the run with exit `6` rather than
+certifying a copy of a moving database. That costs one full read of the source
+per measurement, so a backup reads the data three times in total: two audits and
+the copy itself.
+
 A restore that ends with
 
 ```text
