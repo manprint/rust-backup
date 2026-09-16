@@ -1,5 +1,164 @@
 # Changelog
 
+## 0.0.7 — prerelease (2026-09-16)
+
+The hardening plan (`docs/plans/001_plan-Hardening/`), phases 0 to 6: what each
+module refuses to approximate, what the destination proves before it reports a
+verified copy, and the gates that keep the documentation honest about both.
+
+### PostgreSQL fidelity
+
+- **Extension configuration tables are user data again.** Relations registered
+  with `pg_extension_config_dump` are captured and restored as their own plan
+  items, loaded over a scope cleared by the extension's own condition. A PostGIS
+  cluster's custom `spatial_ref_sys` rows now survive a restore instead of being
+  silently replaced by the extension's defaults.
+- **An object owned by an extension no longer refuses the cluster.** PostGIS
+  defines three rules on `public.geometry_columns`, which made every PostGIS
+  cluster unbackupable; `CREATE EXTENSION` recreates them verbatim on the
+  destination.
+- **A plan item this build cannot restore is refused, at preflight and on the
+  apply path**, rather than skipped and then reported as a verified copy.
+- **Extension versions are preflighted** against
+  `pg_available_extension_versions`, and a version the destination cannot
+  install is named along with what it does have. `--extension-version
+  <source|default>` (`RUST_BACKUP_EXTENSION_VERSION`, `extension_version:`)
+  chooses; under `default` the report carries `deviation: extension <name>
+  restored at version <actual> (source <version>)`.
+- View and materialized-view relation options are captured and emitted,
+  unpopulated materialized views stay unpopulated, comments on constraints and
+  indexes round-trip, and the PostgreSQL 18 named-`NOT NULL` probe compares
+  against the server's own default name.
+
+### What the destination proves
+
+- **Row counts.** The source counts the rows of every data item and of every
+  populated materialized view during Analyze; the destination compares them with
+  what `COPY` wrote and `REFRESH` produced, and fails closed on a difference.
+- **Constraint state.** `convalidated`, `condeferrable` and `condeferred` are
+  captured, restored verbatim and compared; a plan whose constraint state and
+  definition text disagree is refused.
+- **The proof is printed.** `RESTORE VERIFIED` gained `rows verified: …`,
+  `constraints: …` and one `deviation: …` line per declared departure, and the
+  same facts leave the module as structured fields.
+
+### Runtime and failure behaviour
+
+- **One pooled read-only connection per database** for every phase of a run: a
+  single-database backup now holds one connection where it used to open about
+  nine.
+- **`lock_timeout=30s` on source sessions and TCP keepalives on both sides.** A
+  table held under `ACCESS EXCLUSIVE` now fails the run in 30 s with the
+  server's own message instead of stalling it indefinitely.
+- **Fingerprint v2** — an order-independent 128-bit commitment per table, folded
+  client-side from a streamed `md5(row)`. It replaces the sorted checksum and its
+  second `COUNT(*)`: the immutability audit no longer sorts and no longer spills
+  to disk.
+- **A run that fails after the payload landed cleans up after itself.**
+  `Destination::abandon()` (defaulted, so other modules are unchanged) removes
+  the databases the run created when read-back fails or the source rejects
+  completion.
+- Two phase tags were wrong: counting a materialized view's rows and the item
+  framing check are Apply, not Verify.
+
+### Source immutability
+
+I-IMMUT stops being a promise the code makes to itself and becomes four
+independent layers, each with its own failure mode. `docs/IMMUTABILITY.md` is
+the reference — every vector with its guard and the test that proves it, the
+fingerprint contract per module, and the least-privilege recipe for each
+backend.
+
+- **Types.** The source side of every module holds a read-only wrapper with no
+  write call to offer: `ReadOnlyClient` over `tokio_postgres::Client`,
+  `ReadOnlyClient`/`ReadOnlyDatabase` over the MongoDB driver (collections are
+  named per call, so no `Collection` or raw `Database` escapes), and
+  `ReadOnlyS3` over the AWS SDK client.
+- **Allowlists.** Where a backend takes a statement or a command as data, the
+  text is checked before it is sent — `guard_read_only` for PostgreSQL (literal
+  and comment stripping, single statement, head allowlist, deny words and deny
+  functions) and an 11-command read list for MongoDB, which also pins
+  `readPreference=primary` and `readConcern=local`. The PostgreSQL source role is
+  probed once per run, and a role that could write is warned about, never
+  refused.
+- **A lint in the gates.** `scripts/source_readonly_lint.sh` and its
+  `--selftest` run inside `scripts/gates.sh`: a write-shaped call added to a
+  source-side file fails the build, and a lint that can no longer detect one
+  fails it too.
+- **Server-side evidence.** Each module's e2e runs a whole transfer under a
+  least-privilege identity and reads the server's own record back —
+  `rb_pg_assert_readonly_log` on PostgreSQL 10..18 (both grant recipes),
+  `rb_mongo_assert_readonly_log` over a mongod started with `--profile 0
+  --slowms 0`, and `rb_minio_assert_readonly_trace` over `mc admin trace`, each
+  with a refused write as the counter-proof.
+- **The audit survives a panic.** The source pipeline runs inside
+  `catch_unwind`, so an unwind takes the same failure path as any other error
+  and the source is fingerprinted again before the run reports `SourceMutated`
+  or the panic itself.
+- **Reading a filesystem source the process does not own moves the files'
+  access times**, so `O_NOATIME` + `EPERM` is now a refusal at the first
+  fingerprint. `--allow-atime-updates` (`RUST_BACKUP_ALLOW_ATIME_UPDATES`,
+  `allow_atime_updates:`) is the explicit opt-in, and it warns once.
+
+### Filesystem
+
+- **Special files are carried, not skipped silently.** FIFOs and character/block
+  device nodes become plan entries (`fifo`, `chardev`, `blockdev`, with the
+  device number in a new `rdev` field) and are recreated with `mkfifo`/`mknod`;
+  mode is applied through `O_PATH|O_NOFOLLOW`, because opening a FIFO blocks and
+  opening a device has side effects. A unix socket is refused at Analyze — "a
+  unix socket cannot be reproduced". A `special_files` preflight check refuses
+  device nodes without root or `CAP_MKNOD` before anything is written, and the
+  fingerprint hashes `rdev`, so a changed device number is drift.
+- **A symlink can no longer redirect a restore.** Directories are created one
+  level at a time behind a `symlink_metadata` check instead of `create_dir_all`,
+  which follows a symlink to a directory: a planted symlink is refused in Apply
+  and a symlinked destination root in Validate.
+- The scope edges are written down where an operator meets them — sparse files
+  restored dense, xattrs and POSIX ACLs never captured, sockets refused, devices
+  needing a capability — along with the cost of the guarantee: a run reads the
+  source tree three times, and that is the evidence behind "source unchanged".
+
+### Test harness
+
+- **A catalogue before the code.** `docs/testing/POSTGRES_MATRIX.md` lists 106
+  rows and `docs/testing/FILESYSTEM_MATRIX.md` 32, each with its fixture, the
+  outcome it must produce and the oracle that decides it. Neither document
+  records execution status: the runners print `PASS`/`FAIL`/`SKIP` per row and
+  stay the only source of truth for that.
+- **Runners for every row.** The PostgreSQL fidelity matrix runs from fixture
+  files with `pg_dump` and catalog oracles, container-log immutability evidence
+  and per-case counters; `e2e/filesystem_matrix.sh` runs the filesystem matrix
+  twice, as root and as an unprivileged user, plus the refusal, xattr, atime and
+  `CAP_MKNOD` rows.
+- **New coverage.** `e2e/postgres_large_table.sh` (a 2 GiB table, peak RSS of
+  both peers under 256 MiB) with CI job `postgres-large`; CI jobs
+  `postgres-postgis` and `postgres-postgis-cross-version`; matrix rows for
+  extension configuration tables, missing extension versions, PostGIS,
+  `CONN-BUDGET`, row counts and constraint state; fault cases
+  `pg-lock-timeout`, `pg-destination-kill`, `pg-concurrent-writer`,
+  `pg-plan-rejected` and `pg-row-count-mismatch`.
+
+### Documentation parity
+
+- **`scripts/docs_parity.sh` fails when the operator guide stops describing the
+  program.** It reads `scripts/env_inventory.sh` — the clap help of every command
+  surface plus the direct `env::var` reads — and asks what help parity cannot: is
+  a flag documented in the chapter that owns it, does the row name the variable
+  and the default clap prints, does `10-variabili-ambiente.md` list every
+  variable the program reads, and does any document name one it never reads. Its
+  `--selftest` removes a variable row and renames a variable cell and asserts
+  both are reported.
+- **The audit it forced.** One cell was wrong — `--udp` defaults to `true`, not
+  "attivo" — and the module, matrix and harness documents were reconciled with
+  the code: the S3 read surface corrected to the eight methods `ReadOnlyS3`
+  carries, a leftover plan marker removed from `IMMUTABILITY.md`, and the two
+  test IDs that resolved to nothing anchored in the scripts that run them.
+- The README now answers from itself what each restore needs in privilege, what
+  every exit code means, and what PostgreSQL and MongoDB refuse to copy rather
+  than approximate.
+
+
 ## 0.0.6 — prerelease (2026-09-16)
 
 ### Correctness
