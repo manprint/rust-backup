@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.0.8 — prerelease (2026-09-22)
+
+A review pass over the four modules and the session core. Everything here is a
+defect found by reading the code against its own invariants, not a new feature:
+three of them abort a healthy run, and the rest are limits the program enforced
+without ever telling the operator they existed.
+
+### Runs that failed while working exactly as designed
+
+- **The 30-second idle timeout no longer fights the backpressure invariant.**
+  Every payload write rides the substream's flow-control window, and
+  I-BANDWIDTH says a slow destination MUST stall it — the destination stops
+  reading while it applies what it already holds. One S3 `upload_part` of a
+  whole multipart part, one MongoDB `insert_many` batch, one PostgreSQL `COPY`
+  flush waiting on a lock, and the window stayed full past 30 s: the run died
+  with `write idle timeout` for doing what the design requires. A 500 MiB S3
+  part over a 100 Mbit/s uplink needs ~42 s of it. Payload I/O now uses a
+  separate 600 s bound (`RUST_BACKUP_IO_IDLE_TIMEOUT`), while the handshake
+  waits keep the short one; channel liveness was never resting on this bound
+  anyway — the control heartbeat (20 s) and the coordination server's reaper
+  (60 s) prove it far sooner.
+- **MongoDB source cursors are opened with `noCursorTimeout`.** The cursor
+  advances only once the destination has taken the previous chunk, and
+  `--max-rate` stalls it further, so a destination slower than the server's
+  `cursorTimeoutMillis` (10 minutes by default) used to kill the backup with
+  `CursorNotFound` on a source nothing had touched.
+- **A root process without `CAP_CHOWN` is no longer told it has it.** The
+  filesystem capability probe answered "effective uid 0, therefore yes" without
+  reading `/proc/self/status`, so a restore in a `--cap-drop=CHOWN` container
+  passed the `ownership` preflight, streamed the whole payload, and only then
+  failed with `EPERM` on the first `fchownat` — exactly the outcome that check
+  exists to prevent. The uid now survives only as the fallback for a host with
+  no readable `/proc`.
+- **A file read interrupted by a signal is retried.** `nix`'s `read` surfaces
+  `EINTR`, which `std`'s reader handles for you; the filesystem source turned it
+  into a failed backup.
+
+### Limits that are now stated instead of discovered
+
+- **The 100 000-item plan ceiling is enforced by the source**, which names it,
+  instead of arriving from the peer as a `Connect` failure after the whole
+  backend had been fingerprinted, analysed and sent. It is documented in all
+  four module guides: an ordinary system root already exceeds it, so the
+  filesystem module is for a data tree, not for `/`.
+- **S3 preflight prints the destination's real memory peak.** A multipart part
+  is assembled whole in memory and its size grows with the object to stay under
+  S3's 10 000-part limit — about 524 MiB for an object near the 5 TiB ceiling.
+  The `multipart-memory` check states it before the plan is accepted.
+- **The source is read three times per run** — fingerprint, transfer,
+  fingerprint — and the destination read-back adds a fourth on its own side.
+  I-IMMUT requires both audits, including on a failed run; the module guides now
+  say so, where only the PostgreSQL one mentioned the cost at all.
+
+### Speed
+
+- **S3 analysis issues its per-object probes 16 at a time.** `HeadObject`,
+  `GetObjectTagging` and `GetObjectAcl` per object, plus a re-listing for each of
+  the two fingerprints, came to roughly five million *sequential* round-trips for
+  a million-object bucket. Every probe is still a read and the plan is
+  byte-identical to what the serial loop produced.
+
+### Diagnostics
+
+- **A dying control plane says so.** A failed client heartbeat, a closed control
+  substream and a coordination-server send that times out each emit a line
+  naming the side that stopped; the only previous evidence was the reaper's
+  message 60 s later, which names the symptom (I-OBSERV).
+
 ## 0.0.7 — prerelease (2026-09-16)
 
 The hardening plan (`docs/plans/001_plan-Hardening/`), phases 0 to 6: what each
