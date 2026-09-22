@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.10 — prerelease (2026-09-22)
 
 ### Static musl archives: the binary runs on Alpine
 
