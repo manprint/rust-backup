@@ -676,6 +676,10 @@ async fn print_plan(reg: &ModuleRegistry, a: &PlanArgs) -> anyhow::Result<()> {
     let params = merge_params(underlay.as_ref().map(|t| &t.params), a.params.overlay()?);
     let src = m.open_source(&params).await.map_err(anyhow::Error::new)?;
     let plan = src.analyze().await.map_err(anyhow::Error::new)?;
+    // The dry-run has to refuse exactly what a transfer would refuse, or its
+    // whole point is lost: a plan past the item ceiling must be named here, in
+    // seconds, and not once the run is already under way.
+    rb_core::channel::validate_plan_bounds(&plan).map_err(anyhow::Error::new)?;
     println!("{}", plan.render());
     Ok(())
 }

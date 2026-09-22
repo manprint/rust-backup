@@ -27,7 +27,13 @@ use crate::wire::{self, ControlFrame, DataFrame};
 
 /// Bounds for peer-supplied plan and stream bookkeeping. They prevent a valid
 /// frame from still forcing unbounded allocation or millions of hashers.
-pub const MAX_PLAN_ITEMS: usize = 100_000;
+///
+/// [`MAX_PLAN_ITEMS`] is a product limit as much as a safety one — an ordinary
+/// filesystem root or a busy bucket runs into it — so it is paired with
+/// [`wire::PLAN_FRAME_LIMIT`], which must stay large enough to carry a plan of
+/// that many items. Raise one and the wire test that ties them together will
+/// tell you to raise the other.
+pub const MAX_PLAN_ITEMS: usize = 200_000;
 pub const MAX_PLAN_ITEM_NAME_BYTES: usize = 4 * 1024;
 pub const MAX_PLAN_ITEM_META_BYTES: usize = 64 * 1024;
 pub const MAX_IN_FLIGHT_ITEM_HASHERS: usize = 1024;
@@ -587,13 +593,15 @@ pub async fn send_plan<S: DuplexStream>(
     plan: &crate::plan::BackupPlan,
     carriers: usize,
 ) -> Result<()> {
-    wire::send_frame(
+    wire::send_frame_bounded(
         ctrl,
         &ControlFrame::Plan {
             plan: Box::new(plan.clone()),
             carriers: carriers.clamp(1, u32::MAX as usize) as u32,
             separate_data_streams: true,
         },
+        wire::PLAN_FRAME_LIMIT,
+        Phase::Connect,
     )
     .await
 }
@@ -606,7 +614,9 @@ pub async fn send_plan<S: DuplexStream>(
 pub async fn recv_plan<S: DuplexStream>(
     ctrl: &mut S,
 ) -> Result<(crate::plan::BackupPlan, u32, bool)> {
-    match wire::recv_frame::<_, ControlFrame>(ctrl).await? {
+    match wire::recv_frame_bounded::<_, ControlFrame>(ctrl, wire::PLAN_FRAME_LIMIT, Phase::Connect)
+        .await?
+    {
         Some(ControlFrame::Plan {
             plan: p,
             carriers,

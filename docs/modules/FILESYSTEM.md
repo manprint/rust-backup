@@ -180,10 +180,10 @@ certify a tree whose contents had been rewritten in place.
 - Extended attributes and POSIX ACLs are **not captured at all**, so a restore
   cannot reproduce them; asking for them with `--preserve-xattr` is refused
   while connecting rather than silently dropped.
-- **A tree of more than 100 000 entries is refused.** One plan item per regular
+- **A tree of more than 200 000 entries is refused.** One plan item per regular
   file, and the plan's item ceiling (`MAX_PLAN_ITEMS`) is what bounds the
   destination's allocation from a peer-supplied plan. An ordinary system root
-  already exceeds it, so this module is for a data tree, not for `/`. The source
+  still exceeds it, so this module is for a data tree, not for `/`. The source
   raises the refusal itself, naming the ceiling, as soon as the plan is built —
   it is no longer a rejection that arrives from the peer after the whole tree
   has been read and sent.

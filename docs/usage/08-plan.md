@@ -99,6 +99,29 @@ usa `plan` prima, alla conferma non ci sono sorprese.
   sulla rete.
 - **Controllare la deriva** fra due momenti, salvando l'output e confrontandolo.
 
+## Tetto agli elementi
+
+Un piano può contenere al massimo **200 000 elementi**. Vale per tutti i moduli —
+un file, una collection, un oggetto S3, una tabella contano uno ciascuno — ed è
+il limite che impedisce a un piano ricevuto dal peer di dettare quanta memoria
+allochi la destinazione.
+
+Il rifiuto arriva dalla **sorgente**, appena il piano è costruito, e nomina il
+tetto:
+
+```text
+plan has 243187 items; limit is 200000
+```
+
+`plan` fa scattare lo stesso rifiuto senza aprire nessun canale: è il modo per
+scoprirlo in pochi secondi invece che a trasferimento avviato. Un albero o un
+bucket troppo grande si divide in più run con radici (o `--prefix`) più strette.
+
+Il piano viaggia come un frame solo, quindi al tetto sugli elementi si accompagna
+un limite di dimensione del frame (128 MiB) dimensionato per contenerne 200 000.
+Un piano sotto il tetto ma con nomi o metadati abnormi può sbattere su
+quest'ultimo; anche in quel caso il rifiuto è della sorgente e dice i byte.
+
 ## Codici di uscita
 
 Gli stessi degli altri comandi, limitatamente alle fasi che `plan` esegue:

@@ -187,7 +187,7 @@ the two measurements is `SourceMutated` (I-IMMUT). The digest is prefixed
 `rust-backup/pg-fingerprint/v2` and is not comparable with a digest taken by an
 older build.
 
-A cluster of more than 100 000 data items is refused against the plan's item
+A cluster of more than 200 000 data items is refused against the plan's item
 ceiling (`MAX_PLAN_ITEMS`), which is what keeps a peer-supplied plan from
 dictating the destination's allocation. The source raises the refusal itself,
 naming the ceiling, before the plan is sent.

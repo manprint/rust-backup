@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### The plan item ceiling is 200 000, and it is now reachable
+
+- **`MAX_PLAN_ITEMS` raised from 100 000 to 200 000.** One plan item per file,
+  collection, object or table, so this is the number of restore units a single
+  run can carry.
+- **The plan frame got a bound of its own, and that is what made the ceiling
+  real.** The plan crosses the wire as ONE frame, and every frame was bounded by
+  `FRAME_LIMIT` (16 MiB). A filesystem tree encodes to roughly 210 bytes per
+  entry and an S3 bucket to roughly 340 — so the old 100 000-item ceiling was
+  already unreachable: a run died somewhere north of 60 000 entries with a
+  generic `frame exceeds FRAME_LIMIT`, never naming the item count the operator
+  could act on. `wire::PLAN_FRAME_LIMIT` (128 MiB) now bounds the plan frame
+  alone, sized at about twice the fattest realistic item shape. Ordinary frames
+  keep the 16 MiB bound. The larger read happens exactly once, at a known point
+  in the protocol, after both sides are paired.
+- **A test ties the two constants together.** `plan_frame_budget_covers_the_item_ceiling`
+  builds a plan of `MAX_PLAN_ITEMS` S3-shaped items and fails if it does not fit
+  the frame bound — raising one constant without the other is now a red test,
+  not a field failure.
+- **`rust-backup plan` enforces the ceiling too.** The dry-run's documented
+  promise is that it fails exactly as the transfer would; it was printing plans
+  a real run would refuse. It now validates the plan bounds before rendering.
+
+### Costs of the higher ceiling
+
+A destination decoding a plan at the new ceiling holds more: the frame buffer
+plus the decoded items. For the fattest module (S3, whose item meta carries
+etag, storage class and content type) that is roughly 65 MiB of frame at
+200 000 items. The bound against a hostile plan moves with it — deliberately,
+and confined to the single plan read.
+
 ## 0.0.8 — prerelease (2026-09-22)
 
 A review pass over the four modules and the session core. Everything here is a

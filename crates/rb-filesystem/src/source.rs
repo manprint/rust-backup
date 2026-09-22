@@ -75,7 +75,7 @@ pub(crate) async fn stream_out(
     let root = checked_root(params, Phase::Transfer)?;
     let payload = payload(plan, Phase::Transfer)?;
     // Index once: a linear scan per item is O(items x entries), which at the
-    // core's 100 000-item cap is billions of string comparisons.
+    // core's 200 000-item cap is tens of billions of string comparisons.
     let files: std::collections::HashMap<&str, &crate::FilesystemEntry> = payload
         .entries
         .iter()

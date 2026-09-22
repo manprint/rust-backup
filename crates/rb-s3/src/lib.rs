@@ -181,7 +181,7 @@ fn validate_params(params: &S3Params) -> Result<()> {
 }
 
 /// Render at most a few entries of a fault list plus the total, so a preflight
-/// line stays readable for a 100 000-object plan.
+/// line stays readable for a 200 000-object plan.
 fn summarize(entries: &[String]) -> String {
     const SHOWN: usize = 5;
     if entries.len() <= SHOWN {
@@ -555,8 +555,8 @@ impl Destination for S3Destination {
             )
             .await?;
             if !self.params.overwrite {
-                // One aggregate check, not one per object: a 100 000-object
-                // plan used to emit 100 000 log lines and bury the handful of
+                // One aggregate check, not one per object: a 200 000-object
+                // plan used to emit 200 000 log lines and bury the handful of
                 // keys an operator actually has to act on.
                 let collisions: Vec<String> = expected.intersection(&actual).cloned().collect();
                 result = result.check(

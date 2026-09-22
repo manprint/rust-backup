@@ -111,7 +111,7 @@ fresh collection name and switch over if they must survive a failed attempt.
 
 - User credentials are not exposed by `usersInfo`; users and roles are therefore
   not recreated.
-- **More than 100 000 collections in one run is refused.** One plan item per
+- **More than 200 000 collections in one run is refused.** One plan item per
   collection, bounded by the plan's item ceiling (`MAX_PLAN_ITEMS`), which is
   what keeps a peer-supplied plan from dictating the destination's allocation.
   The source raises it itself, naming the ceiling, before the plan is sent.

@@ -27,6 +27,28 @@ pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const COPY_BUFFER: usize = 64 * 1024; // 64 KiB
 /// Max JSON control/data frame body size.
 pub const FRAME_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB
+/// Max body size for the one frame that legitimately scales with the plan:
+/// [`ControlFrame::Plan`].
+///
+/// Every other frame is a fixed-shape control message or a `CHUNK_SIZE` payload
+/// chunk, so [`FRAME_LIMIT`] bounds them with room to spare. The plan is
+/// different — it carries one entry per restore unit, up to
+/// [`crate::channel::MAX_PLAN_ITEMS`] of them, and it is sent whole because the
+/// destination must validate and restore from the plan alone. At 16 MiB the item
+/// ceiling was unreachable: a filesystem tree encodes to roughly 210 bytes per
+/// entry and an S3 bucket to roughly 340, so the frame bound bit first and did it
+/// with a generic "too large", not with the item count the operator could act on.
+///
+/// The budget here is ~670 bytes per item at the current ceiling — about twice
+/// the fattest realistic shape (S3, whose item meta carries etag, storage class
+/// and content type). `plan_frame_budget_covers_the_item_ceiling` in
+/// `rb-core/tests/wire_test.rs` is what keeps the two constants honest: raise
+/// [`crate::channel::MAX_PLAN_ITEMS`] and that test tells you to raise this too.
+///
+/// The larger allocation is read exactly once, at a known point in the protocol
+/// (`channel::recv_plan`), after the two sides are already paired on a secret —
+/// it is not a bound an arbitrary frame can reach.
+pub const PLAN_FRAME_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
 /// Idle timeout for a handshake read the caller is *waiting* on (re-armed on
 /// progress). Short on purpose: a peer that owes a completion frame and stops
 /// writing is wedged, not merely slow. Payload I/O uses
@@ -161,12 +183,26 @@ where
     S: AsyncWrite + Unpin,
     T: Serialize,
 {
+    send_frame_bounded(stream, frame, FRAME_LIMIT, Phase::Transfer).await
+}
+
+/// [`send_frame`] with an explicit size bound and phase, for the plan frame.
+pub async fn send_frame_bounded<S, T>(
+    stream: &mut S,
+    frame: &T,
+    limit: usize,
+    phase: Phase,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let body = serde_json::to_vec(frame)
-        .map_err(|e| BackupError::phase_src(Phase::Transfer, "frame serialize", e))?;
-    if body.len() > FRAME_LIMIT {
+        .map_err(|e| BackupError::phase_src(phase, "frame serialize", e))?;
+    if body.len() > limit {
         return Err(BackupError::phase(
-            Phase::Transfer,
-            "frame exceeds FRAME_LIMIT",
+            phase,
+            format!("frame is {} bytes; limit is {limit}", body.len()),
         ));
     }
     let len = (body.len() as u32).to_le_bytes();
@@ -175,7 +211,7 @@ where
     stream
         .flush()
         .await
-        .map_err(|e| BackupError::phase_src(Phase::Transfer, "frame flush", e))?;
+        .map_err(|e| BackupError::phase_src(phase, "frame flush", e))?;
     Ok(())
 }
 
@@ -185,23 +221,39 @@ where
     S: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
 {
+    recv_frame_bounded(stream, FRAME_LIMIT, Phase::Transfer).await
+}
+
+/// [`recv_frame`] with an explicit size bound and phase, for the plan frame.
+///
+/// The bound is checked against the declared length BEFORE the body buffer is
+/// allocated, so an inflated length prefix costs nothing.
+pub async fn recv_frame_bounded<S, T>(
+    stream: &mut S,
+    limit: usize,
+    phase: Phase,
+) -> Result<Option<T>>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(BackupError::phase_src(Phase::Transfer, "frame len read", e)),
+        Err(e) => return Err(BackupError::phase_src(phase, "frame len read", e)),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > FRAME_LIMIT {
+    if len > limit {
         return Err(BackupError::phase(
-            Phase::Transfer,
-            "incoming frame too large",
+            phase,
+            format!("incoming frame is {len} bytes; limit is {limit}"),
         ));
     }
     let mut body = vec![0u8; len];
     read_exact_idle(stream, &mut body).await?;
     let frame = serde_json::from_slice(&body)
-        .map_err(|e| BackupError::phase_src(Phase::Transfer, "frame deserialize", e))?;
+        .map_err(|e| BackupError::phase_src(phase, "frame deserialize", e))?;
     Ok(Some(frame))
 }
 

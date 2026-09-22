@@ -2,7 +2,7 @@
 
 use rb_core::channel::{
     validate_plan_bounds, ChunkEvent, ChunkSink, ChunkSource, StreamChunkSink, StreamChunkSource,
-    MAX_PLAN_ITEM_META_BYTES, MAX_PLAN_ITEM_NAME_BYTES,
+    MAX_PLAN_ITEMS, MAX_PLAN_ITEM_META_BYTES, MAX_PLAN_ITEM_NAME_BYTES,
 };
 use rb_core::plan::{human_bytes, BackupMode, BackupPlan, IntegritySpec, PlanItem};
 use rb_core::wire;
@@ -248,4 +248,62 @@ async fn mid_stream_abort_carries_reason() {
 fn human_bytes_scales() {
     assert_eq!(human_bytes(512), "512 B");
     assert!(human_bytes(1536).starts_with("1.50 KiB"));
+}
+
+/// A plan of `MAX_PLAN_ITEMS` realistic items must fit in `PLAN_FRAME_LIMIT`.
+///
+/// The plan crosses the wire as ONE frame, so the item ceiling is only real if
+/// the frame bound can carry it. Before these two constants were tied together
+/// the item ceiling was unreachable — the frame bound bit first, and it bit with
+/// a generic "too large" instead of naming the item count.
+///
+/// The shape measured here is the fattest of the four modules: an S3 object,
+/// whose item meta carries key, size, etag, storage class, content type and
+/// last-modified. If this fails, `MAX_PLAN_ITEMS` was raised without raising
+/// `wire::PLAN_FRAME_LIMIT`.
+#[test]
+fn plan_frame_budget_covers_the_item_ceiling() {
+    let items: Vec<PlanItem> = (0..MAX_PLAN_ITEMS)
+        .map(|i| {
+            let key = format!("warehouse/events/2026/09/22/part-{i:06}.parquet");
+            PlanItem {
+                id: i as u32,
+                ordinal: i as u32,
+                kind: "object".to_string(),
+                name: key.clone(),
+                estimated_bytes: 1_234_567,
+                meta: serde_json::json!({
+                    "key": key,
+                    "size": 1_234_567_u64,
+                    "etag": "\"9bb58f26192e4ba00f01e2e7b136bbd8\"",
+                    "storage_class": "STANDARD",
+                    "content_type": "application/octet-stream",
+                    "last_modified": "2026-09-22T10:11:12Z",
+                }),
+            }
+        })
+        .collect();
+
+    let plan = BackupPlan {
+        format_version: rb_core::plan::PLAN_FORMAT_VERSION,
+        module: "s3".to_string(),
+        mode: BackupMode::Copy1to1,
+        created_at: "2026-09-22T10:00:00Z".to_string(),
+        source_summary: "a bucket at the item ceiling".to_string(),
+        items,
+        estimated_bytes: 0,
+        integrity: IntegritySpec::default(),
+        payload: serde_json::Value::Null,
+    };
+    validate_plan_bounds(&plan).expect("a plan exactly at the ceiling is accepted");
+
+    let encoded = serde_json::to_vec(&plan).expect("plan encodes").len();
+    assert!(
+        encoded <= wire::PLAN_FRAME_LIMIT,
+        "a plan of {} items encodes to {encoded} bytes, past PLAN_FRAME_LIMIT {}: \
+         raise the frame bound or lower MAX_PLAN_ITEMS",
+        MAX_PLAN_ITEMS,
+        wire::PLAN_FRAME_LIMIT
+    );
+    const { assert!(wire::PLAN_FRAME_LIMIT > wire::FRAME_LIMIT) };
 }
