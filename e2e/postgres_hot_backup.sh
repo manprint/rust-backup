@@ -63,8 +63,7 @@ dst_sql() { docker exec "$DST" psql -U postgres -d "$DATABASE" -v ON_ERROR_STOP=
 # parent, one autocommit statement at a time, until killed.
 start_writer() {
   {
-    local i
-    for i in $(seq 1 100000); do
+    for _ in $(seq 1 100000); do
       echo "WITH p AS (INSERT INTO parent (payload) VALUES (repeat('w', 200)) RETURNING id)
             INSERT INTO child (parent_id, payload) SELECT id, repeat('c', 200) FROM p, generate_series(1, 2);"
       echo "UPDATE parent SET payload = md5(random()::text) WHERE id = (random() * ${PARENTS})::int + 1;"
