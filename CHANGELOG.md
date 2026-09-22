@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.11 — prerelease (2026-09-23)
 
 ### `--hot-backup`: copy a PostgreSQL source that stays online
 
