@@ -42,7 +42,11 @@ guarded, how it is proved, and the read-only role to create for each backend.
 
 Download a Linux `x86_64` or `aarch64` archive from
 [GitHub Releases](https://github.com/manprint/rust-backup/releases), verify it,
-and install the binary:
+and install the binary. The `*-linux-gnu` archives need glibc 2.34 or newer
+(Debian 12, Ubuntu 22.04, RHEL 9); the `*-linux-musl` archives are statically
+linked and run on any Linux, **Alpine included** — on Alpine the gnu binary fails
+with `cannot execute: required file not found`, because its glibc loader is not
+there:
 
 ```bash
 sha256sum --check rust-backup-*.tar.gz.sha256

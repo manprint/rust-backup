@@ -1,8 +1,8 @@
 name: Fast release
 
 # The tag path, optimised for wall clock: it compiles the binary once per
-# architecture on a native runner with a warm cargo cache and publishes the
-# archives. Nothing else.
+# target — glibc and static musl, for amd64 and arm64 — on a native runner with
+# a warm cargo cache and publishes the archives. Nothing else.
 #
 # What it deliberately does NOT run, because the tagged commit has already
 # passed the full gate on `dev` (fmt, clippy, unit tests, e2e, CodeQL, cargo
@@ -36,10 +36,14 @@ jobs:
         include:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            arch: amd64
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            arch: arm64
+          # Statically linked: no program interpreter and no glibc, so these run
+          # on Alpine and on distributions older than the gnu builds' glibc 2.34.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,7 +55,7 @@ jobs:
       # exact `Cargo.lock`, the cache holds only the dependency registry and
       # `target/`, and the published artifact is built from a fresh checkout of
       # the tagged commit with `--locked`. Without it this is a cold ten-minute
-      # compile per architecture, which is the whole point of the workflow.
+      # compile per target, which is the whole point of the workflow.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -60,9 +64,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: fast-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          key: fast-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            fast-release-${{ runner.os }}-${{ matrix.arch }}-
+            fast-release-${{ runner.os }}-${{ matrix.target }}-
 
       - name: Check that the tag matches the crate version
         if: github.ref_type == 'tag'
@@ -75,11 +79,47 @@ jobs:
             exit 1
           fi
 
+      # The musl targets build inside Alpine, which is a musl host: ring and
+      # aws-lc compile C, and the Ubuntu runner has no musl C toolchain. Built
+      # natively there, the musl target links statically by default. The cargo
+      # registry and `target/` are bind-mounted, so the cache above applies too.
       - name: Build the release binary
-        run: cargo build --locked --release --all-features --bin rust-backup
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *-musl ]]; then
+            mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
+            docker run --rm \
+              -v "$PWD:/src" -w /src \
+              -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+              -v "$HOME/.cargo/git:/usr/local/cargo/git" \
+              -e CARGO_TERM_COLOR -e CARGO_INCREMENTAL \
+              rust:alpine sh -euc "
+                apk add --no-cache musl-dev
+                cargo build --locked --release --all-features --bin rust-backup --target $TARGET
+                chown -R $(id -u):$(id -g) target /usr/local/cargo/registry /usr/local/cargo/git"
+          else
+            cargo build --locked --release --all-features --bin rust-backup --target "$TARGET"
+          fi
 
       - name: Smoke-test the binary
-        run: ./target/release/rust-backup --version
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/rust-backup"
+          "./$bin" --version
+          if [[ "$TARGET" == *-musl ]]; then
+            # What the musl archive is for: no program interpreter, so it starts
+            # where there is no glibc at all.
+            if readelf -lW "$bin" | grep -q INTERP; then
+              echo "::error::$bin is dynamically linked" >&2
+              exit 1
+            fi
+            docker run --rm -v "$PWD/$bin:/usr/local/bin/rust-backup:ro" \
+              alpine:3.22 rust-backup --version
+          fi
 
       - name: Package the archive and its checksum
         env:
@@ -95,7 +135,7 @@ jobs:
           fi
           package="rust-backup-${version}-${TARGET}"
           mkdir -p "dist/$package"
-          install -m 0755 target/release/rust-backup "dist/$package/rust-backup"
+          install -m 0755 "target/$TARGET/release/rust-backup" "dist/$package/rust-backup"
           cp README.md CHANGELOG.md LICENSE "dist/$package/"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
           (cd dist && sha256sum "$package.tar.gz" > "$package.tar.gz.sha256")
@@ -104,7 +144,7 @@ jobs:
       - name: Upload the archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fast-archive-${{ matrix.arch }}
+          name: fast-archive-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14

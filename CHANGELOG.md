@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Static musl archives: the binary runs on Alpine
+
+- **The release now ships `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` archives, statically linked.** The `-linux-gnu`
+  archives are linked dynamically against glibc 2.34+, and on Alpine (musl) their
+  program interpreter `/lib64/ld-linux-x86-64.so.2` does not exist: bash reports
+  `cannot execute: required file not found`, busybox `sh` reports `not found`.
+  The musl binary has no interpreter and no shared-library dependency, so it also
+  runs on distributions older than glibc 2.34.
+- `fast-release.yml` builds the musl targets natively inside `rust:alpine`,
+  fails the job if the binary carries an `INTERP` header, and runs `--version`
+  in a bare `alpine` container before the archive is published.
+
 ## 0.0.9 — prerelease (2026-09-22)
 
 ### The plan item ceiling is 200 000, and it is now reachable
