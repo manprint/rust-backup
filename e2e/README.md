@@ -13,6 +13,7 @@ return non-zero on any failure.
 | `postgres_introspect.sh` | T-PG-INTROSPECT | 2.2 | seed a pg, run the gated live introspection test |
 | `postgres_matrix.sh` | T-PG-MATRIX, T-PG-IMMUT, T-IMMUT-PG-LP | 2.8, 4.7 | pg 10..18 same/cross-major restore + catalog/data proof + abort immutability + a full run as a read-only role, proven from the server log |
 | `postgres_large_table.sh` | T-PG-RSS | 3.4 | one 2 GiB table end to end, peak RSS of both peers sampled and capped |
+| `postgres_hot_backup.sh` | T-PG-HOT | — | `--hot-backup` under concurrent writes: consistent snapshot restored and verified, no orphan children, no sequence behind its table; cold run still exit 6, no destination consent exit 3, unsupported module exit 2 |
 | `mongodb_matrix.sh` | T-MONGO-IMMUT, T-IMMUT-MONGO-LP | 3, 4.7 | mongo 4..8 same/cross-major restore + catalog/BSON proof + abort/overwrite + a full run as a `read`-only user, proven from the mongod command log |
 | `filesystem_netns_test.sh` | T-FS-OWN, T-FS-IMMUT | 4 | ownership (root vs non-root) + immutability |
 | `filesystem_matrix.sh` | T-FS-MATRIX, T-FS-SPECIAL, T-FS-ATIME | 5.3 | every `M-FS-*` row: a privileged pass and an unprivileged one over the whole fixture, the three refusals, the access-time guard and the xattr refusal. Root only |
@@ -87,6 +88,8 @@ Environment switches the scripts read:
 | `RB_PG_NOTEMP_MODE` | `warn` | `postgres_matrix.sh` | `strict` turns the I-NOTEMP row from SKIP into a failure. Since § 3.3 the fingerprint no longer sorts; what still spills is the data stream's `ORDER BY`, which the read-back depends on |
 | `RUST_BACKUP_PG_LARGE_ROWS` | `2000000` | `postgres_large_table.sh` | rows in the single large table (about 1 KiB each) |
 | `RUST_BACKUP_RSS_LIMIT_KIB` | `262144` | `postgres_large_table.sh`, `bandwidth_netem.sh` | per-process peak-RSS cap |
+| `RUST_BACKUP_PG_HOT_PARENTS` | `50000` | `postgres_hot_backup.sh` | parent rows seeded (twice as many children) |
+| `RUST_BACKUP_PG_HOT_RATE` | `3000000` | `postgres_hot_backup.sh` | `--max-rate` in bytes/s, so writes land mid-transfer |
 
 Database arguments accept `source:destination`, for example:
 

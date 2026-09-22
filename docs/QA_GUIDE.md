@@ -225,6 +225,21 @@ bash e2e/postgres_large_table.sh 16
 
 In CI this is the job `postgres-large` (`timeout-minutes: 40`).
 
+The hot backup (`--hot-backup`) is proved against a source that keeps being
+written: a writer inserts parent/child pairs linked by a foreign key for the
+whole transfer, slowed with `--max-rate` so writes land between one table's
+`COPY` and the next. The restore must carry both hot-backup headlines with one
+commitment, every child must have its parent and no sequence may be behind its
+table; the same writes under a cold backup must still end in exit `6`, a
+destination without the flag must refuse the plan (exit `3`), and a module that
+cannot take a snapshot must refuse the flag (exit `2`).
+
+```bash
+bash e2e/postgres_hot_backup.sh 16
+```
+
+In CI this is the job `postgres-hot-backup` (`timeout-minutes: 40`).
+
 MongoDB 8 needs a host kernel older than 6.19: every published MongoDB 8 image
 refuses to start above that (SERVER-121912). On a newer kernel
 `e2e/mongodb_matrix.sh 8` prints a `SKIP` naming the kernel and exits 77, which

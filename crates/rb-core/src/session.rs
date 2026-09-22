@@ -23,7 +23,7 @@ use crate::channel::{
 };
 use crate::error::{BackupError, Phase, Result};
 use crate::module::{Destination, Source};
-use crate::plan::BackupPlan;
+use crate::plan::{BackupMode, BackupPlan, Preflight};
 use crate::progress::Progress;
 use crate::verification::{RestoreEvidence, VerificationReport};
 use crate::wire::{self, ControlFrame};
@@ -229,14 +229,19 @@ where
     }
 }
 
+/// `baseline` is `None` for a hot backup, which is not audited: its source was
+/// read through one snapshot while it kept changing.
 async fn audit_source_before_ack<S>(
     source: &dyn Source,
-    baseline: &str,
+    baseline: Option<&str>,
     stream: &mut S,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    let Some(baseline) = baseline else {
+        return Ok(());
+    };
     let current = match source.fingerprint().await {
         Ok(current) => current,
         Err(error) => {
@@ -306,6 +311,8 @@ pub struct SourceOutcome {
 ///
 /// SOURCE-IMMUTABILITY: the source fingerprint is captured before analyze and
 /// re-checked after streaming; any change is a hard [`BackupError::SourceMutated`].
+/// A hot backup ([`Source::hot_backup`]) is the one explicit exception: its
+/// source is online, so the audit is skipped and the run says so.
 pub async fn run_source(
     source: &dyn Source,
     channel: &dyn DataChannel,
@@ -323,22 +330,56 @@ pub async fn run_source_limited(
     progress: &Progress,
     max_rate: Option<u64>,
 ) -> Result<SourceOutcome> {
-    // 1. Immutability baseline (read-only).
-    let fp_before = source.fingerprint().await?;
+    // 1. Immutability baseline (read-only). A hot backup has none: its source
+    // is online and changes while it is read, so an audit would fail every
+    // run. Consistency comes from the module's single snapshot instead.
+    let hot = source.hot_backup();
+    let fp_before = if hot {
+        warn!(
+            "hot backup: the source stays online and is not audited for immutability; \
+             the destination is verified against the snapshot the source was read from"
+        );
+        None
+    } else {
+        Some(source.fingerprint().await?)
+    };
 
     // A panic must not become a way to skip the audit. I-IMMUT (`CLAUDE.md`)
     // holds on *every* exit path, and the run that panicked halfway through
     // reading the source is exactly the one whose source state is least
     // certain. `catch_unwind` turns the unwind into an ordinary error, which
     // then goes through the same failure-path fingerprint check as any other.
-    let outcome = AssertUnwindSafe(source_run(source, channel, progress, max_rate, &fp_before))
-        .catch_unwind()
-        .await
-        .unwrap_or_else(|payload| Err(panicked(payload)));
+    let outcome = AssertUnwindSafe(source_run(
+        source,
+        channel,
+        progress,
+        max_rate,
+        fp_before.as_deref(),
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|payload| Err(panicked(payload)));
 
     // 6. Immutability audit — the central invariant. It runs on EVERY exit path,
     // including a run that failed or was aborted mid-stream: an aborted transfer
     // is exactly the case where a half-applied source write would hide.
+    let Some(fp_before) = fp_before else {
+        return match outcome {
+            Ok(outcome) => {
+                progress.complete();
+                info!(
+                    items = outcome.verification.items_verified,
+                    bytes = outcome.verification.bytes_verified,
+                    blake3 = %outcome.verification.payload_blake3,
+                    detail = %outcome.verification.detail,
+                    "BACKUP VERIFIED (hot backup): destination read-back matches the source \
+                     snapshot; the online source was not audited"
+                );
+                Ok(outcome)
+            }
+            Err(run_error) => Err(run_error),
+        };
+    };
     match outcome {
         Ok(outcome) => {
             progress.complete();
@@ -388,10 +429,25 @@ async fn source_run(
     channel: &dyn DataChannel,
     progress: &Progress,
     max_rate: Option<u64>,
-    source_baseline: &str,
+    source_baseline: Option<&str>,
 ) -> Result<SourceOutcome> {
     // 2. Analyze and build the self-contained plan (read-only).
     let plan = source.analyze().await?;
+    // The plan's mode is what makes the destination ask its own operator for
+    // consent, so a source that skips the audit must say so in the plan — and
+    // a plan that claims a snapshot must come from a source that took one.
+    let hot_plan = plan.mode == BackupMode::HotSnapshot;
+    if hot_plan != source.hot_backup() {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!(
+                "module {} built a {:?} plan from a source opened with hot_backup={}",
+                plan.module,
+                plan.mode,
+                source.hot_backup()
+            ),
+        ));
+    }
     // The destination enforces the same bounds the moment it decodes the plan
     // (`channel::recv_plan`). Checking them here as well is what turns "the
     // peer rejected your plan after the whole source was read and sent" into a
@@ -507,7 +563,7 @@ async fn source_run(
 
 struct SourceAudit<'a> {
     source: &'a dyn Source,
-    baseline: &'a str,
+    baseline: Option<&'a str>,
 }
 
 /// Source payload path for the negotiated separate-data layout. The plan/control
@@ -851,7 +907,7 @@ where
     info!("\n{}", plan.render());
 
     // 2. Preflight (disk space, accessibility, version compat, privileges).
-    let preflight = dest.validate(&plan).await?;
+    let preflight = hot_backup_consent(dest.validate(&plan).await?, &plan, dest);
     for c in &preflight.checks {
         if c.passed {
             info!(check = %c.name, "{}", c.detail);
@@ -1013,7 +1069,8 @@ where
                 bytes = report.bytes_verified,
                 blake3 = %report.payload_blake3,
                 detail = %report.detail,
-                "RESTORE VERIFIED: persisted destination matches source"
+                "{}",
+                restore_verified_headline(&plan)
             );
             log_verification_extras(&report);
         }
@@ -1031,6 +1088,51 @@ where
         }
     }
     Ok(plan)
+}
+
+/// Fold the destination's consent to a hot-backup plan into its preflight.
+///
+/// A [`BackupMode::HotSnapshot`] plan comes from a source that stayed online
+/// and was not audited for immutability: the copy will match the snapshot the
+/// source read, not the source as it is by the time the restore ends. The
+/// source operator accepted that with `--hot-backup`; the destination's
+/// operator has to accept it too, or the plan fails preflight (exit 3) before a
+/// byte is applied.
+fn hot_backup_consent(
+    preflight: Preflight,
+    plan: &BackupPlan,
+    dest: &dyn Destination,
+) -> Preflight {
+    if plan.mode != BackupMode::HotSnapshot {
+        return preflight;
+    }
+    if dest.accepts_hot_backup() {
+        preflight.check(
+            "hot backup",
+            true,
+            format!(
+                "hot backup accepted: the copy will match the source snapshot of {}, \
+                 not the online source",
+                plan.created_at
+            ),
+        )
+    } else {
+        preflight.check(
+            "hot backup",
+            false,
+            "the source ran as a hot backup (online, not audited for immutability); \
+             pass --hot-backup to the destination to accept a copy of its snapshot",
+        )
+    }
+}
+
+/// The operator-facing `RESTORE VERIFIED` headline for `plan`.
+fn restore_verified_headline(plan: &BackupPlan) -> &'static str {
+    if plan.mode == BackupMode::HotSnapshot {
+        "RESTORE VERIFIED (hot backup): persisted destination matches the source snapshot"
+    } else {
+        "RESTORE VERIFIED: persisted destination matches source"
+    }
 }
 
 /// Print what the module proved beyond bytes, one line each, under the
@@ -1203,7 +1305,8 @@ async fn destination_stream_multi(
                 blake3 = %report.payload_blake3,
                 detail = %report.detail,
                 carriers = channel.carriers(),
-                "RESTORE VERIFIED: persisted destination matches source"
+                "{}",
+                restore_verified_headline(&plan)
             );
             log_verification_extras(&report);
         }

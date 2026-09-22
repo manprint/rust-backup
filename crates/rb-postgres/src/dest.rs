@@ -1370,6 +1370,7 @@ mod tests {
     fn params(database: Option<&str>) -> PostgresParams {
         PostgresParams {
             allow_unsupported_objects: false,
+            hot_backup: false,
             host: "localhost".into(),
             port: 5432,
             user: "postgres".into(),

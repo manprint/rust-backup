@@ -565,6 +565,23 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 
 ## 9. Blockers and open questions
 
+- **TODO (user-deferred, 2026-09-23) — view definitions differ at read-back on an Odoo database.**
+  A real restore of `synclinic` (Odoo) failed `[Verify]` exit `5` with three differences, all
+  `catalog.databases["synclinic"].schemas["public"].views[<v>].definition`, for
+  `purchase_bill_union`, `report_all_channels_sales` and `report_stock_quantity` — all three
+  report views built on `UNION`/`WITH`. The report's first 240 characters are identical on both
+  sides (`dest.rs` `compact_json`, `MAX = 240`), so the actual difference is not visible.
+  `restate_view_definitions` (`dest.rs`) re-renders every source view through a temporary view on
+  the destination before comparing, so two explanations remain: (a) the probe failed and the
+  comparison fell back to the source text verbatim — the destination log then carries `could not
+  re-render the view definition on the destination; comparing the source text verbatim` (a
+  destination role without `TEMP` on the restored database would do it) and a cross-major pair
+  then differs on any version-dependent rendering; (b) the probe succeeded and a real restore
+  still renders differently from a temporary view of the same text — a bug in this module. To
+  resolve: both server versions, the grep above on the destination log, and
+  `diff` of `pg_get_viewdef('public.<v>'::regclass, true)` taken on each side. Independently of
+  the cause, the difference report should show the region around the first differing character
+  instead of the first 240. The user deferred the investigation; nothing is changed for it yet.
 - No user-deferred question — the user adopted every recommended default at the clarification gate (D11-D27).
 - `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; ~~R7 `tokio-postgres 0.7.x` keepalive setters~~ **RESOLVED § 3.2**: the locked 0.7.18 exposes all four (`keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`); ~~R8 MinIO policy action names~~ **RESOLVED § 4.7**: MinIO rejects `s3:GetObjectAcl` as an unsupported action and needs no `s3:GetBucketLocation`; the working set is `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetObject`, `s3:GetObjectTagging` (AWS additionally takes `s3:GetObjectAcl`); ~~R9 `mongod --profile 0 --slowms 0` JSON logging~~ **RESOLVED § 4.7**: identical `"c":"COMMAND"` + `attr.command` + `attr.appName` shape on 4.4, 6.0 and 7.0 (8 unrunnable on this kernel).
 - ~~§ 6.1 mismatch list, input for § 6.2~~ **RESOLVED § 6.2**: the single row —
@@ -615,7 +632,7 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
 ## 10. Do-not-repeat
 
 - XOR as the commutative row commitment — rejected at design time: `{A,A,C}` and `{B,B,C}` collide. Use the wrapping `u128` sum plus exact count (D19).
-- Exported snapshot (`pg_export_snapshot`) for source consistency — rejected (D18): a long-held snapshot blocks vacuum on the source, and the fingerprint audit already fails the run on drift.
+- Exported snapshot (`pg_export_snapshot`) for source consistency — rejected (D18): a long-held snapshot blocks vacuum on the source, and the fingerprint audit already fails the run on drift. **Still rejected for a cold run.** The opt-in `--hot-backup` (2026-09-23, user request) takes the trade-off deliberately: a source that must stay online has no audit to fall back on, so it reads through one `REPEATABLE READ, READ ONLY` transaction per connection (never exported) and documents the vacuum and lock cost (`docs/modules/POSTGRES.md` § Hot backup).
 - `#[ignore]` for privilege- or service-dependent unit tests — not used in this repo; gate on an env var and print the skip reason instead.
 
 ## 11. Progress board

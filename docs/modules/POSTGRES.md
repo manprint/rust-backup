@@ -118,7 +118,7 @@ case in `e2e/fault_matrix.sh`:
 | Failure | Source | Destination |
 |---------|--------|-------------|
 | The destination process dies mid-stream | fails with a `Transfer` error, runs its failure-path immutability audit and reports the source unchanged — never a mutation it did not cause | whatever it had written is uncertified; nothing can clean up after a killed process |
-| Somebody writes to the source while it is read | the fingerprint audit catches it: `SOURCE-IMMUTABILITY VIOLATION`, exit `6` | the load may have completed, so the databases this run created are dropped — a copy of a moving source is never left behind looking complete |
+| Somebody writes to the source while it is read (cold run; a [hot backup](#hot-backup-hot_backup) expects it and is not audited) | the fingerprint audit catches it: `SOURCE-IMMUTABILITY VIOLATION`, exit `6` | the load may have completed, so the databases this run created are dropped — a copy of a moving source is never left behind looking complete |
 | The source process dies mid-`COPY` | — | the apply fails and the databases this run created are dropped |
 | The destination refuses the plan (preflight, or an existing database without `--overwrite`) | learns it as a plan rejection (exit `4`) and still audits the source | nothing was written, nothing is removed; an existing database is never touched |
 
@@ -192,6 +192,41 @@ ceiling (`MAX_PLAN_ITEMS`), which is what keeps a peer-supplied plan from
 dictating the destination's allocation. The source raises the refusal itself,
 naming the ceiling, before the plan is sent.
 
+## Hot backup (`hot_backup`)
+
+`--hot-backup` on both peers copies a source that stays online. The fingerprint
+above cannot work there — the application writes throughout, so the two
+measurements always differ — and a copy made of independent per-table `COPY`
+statements would be worse than a refusal: children read after their new parents
+were inserted fail their foreign key on the destination, and a sequence read
+before its table restarts below ids the copy already holds.
+
+The source therefore reads through **one snapshot per database**
+(`SourcePool::snapshot`): every pooled connection sends
+`BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY` right after connecting (after
+the role probe, whose failure must stay a missing warning) and keeps it until
+the run ends. Introspection, the sequence values, the row counts and every
+`COPY` then see the state of the first statement of that connection; sequences
+are read non-transactionally *after* the snapshot, so a restored sequence is
+never behind a restored id. A connection that drops mid-run is not replaced —
+a new one would read a later state — and the run fails with `hot backup: the
+connection holding the snapshot of database '…' was lost; restart the backup`.
+
+The session skips both fingerprint audits and prints `BACKUP VERIFIED (hot
+backup)` / `RESTORE VERIFIED (hot backup)` instead of the cold headlines. The
+plan is `BackupMode::HotSnapshot`, which a destination restores only with its
+own `hot_backup`; the destination's checks — catalog read-back, row counts,
+per-item BLAKE3 — are unchanged and are exact, because the plan and the stream
+describe the same snapshot.
+
+Costs, all bounded by the run: the transaction holds back vacuum's cleanup
+horizon, and it keeps the `ACCESS SHARE` lock of every relation it read, so DDL
+on those tables (and the queries queued behind that DDL) waits for the backup.
+`idle_in_transaction_session_timeout=0` is already pinned on source sessions, so
+a server-wide value cannot kill the snapshot while the destination reviews the
+plan. A whole-cluster run is consistent per database, not across databases —
+PostgreSQL cannot share a snapshot between databases.
+
 ## Determinism of the read-back
 
 Table items are streamed ordered by the C-collated text of the whole row, and the
@@ -250,6 +285,14 @@ The error names every offender. `allow_unsupported_objects=true`
 (`-P allow_unsupported_objects=true`) accepts a knowingly partial copy; the run
 then logs exactly what it leaves behind.
 
+Default privileges are the most common refusal on application databases, and
+the narrowest loss: existing grants (`relacl`) are copied like any other ACL,
+and what is left behind is only the rule applied to objects a role creates
+*after* the restore. Each offender reads `schema.role:objtype` (no `schema.`
+for a role-wide rule), `objtype` being `pg_default_acl.defaclobjtype`. How to
+read the rules on the source and recreate them on the destination is in
+[docs/usage/03-postgres.md](../usage/03-postgres.md#caso-frequente-alter-default-privileges).
+
 ## Runtime model and guardrails
 
 A formal review of the module's runtime behaviour, one line per checked
@@ -267,7 +310,7 @@ in this repository.
 | g | Every fallible path carries the phase it happened in. Two sites were wrong and were fixed in this review: counting a materialized view's rows and the item-framing check both run inside apply and were tagged `Verify`. | `dest.rs` `matview_count_error`, `item_end_mismatch`; tests `review_g_matview_count_error_is_tagged_apply`, `review_g_item_end_mismatch_is_tagged_apply` | FIXED |
 | h | Backpressure is the consumer's (I-BANDWIDTH): a chunk write waits on the substream window, so a slow destination stalls the source's `COPY` reads. No buffer decouples them, and the module uses one carrier. | `source.rs` `copy_stream_to_sink`; `lib.rs` `max_carriers() == 1`; `e2e/bandwidth_netem.sh` | PASS |
 | i | The read-back runs the source code path against the **destination**: `verify` passes the destination's own parameters, so it cannot reach the source host. | `lib.rs` `PostgresDestination::verify` | PASS |
-| j | Nothing on the source side issues `BEGIN`, `START TRANSACTION` or `SET TRANSACTION`, so the read-only default of the session cannot be relaxed from inside. Phase 4 § 4.2 turns this into an enforced allowlist. | grep over `source.rs`, `introspect.rs`, `immutability.rs`, `connect.rs` | PASS |
+| j | Nothing on the source side issues `BEGIN`, `START TRANSACTION` or `SET TRANSACTION` of its own making, so the read-only default of the session cannot be relaxed from inside. Phase 4 § 4.2 turns this into an enforced allowlist. The one exception is the hot backup's constant `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY`, sent by a method that takes no SQL and opens a transaction that cannot write. | grep over `source.rs`, `introspect.rs`, `immutability.rs`, `connect.rs`; `read_only_client_has_no_write_methods` | PASS |
 
 ### Connections, timeouts and keepalives
 
@@ -322,7 +365,7 @@ say so:
   write that somehow got past both layers still fails at the backend.
 
 On top of that the run is bracketed by two fingerprints, so any drift ends it as
-a source mutation.
+a source mutation — except in a hot backup (below), which is not audited.
 
 At connect time the source role is probed once
 (`rolsuper`/`rolcreatedb`/`rolcreaterole`, plus

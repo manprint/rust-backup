@@ -17,7 +17,7 @@ echo "exit=$?"     # 0 = copia verificata; qualunque altro valore = nessuna cert
 | `3` | preflight | la destinazione non è in condizione di ricevere: database già presente senza `--overwrite`, root non vuota, privilegi insufficienti | sistemare la destinazione e ripetere |
 | `4` | piano rifiutato | l'operatore ha risposto qualcosa di diverso da `yes` al prompt (o stdin era chiuso) | usare `--yes` / `auto_accept: true` nelle esecuzioni non interattive |
 | `5` | integrità / apply / verify | un digest o la rilettura non coincidono, il numero di righe ripristinate non coincide con quello contato sulla sorgente, oppure l'applicazione è fallita | **il ripristino non è utilizzabile**: indagare e rieseguire da zero |
-| `6` | sorgente modificata | l'impronta della sorgente è cambiata fra l'inizio e la fine | fermare le scritture sulla sorgente (o usare uno snapshot) e ripetere |
+| `6` | sorgente modificata | l'impronta della sorgente è cambiata fra l'inizio e la fine | fermare le scritture sulla sorgente (o usare uno snapshot) e ripetere; per PostgreSQL in linea, `--hot-backup` su entrambi i lati ([03](03-postgres.md#backup-a-caldo---hot-backup)) |
 | `7` | trasporto / connessione | coordinatore irraggiungibile, segreto errato, TLS fallito, peer assente | verificare rete, `--to`, `--channel`, segreto e certificati |
 
 In una sessione con più target falliti vale il codice **più grave**, in
@@ -37,6 +37,15 @@ items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s  status="verified"
 
 Il programma non stampa mai quelle righe per una copia parziale. Una conferma di
 completamento priva della prova di rilettura viene rifiutata.
+
+Un backup a caldo (`--hot-backup`, solo PostgreSQL) stampa invece queste due, e
+mai la prima riga qui sopra, perché la sorgente in linea non è stata verificata
+immutata: la destinazione coincide con lo snapshot letto dalla sorgente.
+
+```text
+BACKUP VERIFIED (hot backup): destination read-back matches the source snapshot; the online source was not audited
+RESTORE VERIFIED (hot backup): persisted destination matches the source snapshot
+```
 
 Per PostgreSQL la destinazione aggiunge sotto quella riga ciò che ha verificato
 — `rows verified: …`, `constraints: …` e un `deviation: …` per ogni scostamento
@@ -60,6 +69,9 @@ di righe che non torna lo fa diventare `5`. Il dettaglio delle righe è in
 | `exact uid/gid restore requires root or CAP_CHOWN` | `3` | destinazione filesystem non privilegiata: `sudo` o `--no-preserve-ownership` |
 | `destination prefix contains stale objects not in the source` | `3` | prefisso S3 sporco: `--overwrite` o prefisso nuovo |
 | `filesystem follow_symlinks and preserve_xattr are not supported` | `7` | opzioni non supportate da questa build |
+| `the source ran as a hot backup (online, not audited for immutability); pass --hot-backup to the destination …` | `3` | la sorgente ha fatto un backup a caldo e la destinazione non l'ha accettato: aggiungere `--hot-backup` alla destinazione |
+| `--hot-backup is not supported by the … module` | `2` | `--hot-backup` passato a un modulo diverso da PostgreSQL |
+| `hot backup: the connection holding the snapshot of database '…' was lost; restart the backup` | `7` | durante un backup a caldo è caduta la connessione che teneva lo snapshot: ripetere |
 | `interrupted by SIGINT/SIGTERM` | `1` | esecuzione interrotta: l'elemento attivo è stato rimosso, nulla è certificato |
 
 ## Diagnostica passo per passo

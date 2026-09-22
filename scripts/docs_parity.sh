@@ -67,7 +67,7 @@ OWNERSHIP = {
     ],
     "03-postgres.md": [
         "--host", "--port", "--user", "--password", "--database", "--sslmode",
-        "--admin", "--overwrite", "--extension-version",
+        "--admin", "--overwrite", "--extension-version", "--hot-backup",
     ],
     "04-mongodb.md": [
         "--host", "--port", "--user", "--password", "--database",

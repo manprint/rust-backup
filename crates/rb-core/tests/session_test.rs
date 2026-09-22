@@ -1379,3 +1379,172 @@ async fn an_oversized_plan_is_refused_by_the_source_before_any_payload_moves() {
         "the refusal must land before a substream is taken from the channel"
     );
 }
+
+/// A source opened for a hot backup: it stays online, so its fingerprint
+/// differs on every call (a cold one stays put), and `plan_mode` lets a test
+/// make it build the wrong kind of plan. `fingerprints` counts the audit calls.
+struct HotSource {
+    fingerprints: Arc<AtomicUsize>,
+    hot: bool,
+    plan_mode: BackupMode,
+}
+
+#[async_trait]
+impl Source for HotSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        let mut plan = demo_plan();
+        plan.mode = self.plan_mode.clone();
+        Ok(plan)
+    }
+    async fn stream_out(&self, _p: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
+        sink.send_chunk(1, 0, b"x").await?;
+        sink.finish_item(1, 1, &rb_core::wire::blake3_hex(b"x"))
+            .await
+    }
+    async fn fingerprint(&self) -> Result<String> {
+        let n = self.fingerprints.fetch_add(1, Ordering::SeqCst);
+        if self.hot {
+            Ok(format!("fp-{n}"))
+        } else {
+            Ok("fp-stable".to_string())
+        }
+    }
+    fn hot_backup(&self) -> bool {
+        self.hot
+    }
+}
+
+/// A destination whose operator did (or did not) pass `--hot-backup`.
+struct ConsentingDest {
+    consents: bool,
+    applied: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Destination for ConsentingDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+    fn accepts_hot_backup(&self) -> bool {
+        self.consents
+    }
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        self.applied.fetch_add(1, Ordering::SeqCst);
+        loop {
+            if let ChunkEvent::End = src.next().await? {
+                return Ok(());
+            }
+        }
+    }
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Ok(evidence.report("in-memory destination read-back"))
+    }
+}
+
+fn hot_source(fingerprints: &Arc<AtomicUsize>) -> HotSource {
+    HotSource {
+        fingerprints: fingerprints.clone(),
+        hot: true,
+        plan_mode: BackupMode::HotSnapshot,
+    }
+}
+
+/// `--hot-backup` on both sides: a source that changes under the run completes
+/// and is verified, and it is never fingerprinted — the audit a live source
+/// fails by construction is skipped, not run and ignored.
+#[tokio::test]
+async fn a_hot_backup_skips_the_immutability_audit() {
+    let ch = TestChannel::pair();
+    let fingerprints = Arc::new(AtomicUsize::new(0));
+    let src = hot_source(&fingerprints);
+    let applied = Arc::new(AtomicUsize::new(0));
+    let dst = ConsentingDest {
+        consents: true,
+        applied: applied.clone(),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let s = tokio::spawn(async move { session::run_source(&src, &*ch, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&dst, &*ch2, &p2, &mut yes).await
+    });
+    let outcome = s
+        .await
+        .unwrap()
+        .expect("a hot backup of a drifting source succeeds");
+    assert_eq!(outcome.plan.mode, BackupMode::HotSnapshot);
+    let plan = d
+        .await
+        .unwrap()
+        .expect("the consenting destination restores it");
+    assert_eq!(plan.mode, BackupMode::HotSnapshot);
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fingerprints.load(Ordering::SeqCst),
+        0,
+        "a hot source must not be fingerprinted"
+    );
+}
+
+/// The destination's operator has to accept a hot backup too: without its own
+/// `--hot-backup` the plan fails preflight before anything is applied.
+#[tokio::test]
+async fn a_hot_plan_fails_preflight_without_destination_consent() {
+    let ch = TestChannel::pair();
+    let fingerprints = Arc::new(AtomicUsize::new(0));
+    let src = hot_source(&fingerprints);
+    let applied = Arc::new(AtomicUsize::new(0));
+    let dst = ConsentingDest {
+        consents: false,
+        applied: applied.clone(),
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let s = tokio::spawn(async move { session::run_source(&src, &*ch, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&dst, &*ch2, &p2, &mut yes).await
+    });
+    let derr = d.await.unwrap().expect_err("no consent, no restore");
+    assert!(
+        matches!(derr, rb_core::error::BackupError::Preflight(_)),
+        "got: {derr}"
+    );
+    assert!(s.await.unwrap().is_err(), "source must see the refusal");
+    assert_eq!(applied.load(Ordering::SeqCst), 0, "nothing may be applied");
+}
+
+/// The plan's mode is what asks the destination for consent, so a source must
+/// not skip the audit behind a plan that claims a cold copy — nor claim a
+/// snapshot it did not take. Both are refused before a substream is taken.
+#[tokio::test]
+async fn a_source_whose_plan_mode_contradicts_its_hot_flag_is_refused() {
+    for (hot, plan_mode) in [
+        (true, BackupMode::Copy1to1),
+        (false, BackupMode::HotSnapshot),
+    ] {
+        let ch = TestChannel::pair();
+        let src = HotSource {
+            fingerprints: Arc::new(AtomicUsize::new(0)),
+            hot,
+            plan_mode,
+        };
+        let error = session::run_source(&src, &*ch, &Progress::default())
+            .await
+            .expect_err("a contradictory plan must not be sent");
+        assert!(
+            error.to_string().contains("[Analyze]"),
+            "hot={hot}: expected an Analyze-phase refusal, got: {error}"
+        );
+        assert_eq!(
+            ch.provider.lock().unwrap().len(),
+            2,
+            "hot={hot}: the refusal must land before a substream is taken"
+        );
+    }
+}

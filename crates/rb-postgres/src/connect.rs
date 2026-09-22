@@ -151,6 +151,10 @@ async fn connect_inner(
 /// legitimately long. A destination session writes DDL and refreshes
 /// materialized views, both of which legitimately take locks and time, so it
 /// sets neither timeout.
+///
+/// `idle_in_transaction_session_timeout=0` also overrides a server-wide value
+/// for a hot backup, whose snapshot transaction sits idle by design while the
+/// destination reviews the plan ([`SourcePool::snapshot`]).
 fn session_timeout_options(read_only: bool) -> String {
     if read_only {
         // `default_transaction_read_only=on`: every transaction in this session
@@ -231,7 +235,29 @@ impl ReadOnlyClient {
         guard_read_only(sql)?;
         self.inner.copy_out(sql).await.map_err(driver_error)
     }
+
+    /// Open the read-only snapshot a hot backup reads through (see
+    /// [`SourcePool::snapshot`]).
+    ///
+    /// The only statement this type sends past [`guard_read_only`], which
+    /// refuses `BEGIN` from every caller: the text is the constant
+    /// [`BEGIN_READ_ONLY_SNAPSHOT`] and nothing else, and what it opens cannot
+    /// write — `READ ONLY` there, on a session already forced read-only at
+    /// startup.
+    pub(crate) async fn begin_read_only_snapshot(&self) -> Result<()> {
+        self.inner
+            .query(BEGIN_READ_ONLY_SNAPSHOT, &[])
+            .await
+            .map(drop)
+            .map_err(driver_error)
+    }
 }
+
+/// `REPEATABLE READ` takes the snapshot at the first statement after it and
+/// keeps it until the transaction ends, so every catalog read, row count,
+/// sequence read and `COPY` of the connection sees the same database state —
+/// what `pg_dump` does. `READ ONLY` makes the transaction unable to write.
+const BEGIN_READ_ONLY_SNAPSHOT: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY";
 
 /// Wrap a driver error without inventing a phase: every call site knows the
 /// phase and the operation, and adds both with `BackupError::phase_src`.
@@ -574,6 +600,8 @@ pub(crate) struct SourcePool {
     conns: Mutex<HashMap<String, ReadOnlyConnection>>,
     /// The role probe has run (it is about the role, not the database).
     probed: AtomicBool,
+    /// Hot backup: every connection reads through one snapshot transaction.
+    snapshot: bool,
 }
 
 /// A borrowed pooled connection. Held for one statement or one `COPY`.
@@ -585,6 +613,27 @@ impl SourcePool {
             params,
             conns: Mutex::new(HashMap::new()),
             probed: AtomicBool::new(false),
+            snapshot: false,
+        }
+    }
+
+    /// The pool of a hot backup: every connection opens a `REPEATABLE READ,
+    /// READ ONLY` transaction before its first read and keeps it until the pool
+    /// is dropped. Analysis (catalog, sequence values, row counts) and the
+    /// `COPY` of each table then see one state of their database even while
+    /// the application keeps writing, so the restored rows satisfy their
+    /// foreign keys, no sequence restarts below an id it already handed out,
+    /// and the destination's row counts match the plan's.
+    ///
+    /// The snapshot is per database: PostgreSQL cannot share one across
+    /// databases, so a whole-cluster hot backup is consistent within each
+    /// database, not between them (as with `pg_dumpall`). The transaction holds
+    /// an `ACCESS SHARE` lock on every relation it has read until the run ends,
+    /// so DDL on those tables waits for the backup.
+    pub(crate) fn snapshot(params: PostgresParams) -> Self {
+        Self {
+            snapshot: true,
+            ..Self::new(params)
         }
     }
 
@@ -600,16 +649,36 @@ impl SourcePool {
             .map(str::to_string)
             .unwrap_or_else(|| self.params.bootstrap_database());
         let mut guard = self.conns.lock().await;
-        let stale = guard
-            .get(&name)
-            .map(|conn| conn.client.is_closed())
-            .unwrap_or(true);
-        if stale {
+        let existing = guard.get(&name).map(|conn| conn.client.is_closed());
+        if self.snapshot && existing == Some(true) {
+            // A new connection would read a newer state than everything this
+            // run already read from the database: the copy would mix two
+            // snapshots, which is exactly what a hot backup must not do.
+            return Err(BackupError::phase(
+                Phase::Connect,
+                format!(
+                    "hot backup: the connection holding the snapshot of database '{name}' \
+                     was lost; restart the backup"
+                ),
+            ));
+        }
+        if existing.unwrap_or(true) {
             let conn = ReadOnlyConnection::connect(&self.params, &name).await?;
             // On the freshly opened connection, before it is handed out: the
-            // probe is two `SELECT`s and runs once per run.
+            // probe is two `SELECT`s and runs once per run. It also runs before
+            // the snapshot transaction opens, because a failed probe is only a
+            // missing warning — inside the transaction it would abort it.
             if !self.probed.swap(true, Ordering::Relaxed) {
                 warn_if_role_can_write(&conn.client, &self.params.user).await;
+            }
+            if self.snapshot {
+                conn.client.begin_read_only_snapshot().await.map_err(|e| {
+                    BackupError::phase_src(
+                        Phase::Connect,
+                        format!("open the hot-backup snapshot of database '{name}'"),
+                        e,
+                    )
+                })?;
             }
             guard.insert(name.clone(), conn);
         }
@@ -812,6 +881,17 @@ mod tests {
         assert_eq!(first, second, "the pool opened a second backend");
     }
 
+    /// The one statement `begin_read_only_snapshot` sends past the guard is
+    /// still refused from every other caller, and it is the transaction a hot
+    /// backup needs: one snapshot for the whole connection, unable to write.
+    #[test]
+    fn the_snapshot_begin_is_read_only_and_refused_by_the_guard() {
+        assert!(guard_read_only(BEGIN_READ_ONLY_SNAPSHOT).is_err());
+        assert!(BEGIN_READ_ONLY_SNAPSHOT.contains("REPEATABLE READ"));
+        assert!(BEGIN_READ_ONLY_SNAPSHOT.ends_with("READ ONLY"));
+        assert!(!BEGIN_READ_ONLY_SNAPSHOT.contains(';'));
+    }
+
     async fn backend_pid(client: &ReadOnlyClient) -> i32 {
         client
             .query_one("SELECT pg_backend_pid()", &[])
@@ -824,6 +904,7 @@ mod tests {
         let host = std::env::var("RUST_BACKUP_PG_HOST").ok()?;
         Some(PostgresParams {
             allow_unsupported_objects: false,
+            hot_backup: false,
             host,
             port: std::env::var("RUST_BACKUP_PG_PORT")
                 .ok()
@@ -1007,6 +1088,21 @@ mod tests {
             block.matches("guard_read_only(sql)?").count(),
             taking_sql,
             "a method takes SQL without calling the guard"
+        );
+        // The inner client is reached by the guarded methods, by `is_closed`,
+        // and by exactly one unguarded statement: the hot-backup snapshot
+        // `BEGIN`, whose text is a constant.
+        assert_eq!(
+            block
+                .matches(".query(BEGIN_READ_ONLY_SNAPSHOT, &[])")
+                .count(),
+            1,
+            "the snapshot BEGIN must send its constant and nothing else"
+        );
+        assert_eq!(
+            block.matches("self.inner").count(),
+            taking_sql + 2,
+            "a new path reaches the inner client"
         );
     }
 

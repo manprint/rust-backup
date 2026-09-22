@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use rb_core::channel::{ChunkSink, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
-use rb_core::plan::{BackupPlan, Preflight};
+use rb_core::plan::{BackupMode, BackupPlan, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 
 /// What to install when the destination cannot provide the exact version of an
@@ -112,6 +112,21 @@ pub struct PostgresParams {
     /// leaves behind.
     #[serde(default)]
     pub allow_unsupported_objects: bool,
+
+    /// Both sides: hot backup of a source that stays online.
+    ///
+    /// Source: each database is read through one `REPEATABLE READ, READ ONLY`
+    /// transaction, so the catalog, the sequence values, the row counts and
+    /// every `COPY` see a single consistent state even while the application
+    /// writes; the session skips the immutability audit, which a live source
+    /// fails by construction. The plan is marked
+    /// [`BackupMode::HotSnapshot`].
+    ///
+    /// Destination: accepts such a plan. The restored copy is verified as
+    /// strictly as a cold one — against the snapshot, not against the source's
+    /// later state.
+    #[serde(default)]
+    pub hot_backup: bool,
 }
 
 fn default_pg_port() -> u16 {
@@ -150,11 +165,19 @@ impl BackupModule for Module {
         "PostgreSQL 10+ (logical, pure Rust)"
     }
 
+    fn supports_hot_backup(&self) -> bool {
+        true
+    }
+
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>> {
         let pg_params: PostgresParams = params.deserialize()?;
-        Ok(Box::new(PostgresSource {
-            pool: SourcePool::new(pg_params),
-        }))
+        let hot = pg_params.hot_backup;
+        let pool = if hot {
+            SourcePool::snapshot(pg_params)
+        } else {
+            SourcePool::new(pg_params)
+        };
+        Ok(Box::new(PostgresSource { pool, hot }))
     }
 
     async fn open_destination(&self, params: &TargetParams) -> Result<Box<dyn Destination>> {
@@ -173,6 +196,9 @@ impl BackupModule for Module {
 /// database instead of one per phase.
 struct PostgresSource {
     pool: SourcePool,
+    /// Opened with `hot_backup`: the pool reads through one snapshot per
+    /// database and the plan is a [`BackupMode::HotSnapshot`].
+    hot: bool,
 }
 
 #[async_trait]
@@ -184,7 +210,11 @@ impl Source for PostgresSource {
         // destination's read-back, and none of those needs a second full scan
         // of every table.
         introspect::gather_row_counts(&self.pool, &mut payload).await?;
-        Ok(introspect::build_plan(&payload, introspect::now_rfc3339()))
+        let mut plan = introspect::build_plan(&payload, introspect::now_rfc3339());
+        if self.hot {
+            plan.mode = BackupMode::HotSnapshot;
+        }
+        Ok(plan)
     }
 
     async fn stream_out(&self, plan: &BackupPlan, sink: &mut dyn ChunkSink) -> Result<()> {
@@ -193,6 +223,10 @@ impl Source for PostgresSource {
 
     async fn fingerprint(&self) -> Result<String> {
         immutability::fingerprint(&self.pool).await
+    }
+
+    fn hot_backup(&self) -> bool {
+        self.hot
     }
 }
 
@@ -213,6 +247,10 @@ struct PostgresDestination {
 impl Destination for PostgresDestination {
     async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
         dest::validate(&self.params, plan).await
+    }
+
+    fn accepts_hot_backup(&self) -> bool {
+        self.params.hot_backup
     }
 
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
@@ -318,6 +356,135 @@ mod tests {
 
         let source = m.open_source(&params).await;
         assert!(source.is_ok());
+    }
+
+    /// `hot_backup` is off unless asked for, and when asked for it reaches both
+    /// sides: the source reports it to the session (which then skips the
+    /// immutability audit) and the destination accepts a hot plan.
+    #[tokio::test]
+    async fn hot_backup_is_opt_in_on_both_sides() {
+        let m = Module;
+        assert!(m.supports_hot_backup());
+        let cold = TargetParams::from_value(serde_json::json!({
+            "host": "localhost",
+            "user": "postgres",
+        }));
+        let hot = TargetParams::from_value(serde_json::json!({
+            "host": "localhost",
+            "user": "postgres",
+            "hot_backup": true,
+        }));
+        assert!(!m.open_source(&cold).await.unwrap().hot_backup());
+        assert!(m.open_source(&hot).await.unwrap().hot_backup());
+        assert!(!m
+            .open_destination(&cold)
+            .await
+            .unwrap()
+            .accepts_hot_backup());
+        assert!(m.open_destination(&hot).await.unwrap().accepts_hot_backup());
+    }
+
+    /// Live: a snapshot pool keeps reading the state it started from while
+    /// another session commits, inside a read-only `REPEATABLE READ`
+    /// transaction; an ordinary pool sees the commit. Runs only against a real
+    /// server, as a role that may create a scratch table.
+    #[tokio::test]
+    async fn snapshot_pool_reads_one_state_while_another_session_writes() {
+        let Some(params) = live_pg_params() else {
+            eprintln!(
+                "SKIP snapshot_pool_reads_one_state_while_another_session_writes: \
+                 set RUST_BACKUP_PG_HOST to run"
+            );
+            return;
+        };
+        let database = params.bootstrap_database();
+        let writer = PgConnection::connect(&params, &database)
+            .await
+            .expect("writer connection");
+        let table = format!("rb_hot_snapshot_{}", std::process::id());
+        writer
+            .client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id int); \
+                 INSERT INTO {table} VALUES (1);"
+            ))
+            .await
+            .expect("create the scratch table");
+        let count = format!("SELECT count(*)::int8 FROM {table}");
+
+        let snapshot = connect::SourcePool::snapshot(params.clone());
+        let before: i64 = {
+            let conn = snapshot.get(Some(&database)).await.expect("snapshot conn");
+            let settings = conn
+                .client
+                .query_one(
+                    "SELECT current_setting('transaction_isolation'), \
+                     current_setting('transaction_read_only')",
+                    &[],
+                )
+                .await
+                .expect("transaction settings");
+            assert_eq!(settings.get::<_, String>(0), "repeatable read");
+            assert_eq!(settings.get::<_, String>(1), "on");
+            conn.client
+                .query_one(&count, &[])
+                .await
+                .expect("count")
+                .get(0)
+        };
+        writer
+            .client
+            .batch_execute(&format!("INSERT INTO {table} VALUES (2)"))
+            .await
+            .expect("concurrent write");
+        let after: i64 = {
+            let conn = snapshot.get(Some(&database)).await.expect("snapshot conn");
+            conn.client
+                .query_one(&count, &[])
+                .await
+                .expect("count")
+                .get(0)
+        };
+        let fresh: i64 = {
+            let pool = connect::SourcePool::new(params.clone());
+            let conn = pool.get(Some(&database)).await.expect("plain conn");
+            conn.client
+                .query_one(&count, &[])
+                .await
+                .expect("count")
+                .get(0)
+        };
+        drop(snapshot);
+        writer
+            .client
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await
+            .expect("drop the scratch table");
+
+        assert_eq!(before, 1);
+        assert_eq!(after, 1, "the snapshot must not see a later commit");
+        assert_eq!(fresh, 2, "an ordinary pool sees the commit");
+    }
+
+    fn live_pg_params() -> Option<PostgresParams> {
+        let host = std::env::var("RUST_BACKUP_PG_HOST").ok()?;
+        Some(PostgresParams {
+            host,
+            port: std::env::var("RUST_BACKUP_PG_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            user: std::env::var("RUST_BACKUP_PG_USER").unwrap_or_else(|_| "postgres".into()),
+            password: std::env::var("RUST_BACKUP_PG_PASSWORD").ok(),
+            database: std::env::var("RUST_BACKUP_PG_DATABASE").ok(),
+            sslmode: "prefer".into(),
+            sslrootcert: None,
+            admin: false,
+            overwrite: false,
+            extension_version: ExtensionVersionPolicy::Source,
+            allow_unsupported_objects: false,
+            hot_backup: false,
+        })
     }
 
     /// analyze now performs a real read-only connection; with no server reachable

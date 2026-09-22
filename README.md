@@ -431,6 +431,13 @@ reported by preflight (normally cluster administration, role and database
 creation). Existing target databases are rejected unless `--overwrite` (or the
 equivalent `overwrite: true` YAML parameter) is explicitly configured.
 
+A source that cannot be stopped — an application that keeps writing — is copied
+with `--hot-backup` on **both** peers. Each database is then read through one
+`REPEATABLE READ, READ ONLY` snapshot, the destination is verified against that
+snapshot, and the immutability audit, which a live source fails by construction,
+is skipped and reported as such
+([docs/usage/03-postgres.md](docs/usage/03-postgres.md#backup-a-caldo---hot-backup)).
+
 Pass credentials in the environment, not on the command line:
 `/proc/<pid>/cmdline` is world-readable on Linux, so a `--password` flag is
 visible to every local account for as long as the transfer runs, while

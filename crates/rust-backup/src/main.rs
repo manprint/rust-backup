@@ -242,6 +242,16 @@ struct ModuleParamArgs {
         require_equals = true
     )]
     allow_atime_updates: Option<bool>,
+    /// postgres, both sides: hot backup of an online source — one consistent snapshot, no immutability audit.
+    #[arg(
+        long = "hot-backup",
+        env = "RUST_BACKUP_HOT_BACKUP",
+        value_parser = boolish(),
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    hot_backup: Option<bool>,
 
     /// Extra module params as key=value (repeatable); overrides typed flags.
     #[arg(short = 'P', long = "param")]
@@ -344,6 +354,7 @@ impl ModuleParamArgs {
         put_bool("follow_symlinks", self.follow_symlinks);
         put_bool("preserve_xattr", self.preserve_xattr);
         put_bool("allow_atime_updates", self.allow_atime_updates);
+        put_bool("hot_backup", self.hot_backup);
         // The switch is spelled in the negative; the parameter is not.
         put_bool(
             "preserve_ownership",
@@ -674,6 +685,7 @@ async fn print_plan(reg: &ModuleRegistry, a: &PlanArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("unknown module '{module}'"))?;
     let underlay = a.params.underlay(module, Role::Source)?;
     let params = merge_params(underlay.as_ref().map(|t| &t.params), a.params.overlay()?);
+    refuse_unsupported_hot_backup(&m, &params)?;
     let src = m.open_source(&params).await.map_err(anyhow::Error::new)?;
     let plan = src.analyze().await.map_err(anyhow::Error::new)?;
     // The dry-run has to refuse exactly what a transfer would refuse, or its
@@ -904,6 +916,30 @@ fn clamp_carriers(
     transport
 }
 
+/// `hot_backup` is a promise only a module that can read a consistent snapshot
+/// of an online source keeps. Every other module ignores unknown params, so
+/// without this refusal `--hot-backup` would run a cold copy of a live backend
+/// and fail its immutability audit at the end of the transfer — or, on the
+/// destination, accept nothing it was asked to accept.
+fn refuse_unsupported_hot_backup(
+    module: &Arc<dyn rb_core::BackupModule>,
+    params: &TargetParams,
+) -> anyhow::Result<()> {
+    let requested = params
+        .0
+        .get("hot_backup")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if requested && !module.supports_hot_backup() {
+        return Err(anyhow::Error::new(rb_core::BackupError::Config(format!(
+            "--hot-backup is not supported by the {} module: it cannot read a consistent \
+             snapshot of an online source",
+            module.name()
+        ))));
+    }
+    Ok(())
+}
+
 async fn execute(
     module: &Arc<dyn rb_core::BackupModule>,
     role: Role,
@@ -911,6 +947,7 @@ async fn execute(
     params: &TargetParams,
     auto_accept: bool,
 ) -> anyhow::Result<()> {
+    refuse_unsupported_hot_backup(module, params)?;
     let progress = Progress::default();
     // Clamp the requested carrier count by what THIS module can restore before
     // the transport opens anything. The destination also enforces its own cap
@@ -1510,6 +1547,53 @@ targets:
         assert!(auto_accept);
     }
 
+    /// `--hot-backup` reaches the module as `hot_backup` on either side, and is
+    /// a configuration error on a module that cannot read a consistent
+    /// snapshot of an online source — never silently ignored.
+    #[test]
+    fn hot_backup_flag_reaches_postgres_and_is_refused_elsewhere() {
+        for role in ["source", "destination"] {
+            let cli = parse(&[
+                "rust-backup",
+                "postgres",
+                role,
+                "--to",
+                "coord:7835",
+                "--channel",
+                "c1",
+                "--host",
+                "db",
+                "--user",
+                "u",
+                "--hot-backup",
+            ]);
+            let Cmd::Postgres(a) = cli.cmd else {
+                panic!("expected postgres subcommand")
+            };
+            let (_, params, _) = resolve_target(&a, "postgres", a.role.into()).expect("resolve");
+            assert_eq!(params.0["hot_backup"], true, "{role}");
+            refuse_unsupported_hot_backup(&rb_postgres::module(), &params)
+                .expect("postgres supports hot backup");
+        }
+        let hot = TargetParams(serde_json::json!({ "hot_backup": true }));
+        for module in [
+            rb_filesystem::module(),
+            rb_mongodb::module(),
+            rb_s3::module(),
+        ] {
+            let error = refuse_unsupported_hot_backup(&module, &hot)
+                .expect_err("only postgres can take a hot backup");
+            assert_eq!(exit_code(&error), 2, "{}: {error}", module.name());
+            assert!(
+                error.to_string().contains("--hot-backup is not supported"),
+                "{error}"
+            );
+        }
+        let cold = TargetParams(serde_json::json!({ "hot_backup": false }));
+        refuse_unsupported_hot_backup(&rb_filesystem::module(), &cold)
+            .expect("an explicit false is not a request");
+    }
+
     /// The atime opt-in is a filesystem *source* concern: it reaches the
     /// module as `allow_atime_updates`, it defaults to absent (so the module
     /// refuses an atime-moving read), and it can be turned back off from the
@@ -1635,6 +1719,7 @@ targets:
             ("postgres", "insecure"),
             ("postgres", "admin"),
             ("postgres", "overwrite"),
+            ("postgres", "hot-backup"),
             ("postgres", "udp"),
             ("mongodb", "yes"),
             ("s3", "path-style"),

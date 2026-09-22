@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### `--hot-backup`: copy a PostgreSQL source that stays online
+
+- **New flag `--hot-backup` (`RUST_BACKUP_HOT_BACKUP`, YAML `hot_backup: true`),
+  PostgreSQL only, on both peers.** A source whose application keeps writing —
+  Odoo's cron jobs, queues and sessions never stop — failed every run with
+  `SOURCE-IMMUTABILITY VIOLATION` (exit `6`), because the audit compares the
+  whole cluster before and after the copy.
+- **The copy is one snapshot, not a relaxed check.** Each source connection
+  opens `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY` before its first read
+  and keeps it for the run, as `pg_dump` does, so the catalog, the sequence
+  values, the row counts and every `COPY` describe one instant. Without it a
+  written source restores children whose parent was never read, sequences
+  behind the ids already copied, and row counts the destination rejects — the
+  cold run of the new e2e fails its integrity check exactly that way.
+- **The immutability audit is skipped, and says so.** The source prints `BACKUP
+  VERIFIED (hot backup): destination read-back matches the source snapshot; the
+  online source was not audited`, never `source unchanged`. The destination's
+  verification is unchanged and exact against the snapshot, and prints `RESTORE
+  VERIFIED (hot backup)`.
+- **Both operators consent.** The plan is `mode=HotSnapshot`; a destination
+  without its own `--hot-backup` fails it at preflight (exit `3`) before writing
+  anything, and an older build cannot decode it. On any other module the flag is
+  a configuration error (exit `2`).
+- Cost, documented in `docs/usage/03-postgres.md`: the snapshot holds back
+  vacuum and keeps `ACCESS SHARE` on every table read until the run ends, so DDL
+  on them waits for the backup. A whole-cluster run is consistent per database.
+- Proved by `e2e/postgres_hot_backup.sh` (CI job `postgres-hot-backup`).
+
 ## 0.0.10 — prerelease (2026-09-22)
 
 ### Static musl archives: the binary runs on Alpine

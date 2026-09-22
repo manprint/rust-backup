@@ -20,6 +20,14 @@ pub const PLAN_FORMAT_VERSION: u16 = 1;
 pub enum BackupMode {
     /// Full 1:1 copy — destination becomes byte/logical-equivalent to source.
     Copy1to1,
+    /// Full copy of a source that stays online (`--hot-backup`). The source
+    /// reads one consistent snapshot, the destination is verified against that
+    /// snapshot, and the source is NOT audited for immutability: its live state
+    /// moves on while it is read. A destination restores such a plan only when
+    /// its own operator accepted it too
+    /// ([`crate::module::Destination::accepts_hot_backup`]). A build that
+    /// predates this variant cannot decode the plan and refuses it.
+    HotSnapshot,
 }
 
 /// One ordered unit of work in the plan (a table, a collection, a file, an

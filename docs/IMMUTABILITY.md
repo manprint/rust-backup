@@ -49,14 +49,14 @@ documented as harmless.
 | `LISTEN` / `NOTIFY` / `UNLISTEN` | no (by guard) | never issued; on the deny list | `guard_rejects_each_denied_statement`, IMMUT-READONLY-LOG |
 | `SET` / `RESET` of a session GUC | no (by guard) | the session pins every GUC it needs in the startup options and never changes one afterwards | `guard_rejects_each_denied_statement`, `read_only_options_include_lock_and_statement_timeouts` |
 | `ANALYZE` / `VACUUM` / `REINDEX` / `CLUSTER` | no (by guard) | never issued; on the deny list, because they write catalog statistics or rewrite storage | `guard_rejects_each_denied_statement` |
-| `pg_export_snapshot` | no (by guard) | the source does not open a snapshot-exporting transaction; every statement is its own implicit transaction | `guard_rejects_each_denied_statement`, IMMUT-READONLY-LOG |
+| `pg_export_snapshot` | no (by guard) | the source never exports a snapshot. A cold run's statements are each their own implicit transaction; a hot backup holds one `REPEATABLE READ, READ ONLY` transaction per connection and shares it with nobody | `guard_rejects_each_denied_statement`, IMMUT-READONLY-LOG |
 | A source role that *could* write (superuser, `INSERT` grants) | accepted, warned | the role is probed once per run and a warning names it; the tool never refuses a role the operator chose | `role_probe_query_text_is_read_only`, T-IMMUT-PG-LP |
 | Spill to the source's `pgsql_tmp` | accepted, reduced | the fingerprint no longer sorts (order-independent commitment, § "Fingerprint contract"); the data stream still sorts by the C-collated row text, which the destination read-back depends on | NOTEMP (matrix, reporting), T-PG-FP2 |
 | Prepared transactions (`PREPARE TRANSACTION`) | no (by guard) | never issued; `PREPARE` is on the deny list | `guard_rejects_each_denied_statement`, IMMUT-READONLY-LOG |
 | Replication slots / `pg_switch_wal` / restore points | no (by guard) | the module is logical and never touches WAL; the functions are on the deny list | `guard_rejects_each_denied_statement`, IMMUT-READONLY-LOG |
-| `BEGIN READ WRITE` overriding the read-only default | no (by guard) | the source path issues no transaction-control statement at all, and the allowlist refuses every one of them | `guard_rejects_each_denied_statement`, runtime-model review item (j), `docs/modules/POSTGRES.md` |
+| `BEGIN READ WRITE` overriding the read-only default | no (by guard) | the allowlist refuses every transaction-control statement. The only one the source ever sends is the constant `BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY` of a hot backup, through `ReadOnlyClient::begin_read_only_snapshot` — a method that takes no SQL | `guard_rejects_each_denied_statement`, `read_only_client_has_no_write_methods`, `the_snapshot_begin_is_read_only_and_refused_by_the_guard`, runtime-model review item (j), `docs/modules/POSTGRES.md` |
 | Statistics counters (`pg_stat_*`) | accepted | reading moves them; the fingerprint normalizes planner estimates so autovacuum and `ANALYZE` cannot look like user mutation | `catalog_hash_ignores_estimate_drift_but_not_structure` |
-| `ACCESS SHARE` locks held while `COPY` runs | accepted | a plain read lock. It does not change data, but it does block a concurrent `ALTER TABLE` / `DROP` for the duration of the copy, and a `lock_timeout` of 30 s bounds the opposite direction | T-PG-TIMEOUT |
+| `ACCESS SHARE` locks held while `COPY` runs | accepted | a plain read lock. It does not change data, but it does block a concurrent `ALTER TABLE` / `DROP` for the duration of the copy, and a `lock_timeout` of 30 s bounds the opposite direction. A hot backup holds every lock it took until the run ends, because its snapshot transaction does | T-PG-TIMEOUT, T-PG-HOT |
 
 ### MongoDB
 
@@ -97,6 +97,36 @@ documented as harmless.
 | `mmap` writes | no | files are read with ordinary `read` calls | T-FS-IMMUT |
 | Symlink following outside the root | no | the walk resolves entries under a checked root and copies symlinks as symlinks | T-FS-OWN |
 | Temporary files on the source | no | nothing is staged anywhere (I-NOTEMP) | T-HYGIENE |
+
+## Hot backup: the one opt-out
+
+`--hot-backup` (PostgreSQL only, both peers) is for a source that cannot be
+stopped. Its application keeps writing, so the fingerprint audit would fail
+every run; the session therefore **skips it** — it does not measure and ignore,
+it does not measure — and says so in a warning and in the `BACKUP VERIFIED (hot
+backup)` headline, which never claims an unchanged source.
+
+What still holds:
+
+- **Nothing written by this tool.** Every guard in the table above stays on:
+  the read-only type, the statement allowlist, the read-only session, and a
+  transaction opened `READ ONLY`.
+- **A consistent copy.** Each database is read through one `REPEATABLE READ`
+  snapshot, so the plan, the row counts and every `COPY` describe one instant,
+  and the destination's read-back is as strict as for a cold copy — against that
+  snapshot.
+- **Consent on both sides.** The plan is `HotSnapshot`; a destination without
+  its own `--hot-backup` fails it at preflight (exit `3`) before applying
+  anything, and a module that cannot take a snapshot refuses the flag (exit
+  `2`).
+
+What is given up is the proof that the source did not change — by construction
+it did — and, for the length of the run, vacuum progress and DDL on the tables
+already read (the transaction holds them). Evidence: T-PG-HOT
+(`e2e/postgres_hot_backup.sh`), `a_hot_backup_skips_the_immutability_audit`,
+`a_hot_plan_fails_preflight_without_destination_consent`,
+`a_source_whose_plan_mode_contradicts_its_hot_flag_is_refused`,
+`snapshot_pool_reads_one_state_while_another_session_writes`.
 
 ## Fingerprint contract
 

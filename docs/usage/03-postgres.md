@@ -56,6 +56,7 @@ RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
 | `--sslmode <modo>` | `RUST_BACKUP_SSLMODE` | `prefer` | entrambi | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `--admin[=bool]` | `RUST_BACKUP_ADMIN` | falso | destinazione | dichiara che la connessione è amministrativa: serve per creare ruoli, database e applicare le proprietà |
 | `--overwrite[=bool]` | `RUST_BACKUP_OVERWRITE` | falso | destinazione | autorizza il ripristino sopra database già esistenti. Senza, il preflight fallisce |
+| `--hot-backup[=bool]` | `RUST_BACKUP_HOT_BACKUP` | falso | entrambi | backup **a caldo** di una sorgente che resta in linea: la sorgente legge ogni database da un solo snapshot e non viene sottoposta all'audit di immutabilità; la destinazione deve passarlo anch'essa per accettare il piano. Vedi [Backup a caldo](#backup-a-caldo---hot-backup) |
 | `--extension-version <source\|default>` | `RUST_BACKUP_EXTENSION_VERSION` | `source` | destinazione | quale versione installare per ogni estensione della sorgente. `source`: esattamente quella della sorgente, e il preflight rifiuta il piano se la destinazione non ce l'ha. `default`: la versione predefinita della destinazione, registrata come `deviation:` nella riga `RESTORE VERIFIED` |
 | `-P sslrootcert=<file.pem>` | — | nessuno | entrambi | CA privata per `require`/`verify-ca`/`verify-full` |
 | `-P allow_unsupported_objects=true` | — | falso | sorgente | accetta una copia *consapevolmente parziale* di un cluster che contiene oggetti non riproducibili (vedi sotto) |
@@ -136,6 +137,88 @@ deviation: extension rbtest restored at version 1.1 (source 1.0)
 Le stesse informazioni escono anche come campi strutturati dell'evento
 `PostgreSQL destination read-back verified`, per chi raccoglie i log.
 
+## Backup a caldo (`--hot-backup`)
+
+Di norma la sorgente deve restare **ferma** per tutta la copia: all'inizio e
+alla fine calcola un'impronta del cluster (catalogo, stato delle sequenze e un
+hash di ogni riga) e, se le due differiscono, fallisce con codice `6`. Con
+un'applicazione in linea, per esempio Odoo, le scritture non si fermano mai
+(cron, code, sessioni, sequenze) e la copia fallisce sempre.
+
+`--hot-backup` copia una sorgente che resta in linea:
+
+```bash
+# sorgente: l'applicazione continua a lavorare
+RUST_BACKUP_PASSWORD='…' rust-backup postgres source \
+  --to coordinatore:7835 --channel pg --secret-file ./secret.txt \
+  --host pg-sorgente --user backup_readonly --database app --hot-backup
+
+# destinazione: anche qui serve --hot-backup, altrimenti il piano è rifiutato
+RUST_BACKUP_PASSWORD='…' rust-backup postgres destination \
+  --to coordinatore:7835 --channel pg --secret-file ./secret.txt \
+  --host pg-destinazione --user postgres --admin --yes --hot-backup
+```
+
+**Cosa fa.** Ogni connessione della sorgente apre una sola transazione
+`REPEATABLE READ, READ ONLY` prima della prima lettura e la tiene fino alla fine
+dell'esecuzione, come fa `pg_dump`. Catalogo, valori delle sequenze, conteggi
+delle righe e ogni `COPY` vedono quindi **lo stesso istante** del database,
+anche mentre l'applicazione scrive. Ne segue che:
+
+- le righe ripristinate rispettano le foreign key (una tabella figlia non può
+  essere stata letta dopo che la madre ha ricevuto righe nuove);
+- nessuna sequenza riparte da un valore già usato da una riga copiata;
+- la verifica della destinazione resta **severa come a freddo** (catalogo,
+  conteggi, rilettura con BLAKE3), ma rispetto allo snapshot, non alla sorgente
+  come sarà alla fine.
+
+**Cosa si accetta passando il flag.**
+
+- La sorgente **non** viene sottoposta all'audit di immutabilità: le scritture
+  dell'applicazione durante la copia sono attese. Le protezioni del programma
+  restano tutte attive (ruolo e sessione in sola lettura, allowlist delle
+  istruzioni, transazione `READ ONLY`).
+- La destinazione è la copia dello snapshot preso all'inizio dell'analisi: ciò
+  che l'applicazione scrive dopo quell'istante **non** è nel backup.
+- Senza `--database` (intero cluster) lo snapshot è **per database**:
+  PostgreSQL non permette di condividerne uno fra database diversi. Ogni
+  database è coerente al suo interno, non rispetto agli altri (come
+  `pg_dumpall`).
+
+**Effetti sulla sorgente durante la copia.**
+
+- La transazione aperta trattiene il vacuum: le versioni morte delle righe
+  prodotte nel frattempo non vengono ripulite finché il backup non termina.
+  Per un backup di qualche ora è normale; su un database con moltissime
+  scritture conviene farlo nelle ore meno cariche.
+- La transazione tiene un lock `ACCESS SHARE` su ogni tabella già letta fino
+  alla fine: un `ALTER TABLE`, `DROP`, `TRUNCATE`, `VACUUM FULL` o `REINDEX` su
+  quelle tabelle **attende** la fine del backup, e le query che arrivano dopo di
+  lui su quella tabella attendono a loro volta. Non aggiornare i moduli
+  dell'applicazione (per Odoo: `-u`/installazioni) durante un backup a caldo.
+- Se la connessione che tiene lo snapshot cade, la copia si ferma con
+  `hot backup: the connection holding the snapshot of database '…' was lost;
+  restart the backup` invece di proseguire su uno snapshot diverso.
+
+**Cosa stampa.** Al posto delle righe consuete compaiono:
+
+```text
+WARN hot backup: the source stays online and is not audited for immutability; the destination is verified against the snapshot the source was read from
+BACKUP VERIFIED (hot backup): destination read-back matches the source snapshot; the online source was not audited
+RESTORE VERIFIED (hot backup): persisted destination matches the source snapshot
+```
+
+Il piano mostra `mode=HotSnapshot`. Una destinazione avviata senza
+`--hot-backup` lo rifiuta in preflight (codice `3`) con `the source ran as a hot
+backup (online, not audited for immutability); pass --hot-backup to the
+destination to accept a copy of its snapshot`, prima di scrivere qualsiasi
+cosa. Una build precedente a questa funzione non riconosce il piano e lo
+rifiuta.
+
+`--hot-backup` esiste solo per PostgreSQL: sugli altri moduli è un errore di
+configurazione (codice `2`), perché nessuno di loro sa leggere uno snapshot
+coerente di una sorgente in linea.
+
 ## Oggetti che fanno fallire l'analisi (di proposito)
 
 L'analisi si **rifiuta** di procedere se il cluster contiene oggetti che questa
@@ -155,7 +238,109 @@ Per accettare comunque una copia parziale:
 rust-backup postgres source … -P allow_unsupported_objects=true
 ```
 
-L'esecuzione elenca allora nei log esattamente ciò che lascia indietro.
+L'esecuzione elenca allora nei log esattamente ciò che lascia indietro:
+
+```text
+WARN rb_postgres::introspect: allow_unsupported_objects is set: this backup is NOT a 1:1 copy unsupported=…
+```
+
+### Come leggere il messaggio
+
+```text
+[Analyze] this build cannot reproduce the following objects, and the catalog read-back cannot detect their absence either, so the run would report a verified copy of a cluster that had lost them: default privileges (ALTER DEFAULT PRIVILEGES) (2): synclinic.odoo:S, synclinic.odoo:r. Set allow_unsupported_objects=true to accept a knowingly partial copy.
+```
+
+- Ogni classe di oggetti compare come `<classe> (<totale>): <nome>, <nome>, …`,
+  con al massimo cinque nomi seguiti da `and N more`. Classi diverse sono
+  separate da `;`.
+- Il controllo gira **un database alla volta** e si ferma al primo che contiene
+  oggetti non supportati. Il messaggio non nomina il database: con `--database`
+  è quello indicato; senza, dopo averlo risolto l'esecuzione successiva può
+  fermarsi sul database seguente.
+- Il rifiuto avviene in analisi, prima di qualunque trasferimento: esce con
+  codice `1` e la destinazione non riceve nulla.
+- Lo stesso rifiuto compare con `rust-backup plan postgres …`: è il modo più
+  rapido per controllare un cluster senza avviare la destinazione.
+
+### Caso frequente: `ALTER DEFAULT PRIVILEGES`
+
+Le regole `ALTER DEFAULT PRIVILEGES` non riguardano gli oggetti che esistono
+già: stabiliscono quali `GRANT` riceveranno in automatico le tabelle, le
+sequenze o le funzioni che un ruolo **creerà in futuro**. Servono tipicamente a
+dare a un secondo ruolo (reporting, sola lettura) l'accesso a ciò che
+l'applicazione crea da sé. Questa build non le copia.
+
+Ogni regola compare nel messaggio come `schema.ruolo:tipo`, senza `schema.`
+quando la regola vale per tutti gli schemi del ruolo (`ALTER DEFAULT
+PRIVILEGES FOR ROLE … GRANT …` senza `IN SCHEMA`). Il tipo è la lettera di
+`pg_default_acl.defaclobjtype`:
+
+| Lettera | Oggetti futuri |
+|---------|----------------|
+| `r` | tabelle e viste |
+| `S` | sequenze |
+| `f` | funzioni e procedure |
+| `T` | tipi |
+| `n` | schemi |
+
+Nell'esempio sopra, `synclinic.odoo:r` e `synclinic.odoo:S` sono due regole
+sulle tabelle e sulle sequenze che il ruolo `odoo` creerà nello schema
+`synclinic`.
+
+**Cosa si perde davvero.** I privilegi già concessi su tabelle e sequenze
+esistenti vengono copiati come tutti gli altri, insieme ai dati e alle
+proprietà. Si perde solo l'automatismo: sulla destinazione, un oggetto creato
+dopo il restore (per esempio una tabella aggiunta da un aggiornamento
+dell'applicazione) non riceve i `GRANT` che avrebbe ricevuto sulla sorgente.
+
+**Come procedere.**
+
+1. Leggere le regole sulla sorgente, collegati al database indicato
+   (`pg_default_acl` è per database):
+
+   ```sql
+   \ddp
+   -- oppure, senza psql:
+   SELECT pg_get_userbyid(d.defaclrole) AS ruolo,
+          n.nspname                     AS schema,
+          d.defaclobjtype               AS tipo,
+          d.defaclacl                   AS privilegi
+   FROM pg_default_acl d
+   LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace;
+   ```
+
+   `privilegi` è nel formato ACL di PostgreSQL: `{reporting=r/odoo}` significa
+   "`reporting` riceve `SELECT`, concesso da `odoo`". Le lettere più comuni:
+   `r` = `SELECT`, `a` = `INSERT`, `w` = `UPDATE`, `d` = `DELETE`,
+   `D` = `TRUNCATE`, `x` = `REFERENCES`, `t` = `TRIGGER`, `U` = `USAGE`,
+   `X` = `EXECUTE`, `C` = `CREATE`.
+
+2. Eseguire il backup accettando la copia parziale:
+
+   ```bash
+   rust-backup postgres source … -P allow_unsupported_objects=true
+   ```
+
+3. Dopo il restore, ricreare le stesse regole sulla destinazione, collegati allo
+   stesso database, con un superutente o un membro del ruolo proprietario della
+   regola. Per l'esempio sopra, se `\ddp` avesse mostrato `{reporting=r/odoo}`
+   su tabelle e `{reporting=rU/odoo}` su sequenze:
+
+   ```sql
+   ALTER DEFAULT PRIVILEGES FOR ROLE odoo IN SCHEMA synclinic
+     GRANT SELECT ON TABLES TO reporting;
+   ALTER DEFAULT PRIVILEGES FOR ROLE odoo IN SCHEMA synclinic
+     GRANT SELECT, USAGE ON SEQUENCES TO reporting;
+   ```
+
+   Poi controllare che `\ddp` mostri sulla destinazione le stesse righe della
+   sorgente. La verifica finale del programma copre ciò che ha copiato, non
+   queste regole: ricrearle spetta all'operatore.
+
+Se le regole sono obsolete, revocarle sulla sorgente (`ALTER DEFAULT
+PRIVILEGES … REVOKE …`) fa passare l'analisi senza l'opzione. È però una
+modifica al database di produzione, che il programma non fa mai da sé: la
+decisione resta all'operatore.
 
 ## Privilegi
 
@@ -299,7 +484,9 @@ Schema completo in [07 — Sessioni YAML](07-sessioni-yaml.md).
 | exit `3`, privilegi insufficienti | l'utente di destinazione non è amministrativo: aggiungere `--admin` e i diritti `CREATEROLE`/`CREATEDB` |
 | analisi rifiutata per una sequenza | manca `SELECT`/`USAGE` sulla sequenza indicata sul lato sorgente |
 | analisi rifiutata per oggetti non supportati | vedi la sezione dedicata: valutare `-P allow_unsupported_objects=true` sapendo cosa si perde |
-| exit `6` | la sorgente è cambiata durante l'esecuzione: fermare la scrittura sul cluster di origine e ripetere |
+| analisi rifiutata per `default privileges (ALTER DEFAULT PRIVILEGES)` | regole sui privilegi degli oggetti *futuri*, quelli esistenti sono copiati: vedi [Caso frequente: `ALTER DEFAULT PRIVILEGES`](#caso-frequente-alter-default-privileges) |
+| exit `6` | la sorgente è cambiata durante l'esecuzione: fermare la scrittura sul cluster di origine e ripetere, oppure — se la sorgente deve restare in linea — usare [`--hot-backup`](#backup-a-caldo---hot-backup) su entrambi i lati |
+| exit `3`, `pass --hot-backup to the destination` | la sorgente ha fatto un backup a caldo: aggiungere `--hot-backup` anche alla destinazione |
 | exit `5` | la rilettura della destinazione non coincide: **il ripristino non è valido**, non usarlo |
 
 Tabella completa dei codici: [11 — Codici di uscita](11-codici-uscita.md).

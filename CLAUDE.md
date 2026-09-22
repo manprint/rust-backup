@@ -46,7 +46,11 @@ against an in-memory channel.
   audits `Source::fingerprint()` before and after every run (incl. aborted runs)
   and returns `BackupError::SourceMutated` on any drift. Source DB users must be
   read-only; filesystem opens read-only (`O_NOATIME` where possible). This is the
-  most heavily tested invariant — see Phase 8.1.
+  most heavily tested invariant — see Phase 8.1. The one explicit opt-out is
+  `--hot-backup` (postgres only, both peers): the source stays online, the audit
+  is skipped (never run-and-ignored), consistency comes from one `REPEATABLE
+  READ, READ ONLY` snapshot per database, and the plan is `HotSnapshot` so the
+  destination must consent too (`docs/IMMUTABILITY.md` § Hot backup).
 - **I-NOTEMP — no temp files.** Data flows backend→`ChunkSink`→channel→`ChunkSource`
   →backend in ≤1 MiB chunks. Never buffer a whole item to disk (unlike bore
   `transfer.rs`, which stages for resume — we do NOT).

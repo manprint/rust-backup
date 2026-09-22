@@ -66,6 +66,16 @@ pub trait Source: Send + Sync {
     /// A stable fingerprint of source state (catalog hash, fs tree hash, object
     /// listing hash…). Used by the session to prove immutability. Read-only.
     async fn fingerprint(&self) -> Result<String>;
+
+    /// Whether this source was opened for a hot backup: it reads one consistent
+    /// snapshot of a backend that keeps being written, and its plan is
+    /// [`crate::plan::BackupMode::HotSnapshot`]. The session then skips the
+    /// fingerprint audit, which a live backend fails by construction. Only a
+    /// module whose [`BackupModule::supports_hot_backup`] is true may return
+    /// true here.
+    fn hot_backup(&self) -> bool {
+        false
+    }
 }
 
 /// The destination side of a target: validate and apply the streamed payload.
@@ -79,6 +89,15 @@ pub trait Destination: Send + Sync {
     /// Preflight the plan: disk space, accessibility, version compatibility,
     /// privilege checks. The transfer proceeds only if `Preflight::ok`.
     async fn validate(&self, plan: &BackupPlan) -> Result<Preflight>;
+
+    /// Whether this destination's operator accepted a hot-backup plan
+    /// ([`crate::plan::BackupMode::HotSnapshot`]). The session fails the
+    /// preflight of such a plan otherwise: the restored copy matches a snapshot
+    /// of a source that kept changing, and consent to that belongs to both
+    /// sides.
+    fn accepts_hot_backup(&self) -> bool {
+        false
+    }
 
     /// Apply the streamed payload to reach 1:1 with the source. No temp files.
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()>;
@@ -116,6 +135,15 @@ pub trait BackupModule: Send + Sync {
 
     /// Human-readable supported-version range (e.g. "PostgreSQL 10+").
     fn version_support(&self) -> &'static str;
+
+    /// Whether this module can take a hot backup (`hot_backup` param): read a
+    /// consistent snapshot of a source that stays online. The binary refuses
+    /// the param for a module that cannot, rather than let it run a cold copy
+    /// of a live backend and fail the immutability audit — or worse, restore
+    /// tables read at different moments.
+    fn supports_hot_backup(&self) -> bool {
+        false
+    }
 
     /// Open a read-only source from connection params.
     async fn open_source(&self, params: &TargetParams) -> Result<Box<dyn Source>>;
