@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.9 — prerelease (2026-09-22)
 
 ### The plan item ceiling is 200 000, and it is now reachable
 
