@@ -180,6 +180,19 @@ certify a tree whose contents had been rewritten in place.
 - Extended attributes and POSIX ACLs are **not captured at all**, so a restore
   cannot reproduce them; asking for them with `--preserve-xattr` is refused
   while connecting rather than silently dropped.
+- **A tree of more than 100 000 entries is refused.** One plan item per regular
+  file, and the plan's item ceiling (`MAX_PLAN_ITEMS`) is what bounds the
+  destination's allocation from a peer-supplied plan. An ordinary system root
+  already exceeds it, so this module is for a data tree, not for `/`. The source
+  raises the refusal itself, naming the ceiling, as soon as the plan is built —
+  it is no longer a rejection that arrives from the peer after the whole tree
+  has been read and sent.
+- **The source tree is read three times per run**: the fingerprint before, the
+  transfer, and the fingerprint after. The fingerprint hashes every file's
+  contents, which is what lets it catch a change that preserved size and mtime,
+  and I-IMMUT requires it on both sides of the run — including a run that
+  failed. Budget roughly three times the tree's size in source reads, and note
+  that the destination read-back adds a fourth full read on its own side.
 - Unix sockets are refused while analyzing (see "What is preserved"). FIFOs and
   device nodes round-trip, devices only where the destination has root or
   `CAP_MKNOD`.

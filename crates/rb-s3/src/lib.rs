@@ -25,7 +25,7 @@ use tokio::io::AsyncReadExt;
 use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
-use rb_core::plan::{BackupPlan, PlanItem, Preflight};
+use rb_core::plan::{human_bytes, BackupPlan, PlanItem, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 use rb_core::wire::CHUNK_SIZE;
 
@@ -516,6 +516,22 @@ impl Destination for S3Destination {
                 }
             }
         }
+        // A multipart part is assembled whole in memory before it is uploaded,
+        // and `part_size_for` scales it with the object so the part count stays
+        // under S3's 10 000 limit — an object near the 5 TiB ceiling therefore
+        // needs a ~524 MiB buffer on this host. Nothing on disk (I-NOTEMP
+        // holds), but it is the destination's real peak and an operator must
+        // see it before accepting the plan, not discover it as an OOM.
+        let peak_part = peak_part_bytes(&payload.objects);
+        result = result.check(
+            "multipart-memory",
+            true,
+            format!(
+                "largest object needs {} of destination memory for one multipart part",
+                human_bytes(peak_part)
+            ),
+        );
+
         result = result.check(
             "target-keys",
             duplicates.is_empty(),
@@ -860,6 +876,18 @@ fn part_size_for(total_bytes: u64) -> usize {
         .max(needed)
         .try_into()
         .unwrap_or(usize::MAX)
+}
+
+/// The largest single multipart part this plan will make the destination hold
+/// in memory: one part of its biggest object, since `restore_object` assembles
+/// a part whole before uploading it and never keeps two.
+fn peak_part_bytes(objects: &[S3Object]) -> u64 {
+    objects
+        .iter()
+        .map(|object| object.size)
+        .max()
+        .map(|largest| part_size_for(largest) as u64)
+        .unwrap_or(0)
 }
 
 /// Refuse an object whose catalog size and plan-item size disagree.
@@ -1218,6 +1246,29 @@ mod tests {
         assert!(
             error.contains("declares 2048 bytes") && error.contains("catalog says 1024"),
             "the error must name both sizes: {error}"
+        );
+    }
+
+    /// The preflight line an operator reads before accepting a plan must name
+    /// the destination's real peak: one part of the biggest object, because a
+    /// part is assembled whole in memory and `part_size_for` scales it with the
+    /// object to stay under S3's 10 000-part limit.
+    #[test]
+    fn the_peak_part_is_one_part_of_the_largest_object() {
+        assert_eq!(peak_part_bytes(&[]), 0);
+        assert_eq!(
+            peak_part_bytes(&[object("small", 1), object("tiny", 2)]),
+            PART_SIZE as u64,
+            "small objects still cost one minimum part"
+        );
+        assert_eq!(
+            peak_part_bytes(&[
+                object("small", 1),
+                object("huge", MAX_S3_OBJECT_BYTES),
+                object("medium", 4096),
+            ]),
+            MAX_S3_OBJECT_BYTES.div_ceil(MAX_MULTIPART_PARTS),
+            "the largest object sets the peak, wherever it sits in the catalog"
         );
     }
 

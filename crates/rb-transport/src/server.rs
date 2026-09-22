@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{interval, timeout, Instant};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use rb_core::config::ServerConfig;
 
@@ -44,17 +44,29 @@ const STREAM_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type Registry = Arc<DashMap<String, Arc<CarrierPool>>>;
 
-async fn send_control<S>(control: &mut Delimited<S>, msg: ServerMsg) -> bool
+/// Send one control frame, giving up after [`CONTROL_SEND_TIMEOUT`].
+///
+/// Both failures end the control loop for `id`, so both say so: a silent
+/// `false` left the reap line 60 s later as the only evidence, and it names the
+/// symptom rather than the side that stopped first (I-OBSERV).
+async fn send_control<S>(id: &str, control: &mut Delimited<S>, msg: ServerMsg) -> bool
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match timeout(CONTROL_SEND_TIMEOUT, control.send_server(msg)).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
-            debug_assert!(!error.to_string().is_empty());
+            debug!(%id, %error, "control send failed; dropping the control loop");
             false
         }
-        Err(_) => false,
+        Err(_) => {
+            warn!(
+                %id,
+                timeout = ?CONTROL_SEND_TIMEOUT,
+                "control send timed out: the peer is not reading its control substream"
+            );
+            false
+        }
     }
 }
 
@@ -251,7 +263,7 @@ where
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if !send_control(control, ServerMsg::Heartbeat).await {
+                if !send_control(id, control, ServerMsg::Heartbeat).await {
                     return Ok(());
                 }
             }
@@ -260,6 +272,7 @@ where
                 if let Ok(peer) = res {
                     info!(%id, peer_candidate_count = peer.addrs.len(), "received peer candidates");
                     if !send_control(
+                        id,
                         control,
                         ServerMsg::UdpPunch {
                             peer_addrs: peer.addrs,
@@ -274,7 +287,7 @@ where
             _ = &mut udp_deadline, if udp_pending => {
                 udp_pending = false;
                 warn!(%id, "udp broker timeout; falling back to relay");
-                if !send_control(control, ServerMsg::UdpUnavailable).await {
+                if !send_control(id, control, ServerMsg::UdpUnavailable).await {
                     return Ok(());
                 }
             }

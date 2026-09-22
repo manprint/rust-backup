@@ -180,9 +180,17 @@ wrapping sum of `md5(row)`, folded client-side while the server streams one hash
 per row). Addition and not XOR: XOR cancels duplicated rows, so `{A, A, C}` and
 `{B, B, C}` would look identical. Nothing is sorted and nothing is aggregated
 server-side, so the audit itself writes no temporary file, and it costs one full
-read of each table per audit. Any drift between the two measurements is
-`SourceMutated` (I-IMMUT). The digest is prefixed `rust-backup/pg-fingerprint/v2`
-and is not comparable with a digest taken by an older build.
+read of each table per audit. The audit runs twice, so a run reads the cluster
+three times in total — before, during the transfer, and after — and the
+destination read-back adds a fourth full read on its own side. Any drift between
+the two measurements is `SourceMutated` (I-IMMUT). The digest is prefixed
+`rust-backup/pg-fingerprint/v2` and is not comparable with a digest taken by an
+older build.
+
+A cluster of more than 100 000 data items is refused against the plan's item
+ceiling (`MAX_PLAN_ITEMS`), which is what keeps a peer-supplied plan from
+dictating the destination's allocation. The source raises the refusal itself,
+naming the ceiling, before the plan is sent.
 
 ## Determinism of the read-back
 

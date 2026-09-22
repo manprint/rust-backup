@@ -1321,3 +1321,61 @@ async fn a_refused_plan_does_not_ask_the_destination_to_undo_anything() {
         "nothing was applied, so there was nothing to undo"
     );
 }
+
+/// A plan above `MAX_PLAN_ITEMS` is refused by the SOURCE, before the payload
+/// stream is ever opened (T-SESS-PLAN-CAP).
+///
+/// The destination has always rejected such a plan on receipt, but only after
+/// the source had fingerprinted, walked and analysed the whole backend and
+/// pushed the plan across — hours of source I/O reported back as a peer-side
+/// Connect failure. The cap is a property of the plan, so the side that builds
+/// the plan is the side that must name it.
+struct OversizedPlanSource {
+    streamed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Source for OversizedPlanSource {
+    async fn analyze(&self) -> Result<BackupPlan> {
+        Ok(many_item_plan(
+            u32::try_from(rb_core::channel::MAX_PLAN_ITEMS + 1).expect("cap fits in u32"),
+        ))
+    }
+
+    async fn stream_out(&self, _plan: &BackupPlan, _sink: &mut dyn ChunkSink) -> Result<()> {
+        self.streamed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn fingerprint(&self) -> Result<String> {
+        Ok("stable-oversized".into())
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_plan_is_refused_by_the_source_before_any_payload_moves() {
+    let channel = TestChannel::pair();
+    let streamed = Arc::new(AtomicUsize::new(0));
+    let source = OversizedPlanSource {
+        streamed: streamed.clone(),
+    };
+
+    let error = session::run_source(&source, &*channel, &Progress::default())
+        .await
+        .expect_err("a plan above the item cap must not be sent");
+
+    assert!(
+        error.to_string().contains("limit is"),
+        "the refusal must name the ceiling: {error}"
+    );
+    assert_eq!(
+        streamed.load(Ordering::Relaxed),
+        0,
+        "no payload may be streamed for a plan the source already refused"
+    );
+    assert_eq!(
+        channel.consumer.lock().unwrap().len(),
+        2,
+        "the refusal must land before a substream is taken from the channel"
+    );
+}

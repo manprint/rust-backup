@@ -242,8 +242,19 @@ impl ReadOnlyDatabase {
 /// The `_id`-ordered read every source path uses: the source streams documents
 /// in this order and the destination read-back re-runs the same query, so the
 /// per-item BLAKE3 matches only if both sides agree on the order.
+///
+/// `no_cursor_timeout` is not an optimisation — it is what makes the cursor
+/// survive its own design. `stream_out` pulls the next document only after
+/// `send_chunk` returns, and `send_chunk` blocks on the consumer-paced
+/// substream window (I-BANDWIDTH) and on any `--max-rate` pacing. A server
+/// reaps a cursor idle longer than `cursorTimeoutMillis` (10 minutes by
+/// default), so a destination slower than the source by that much used to kill
+/// the backup with `CursorNotFound` on a perfectly healthy source.
 pub(crate) fn sort_by_id() -> FindOptions {
-    FindOptions::builder().sort(doc! { "_id": 1 }).build()
+    FindOptions::builder()
+        .sort(doc! { "_id": 1 })
+        .no_cursor_timeout(true)
+        .build()
 }
 
 /// A live SOURCE connection: the client cannot express a write, the read
@@ -333,6 +344,18 @@ pub fn parse_major(s: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `_id` sort is what makes the digests comparable; `no_cursor_timeout`
+    /// is what makes the cursor survive its own backpressure. A source cursor
+    /// advances only when `send_chunk` returns, and that blocks on the
+    /// consumer-paced window, so a server-side 10-minute idle reap used to kill
+    /// the run with `CursorNotFound` on an untouched source.
+    #[test]
+    fn source_reads_are_id_ordered_and_immune_to_the_cursor_reaper() {
+        let options = sort_by_id();
+        assert_eq!(options.sort, Some(doc! { "_id": 1 }));
+        assert_eq!(options.no_cursor_timeout, Some(true));
+    }
 
     #[test]
     fn parse_major_modern_versions() {

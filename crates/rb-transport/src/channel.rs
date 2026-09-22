@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, warn};
 
 use rb_core::channel::DataChannel;
 use rb_core::error::{BackupError, Phase, Result};
@@ -352,16 +353,32 @@ async fn drive_control(mut control: Delimited<mux::Stream>) {
     // full interval after setup (setup already proved the link live).
     tick.tick().await;
     loop {
+        // Every exit here ends the keepalive, so every exit says why. Without a
+        // line the only trace a dying control plane left was the coordination
+        // server's reap 60 s later, which names the symptom and never the side
+        // that failed first (I-OBSERV).
         tokio::select! {
             _ = tick.tick() => {
-                if control.send_client(ClientMsg::Heartbeat).await.is_err() {
+                if let Err(error) = control.send_client(ClientMsg::Heartbeat).await {
+                    warn!(
+                        %error,
+                        "control-plane heartbeat failed; the coordination server will reap \
+                         this channel once its recv deadline elapses"
+                    );
                     return;
                 }
             }
             msg = control.recv_server() => {
                 match msg {
                     Ok(Some(_)) => {}
-                    _ => return,
+                    Ok(None) => {
+                        debug!("control substream closed by the coordination server");
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(%error, "control substream read failed; keepalive stopping");
+                        return;
+                    }
                 }
             }
         }

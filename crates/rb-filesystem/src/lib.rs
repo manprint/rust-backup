@@ -213,6 +213,35 @@ mod tests {
 
     use super::*;
 
+    /// The capability probe must read the real effective set, uid 0 included.
+    /// Root with `--cap-drop=CHOWN` is an ordinary container, and answering
+    /// "root, therefore yes" made preflight approve a restore whose `fchownat`
+    /// then failed with EPERM after the whole payload had already landed.
+    #[test]
+    fn root_without_the_capability_is_not_treated_as_having_it() {
+        // CAP_CHOWN is bit 0, CAP_MKNOD bit 27.
+        let with_chown = "Name:\tx\nCapEff:\t0000000000000001\n";
+        let without = "Name:\tx\nCapEff:\t0000000000000000\n";
+        let full = "Name:\tx\nCapEff:\t000001ffffffffff\n";
+        assert_eq!(dest::capability_bits(with_chown), Some(1));
+        assert_eq!(dest::capability_bits(without), Some(0));
+        assert_eq!(
+            dest::capability_bits(full).map(|bits| bits & (1 << 27) != 0),
+            Some(true),
+            "CAP_MKNOD must be read out of a full set"
+        );
+        assert_eq!(
+            dest::capability_bits("Name:\tx\nThreads:\t1\n"),
+            None,
+            "a status without CapEff must say so, not answer zero"
+        );
+        assert_eq!(
+            dest::capability_bits("CapEff:\tnot-hex\n"),
+            None,
+            "an unparsable mask must say so, not answer zero"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         chunks: Vec<(u32, u64, Vec<u8>)>,

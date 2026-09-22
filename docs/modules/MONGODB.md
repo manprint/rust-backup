@@ -111,6 +111,23 @@ fresh collection name and switch over if they must survive a failed attempt.
 
 - User credentials are not exposed by `usersInfo`; users and roles are therefore
   not recreated.
+- **More than 100 000 collections in one run is refused.** One plan item per
+  collection, bounded by the plan's item ceiling (`MAX_PLAN_ITEMS`), which is
+  what keeps a peer-supplied plan from dictating the destination's allocation.
+  The source raises it itself, naming the ceiling, before the plan is sent.
+- **Every document is read three times per run**: the fingerprint before, the
+  transfer, and the fingerprint after. The fingerprint hashes the full
+  `_id`-ordered content of every collection — a sample could not catch a
+  mutation outside it — and I-IMMUT requires it on both sides of the run,
+  including a failed one. The destination read-back adds a fourth full read on
+  its own side.
+- Source cursors are opened with `noCursorTimeout`, because backpressure is
+  supposed to stall them: the cursor advances only when the destination has
+  taken the previous chunk, and a `--max-rate` cap stalls it further. Without
+  that flag a destination slower than the server's `cursorTimeoutMillis` (10
+  minutes by default) killed the run with `CursorNotFound` on an untouched
+  source. A deployment that forbids `noCursorTimeout` (some hosted shared tiers
+  do) will refuse the `find` outright rather than fail halfway.
 - Views and time-series collections are not copied; the run refuses to proceed
   unless `allow_skipped_namespaces` is set (see above).
 - Discrete host/port parameters are plaintext unless the server policy provides

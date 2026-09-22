@@ -207,10 +207,25 @@ impl NoAtimeReader {
 
     fn read_chunk(&mut self) -> Result<Vec<u8>> {
         let mut buf = vec![0_u8; 64 * 1024];
-        let used = read(self.fd, &mut buf)
-            .map_err(|e| BackupError::phase(Phase::Transfer, format!("filesystem read: {e}")))?;
-        buf.truncate(used);
-        Ok(buf)
+        loop {
+            match read(self.fd, &mut buf) {
+                Ok(used) => {
+                    buf.truncate(used);
+                    return Ok(buf);
+                }
+                // `nix::read` surfaces `EINTR`, which `std`'s reader retries on
+                // our behalf: a signal delivered mid-read is an interruption of
+                // the syscall, not a failure of the file, and abandoning a tree
+                // halfway over one would be a self-inflicted backup failure.
+                Err(Errno::EINTR) => continue,
+                Err(error) => {
+                    return Err(BackupError::phase(
+                        Phase::Transfer,
+                        format!("filesystem read: {error}"),
+                    ))
+                }
+            }
+        }
     }
 }
 

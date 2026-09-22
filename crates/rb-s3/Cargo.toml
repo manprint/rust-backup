@@ -9,6 +9,7 @@ description = "rust-backup S3-compatible streaming module"
 [dependencies]
 rb-core = { path = "../rb-core" }
 async-trait.workspace = true
+futures-util.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }

@@ -27,8 +27,49 @@ pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const COPY_BUFFER: usize = 64 * 1024; // 64 KiB
 /// Max JSON control/data frame body size.
 pub const FRAME_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB
-/// Idle timeout for a single read/write syscall (re-armed on progress).
+/// Idle timeout for a handshake read the caller is *waiting* on (re-armed on
+/// progress). Short on purpose: a peer that owes a completion frame and stops
+/// writing is wedged, not merely slow. Payload I/O uses
+/// [`payload_idle_timeout`] instead — see why there.
 pub const IO_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default idle timeout for a single payload read/write syscall.
+///
+/// A payload write rides the substream's flow-control window, and I-BANDWIDTH
+/// says a slow destination MUST stall it: the destination stops reading while
+/// it applies what it already holds — an S3 `upload_part` of a whole multipart
+/// part (up to ~524 MiB), a MongoDB `insert_many` batch, a PostgreSQL `COPY`
+/// flush waiting on a lock — and the window stays full for exactly that long.
+/// The previous 30 s bound turned every such pause into `write idle timeout`,
+/// aborting runs that the backpressure design says must simply wait: a 500 MiB
+/// S3 part over a 100 Mbit/s uplink needs ~42 s of it.
+///
+/// The bound survives only to fail a genuinely wedged peer. Channel liveness is
+/// proved independently and much sooner by the transport's control heartbeat
+/// (20 s) and the coordination server's 60 s recv-deadline reaper, so making it
+/// generous here costs no detection latency that matters.
+pub const DEFAULT_PAYLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// [`DEFAULT_PAYLOAD_IDLE_TIMEOUT`], overridable with
+/// `RUST_BACKUP_IO_IDLE_TIMEOUT` (whole seconds).
+///
+/// Resolved once and cached: this is read on every chunk of every item.
+pub fn payload_idle_timeout() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        parse_idle_timeout(std::env::var("RUST_BACKUP_IO_IDLE_TIMEOUT").ok().as_deref())
+    })
+}
+
+/// Pure half of [`payload_idle_timeout`]. An absent, unparsable or zero value
+/// all keep the default: `0` must not be a way to disable the bound entirely,
+/// which would let a wedged peer hold a run open forever.
+fn parse_idle_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|seconds| seconds.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_PAYLOAD_IDLE_TIMEOUT)
+}
 
 /// Control-plane frames carried on the first ("control") substream.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -165,13 +206,16 @@ where
 }
 
 /// `write_all` with an idle timeout re-armed on every successful write — a stuck
-/// peer fails fast instead of hanging forever. (Ported from `bore::transfer`.)
+/// peer fails eventually instead of hanging forever. (Ported from
+/// `bore::transfer`.) The bound is [`payload_idle_timeout`], not
+/// [`IO_IDLE_TIMEOUT`]: a full flow-control window is backpressure, not a fault.
 pub async fn write_all_idle<S>(stream: &mut S, mut buf: &[u8]) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
+    let idle = payload_idle_timeout();
     while !buf.is_empty() {
-        let n = tokio::time::timeout(IO_IDLE_TIMEOUT, stream.write(buf))
+        let n = tokio::time::timeout(idle, stream.write(buf))
             .await
             .map_err(|_| BackupError::phase(Phase::Transfer, "write idle timeout"))?
             .map_err(|e| BackupError::phase_src(Phase::Transfer, "write", e))?;
@@ -186,14 +230,18 @@ where
     Ok(())
 }
 
-/// `read_exact` with an idle timeout re-armed on every successful read.
+/// `read_exact` with an idle timeout re-armed on every successful read. Bounded
+/// by [`payload_idle_timeout`] for the same reason as [`write_all_idle`]: the
+/// producer's own backend can legitimately go quiet mid-frame (PostgreSQL's
+/// `ORDER BY` blocking sort emits no `COPY` byte until the table is sorted).
 pub async fn read_exact_idle<S>(stream: &mut S, buf: &mut [u8]) -> Result<()>
 where
     S: AsyncRead + Unpin,
 {
+    let idle = payload_idle_timeout();
     let mut off = 0;
     while off < buf.len() {
-        let n = tokio::time::timeout(IO_IDLE_TIMEOUT, stream.read(&mut buf[off..]))
+        let n = tokio::time::timeout(idle, stream.read(&mut buf[off..]))
             .await
             .map_err(|_| BackupError::phase(Phase::Transfer, "read idle timeout"))?
             .map_err(|e| BackupError::phase_src(Phase::Transfer, "read", e))?;
@@ -215,7 +263,35 @@ pub fn blake3_hex(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlFrame;
+    use super::{parse_idle_timeout, ControlFrame, DEFAULT_PAYLOAD_IDLE_TIMEOUT, IO_IDLE_TIMEOUT};
+    use std::time::Duration;
+
+    /// The payload bound must stay well clear of the handshake bound: a
+    /// destination applying one S3 multipart part, one MongoDB insert batch or
+    /// one blocked PostgreSQL `COPY` flush stops reading for longer than the
+    /// handshake bound allows, and that is backpressure working, not a fault.
+    #[test]
+    fn the_payload_idle_bound_is_far_above_the_handshake_bound() {
+        assert!(
+            DEFAULT_PAYLOAD_IDLE_TIMEOUT >= IO_IDLE_TIMEOUT * 10,
+            "payload {DEFAULT_PAYLOAD_IDLE_TIMEOUT:?} vs handshake {IO_IDLE_TIMEOUT:?}"
+        );
+    }
+
+    /// `0` and garbage keep the default rather than disabling the bound, which
+    /// would let a wedged peer hold a run open forever.
+    #[test]
+    fn the_idle_override_never_removes_the_bound() {
+        assert_eq!(parse_idle_timeout(Some("90")), Duration::from_secs(90));
+        assert_eq!(parse_idle_timeout(Some(" 90 ")), Duration::from_secs(90));
+        for refused in [None, Some(""), Some("0"), Some("-1"), Some("later")] {
+            assert_eq!(
+                parse_idle_timeout(refused),
+                DEFAULT_PAYLOAD_IDLE_TIMEOUT,
+                "{refused:?} must fall back to the default"
+            );
+        }
+    }
 
     #[test]
     fn legacy_plan_defaults_to_one_multiplexed_carrier() {

@@ -724,21 +724,35 @@ fn libc_o_directory() -> i32 {
     0o200_000 // O_DIRECTORY on Linux
 }
 
-/// Is `bit` set in this process's effective capability set? Root has every
-/// capability, and a non-root process reports its own in `/proc/self/status`.
+/// Is `bit` set in this process's effective capability set?
+///
+/// Read from `/proc/self/status` for EVERY process, root included. "Effective
+/// uid 0, therefore yes" is false on any hardened runtime: `docker run
+/// --cap-drop=CHOWN`, a systemd unit with `CapabilityBoundingSet=`, a CI
+/// sandbox — all run as root without the capability. Answering yes there made
+/// the `ownership` and `special_files` preflight checks approve a restore whose
+/// `fchownat`/`mknod` then failed with `EPERM` *after* the whole payload had
+/// landed, which is exactly the outcome those checks exist to prevent. The uid
+/// survives only as the fallback for a host with no readable `/proc`.
 fn has_cap(bit: u32) -> bool {
-    if Uid::effective().is_root() {
-        return true;
+    match effective_capabilities() {
+        Some(bits) => bits & (1u64 << bit) != 0,
+        None => Uid::effective().is_root(),
     }
-    fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:\t").map(str::to_owned))
-        })
-        .and_then(|raw| u64::from_str_radix(raw.trim(), 16).ok())
-        .is_some_and(|bits| bits & (1u64 << bit) != 0)
+}
+
+/// This process's `CapEff` mask, or `None` when `/proc` cannot answer.
+fn effective_capabilities() -> Option<u64> {
+    capability_bits(&fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// Pure half of [`effective_capabilities`], so the parse is testable without a
+/// `/proc` to point it at.
+pub(crate) fn capability_bits(status: &str) -> Option<u64> {
+    let raw = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))?;
+    u64::from_str_radix(raw.trim(), 16).ok()
 }
 
 /// CAP_CHOWN — restoring uid/gid.

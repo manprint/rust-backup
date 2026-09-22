@@ -392,6 +392,13 @@ async fn source_run(
 ) -> Result<SourceOutcome> {
     // 2. Analyze and build the self-contained plan (read-only).
     let plan = source.analyze().await?;
+    // The destination enforces the same bounds the moment it decodes the plan
+    // (`channel::recv_plan`). Checking them here as well is what turns "the
+    // peer rejected your plan after the whole source was read and sent" into a
+    // refusal the source raises itself, naming the ceiling, before a byte of
+    // payload leaves. A tree or bucket above `MAX_PLAN_ITEMS` is not a
+    // transport fault and must not be reported as one.
+    channel::validate_plan_bounds(&plan)?;
     progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, items = plan.items.len(), "source plan ready");
     info!("\n{}", plan.render());

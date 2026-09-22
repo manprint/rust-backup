@@ -18,6 +18,7 @@ use aws_sdk_s3::operation::get_object_tagging::builders::GetObjectTaggingFluentB
 use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
 use aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder;
 use aws_sdk_s3::Client;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncReadExt;
 
 use rb_core::channel::ChunkSink;
@@ -215,6 +216,18 @@ impl Source for S3Source {
     }
 }
 
+/// How many per-object read probes (`HeadObject`, `GetObjectTagging`,
+/// `GetObjectAcl`) may be in flight at once.
+///
+/// Every one of them is a network round-trip, and a bucket has as many objects
+/// as it has. Issued one after another, a 1 000 000-object bucket cost roughly
+/// five million *sequential* round-trips across the pre-run fingerprint,
+/// analysis and the post-run fingerprint — days of wall clock spent almost
+/// entirely waiting. The bound keeps that concurrency well inside any provider's
+/// per-connection limits (and MinIO's), and every probe stays a read, so
+/// nothing about I-IMMUT changes.
+const PROBE_CONCURRENCY: usize = 16;
+
 async fn validate_source_fidelity(
     s3: &ReadOnlyS3,
     params: &S3Params,
@@ -234,57 +247,76 @@ async fn validate_source_fidelity(
             "versioned S3 buckets are unsupported: versions/delete markers cannot be reproduced",
         ));
     }
-    for object in objects {
-        let unsupported = unsupported_object_features(object);
-        if !unsupported.is_empty() {
-            return Err(BackupError::phase(
+    // `objects` arrives in key order and `buffered` preserves it, so the object
+    // named in the refusal is the first offending key and not whichever probe
+    // happened to answer first.
+    let probes: Vec<_> = objects
+        .iter()
+        .map(|object| check_object_fidelity(s3, params, object))
+        .collect();
+    stream::iter(probes)
+        .buffered(PROBE_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+/// The per-object half of [`validate_source_fidelity`]: everything this build
+/// refuses to copy rather than drop silently.
+async fn check_object_fidelity(
+    s3: &ReadOnlyS3,
+    params: &S3Params,
+    object: &S3Object,
+) -> Result<()> {
+    let unsupported = unsupported_object_features(object);
+    if !unsupported.is_empty() {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!("S3 object {:?}: {}", object.key, unsupported.join("; ")),
+        ));
+    }
+    let tags = s3
+        .get_object_tagging()
+        .bucket(&params.bucket)
+        .key(&object.key)
+        .send()
+        .await
+        .map_err(|e| {
+            BackupError::phase(
                 Phase::Analyze,
-                format!("S3 object {:?}: {}", object.key, unsupported.join("; ")),
-            ));
-        }
-        let tags = s3
-            .get_object_tagging()
-            .bucket(&params.bucket)
-            .key(&object.key)
-            .send()
-            .await
-            .map_err(|e| {
-                BackupError::phase(
-                    Phase::Analyze,
-                    format!("read S3 object tags {:?}: {e}", object.key),
-                )
-            })?;
-        if !tags.tag_set().is_empty() {
-            return Err(BackupError::phase(
+                format!("read S3 object tags {:?}: {e}", object.key),
+            )
+        })?;
+    if !tags.tag_set().is_empty() {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!(
+                "S3 object {:?} has tags; object tags are not preserved",
+                object.key
+            ),
+        ));
+    }
+    let acl = s3
+        .get_object_acl()
+        .bucket(&params.bucket)
+        .key(&object.key)
+        .send()
+        .await
+        .map_err(|e| {
+            BackupError::phase(
                 Phase::Analyze,
-                format!(
-                    "S3 object {:?} has tags; object tags are not preserved",
-                    object.key
-                ),
-            ));
-        }
-        let acl = s3
-            .get_object_acl()
-            .bucket(&params.bucket)
-            .key(&object.key)
-            .send()
-            .await
-            .map_err(|e| {
-                BackupError::phase(
-                    Phase::Analyze,
-                    format!("read S3 object ACL {:?}: {e}", object.key),
-                )
-            })?;
-        let owner_id = acl.owner().and_then(|owner| owner.id());
-        if !acl_is_owner_only_full_control(owner_id, acl.grants()) {
-            return Err(BackupError::phase(
-                Phase::Analyze,
-                format!(
-                    "S3 object {:?} has a non-default ACL; object ACLs are not preserved",
-                    object.key
-                ),
-            ));
-        }
+                format!("read S3 object ACL {:?}: {e}", object.key),
+            )
+        })?;
+    let owner_id = acl.owner().and_then(|owner| owner.id());
+    if !acl_is_owner_only_full_control(owner_id, acl.grants()) {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!(
+                "S3 object {:?} has a non-default ACL; object ACLs are not preserved",
+                object.key
+            ),
+        ));
     }
     Ok(())
 }
@@ -301,39 +333,28 @@ async fn list_objects(s3: &ReadOnlyS3, params: &S3Params, phase: Phase) -> Resul
             .send()
             .await
             .map_err(|e| BackupError::phase(phase, format!("list S3 objects: {e}")))?;
-        for object in page.contents() {
-            let key = object
-                .key()
-                .ok_or_else(|| BackupError::phase(phase, "S3 object without key"))?;
-            let head = s3
-                .head_object()
-                .bucket(&params.bucket)
-                .key(key)
-                .send()
-                .await
-                .map_err(|e| BackupError::phase(phase, format!("head S3 object {key:?}: {e}")))?;
-            objects.push(S3Object {
-                key: key.to_owned(),
-                size: head.content_length().unwrap_or(0).max(0) as u64,
-                etag: head.e_tag().map(str::to_owned),
-                content_type: head.content_type().map(str::to_owned),
-                storage_class: head.storage_class().map(|v| v.as_str().to_owned()),
-                server_side_encryption: head
-                    .server_side_encryption()
-                    .map(|v| v.as_str().to_owned()),
-                metadata: head
-                    .metadata()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect(),
-                content_encoding: head.content_encoding().map(str::to_owned),
-                cache_control: head.cache_control().map(str::to_owned),
-                content_disposition: head.content_disposition().map(str::to_owned),
-                content_language: head.content_language().map(str::to_owned),
-                expires: head.expires_string().map(str::to_owned),
-                website_redirect_location: head.website_redirect_location().map(str::to_owned),
-            });
+        let keys = page
+            .contents()
+            .iter()
+            .map(|object| {
+                object
+                    .key()
+                    .map(str::to_owned)
+                    .ok_or_else(|| BackupError::phase(phase, "S3 object without key"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The HEAD per key is not avoidable — `ListObjectsV2` carries neither
+        // the user metadata nor the entity headers a 1:1 copy has to reproduce
+        // — but serialising it made the listing one round-trip deep per object.
+        // `buffered` keeps the page's key order, so the plan stays identical to
+        // what the serial loop produced.
+        let probes: Vec<_> = keys
+            .into_iter()
+            .map(|key| describe_object(s3, params, key, phase))
+            .collect();
+        let mut heads = stream::iter(probes).buffered(PROBE_CONCURRENCY);
+        while let Some(object) = heads.next().await {
+            objects.push(object?);
         }
         // Drive the loop off the continuation token alone. Treating a missing
         // `IsTruncated` as "complete" silently truncated the plan at 1 000 keys
@@ -348,4 +369,40 @@ async fn list_objects(s3: &ReadOnlyS3, params: &S3Params, phase: Phase) -> Resul
     }
     objects.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(objects)
+}
+
+/// One object's restorable description, from a single `HeadObject`.
+async fn describe_object(
+    s3: &ReadOnlyS3,
+    params: &S3Params,
+    key: String,
+    phase: Phase,
+) -> Result<S3Object> {
+    let head = s3
+        .head_object()
+        .bucket(&params.bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|e| BackupError::phase(phase, format!("head S3 object {key:?}: {e}")))?;
+    Ok(S3Object {
+        key,
+        size: head.content_length().unwrap_or(0).max(0) as u64,
+        etag: head.e_tag().map(str::to_owned),
+        content_type: head.content_type().map(str::to_owned),
+        storage_class: head.storage_class().map(|v| v.as_str().to_owned()),
+        server_side_encryption: head.server_side_encryption().map(|v| v.as_str().to_owned()),
+        metadata: head
+            .metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        content_encoding: head.content_encoding().map(str::to_owned),
+        cache_control: head.cache_control().map(str::to_owned),
+        content_disposition: head.content_disposition().map(str::to_owned),
+        content_language: head.content_language().map(str::to_owned),
+        expires: head.expires_string().map(str::to_owned),
+        website_redirect_location: head.website_redirect_location().map(str::to_owned),
+    })
 }
