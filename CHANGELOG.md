@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0 — release (2026-09-23)
+
+The first official release, and the first one staged on real hosts. It
+carries everything from the 0.0.x prereleases below, unchanged since 0.0.19:
+
+- four modules — PostgreSQL (10..=18, cluster fidelity, `--hot-backup`),
+  MongoDB (4..=8), POSIX filesystem, S3/MinIO — all on pure-Rust drivers;
+- the source is never altered (fingerprint audit before and after every run,
+  or one read-only snapshot with `--hot-backup`), nothing is staged to disk,
+  and every run ends with a read-back of the destination against the source;
+- relay and direct UDP/QUIC transport with automatic fallback, including when
+  STUN is unreachable;
+- `run --config` sessions with parallel targets, a per-target session status
+  and the "every source plan is ready" line on the source side.
+
 ## 0.0.19 — prerelease (2026-09-23)
 
 ### A large filesystem source no longer loses its channel
