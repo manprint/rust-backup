@@ -585,8 +585,9 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     }
 
     let source_major = expected.server_major;
+    let mut probe_failures = Vec::new();
     if destination_major != source_major {
-        restate_view_definitions(params, &mut expected, destination_major).await?;
+        probe_failures = restate_view_definitions(params, &mut expected, destination_major).await?;
         strip_privileges_newer_than(&mut expected, source_major);
         strip_privileges_newer_than(&mut actual, source_major);
     }
@@ -598,7 +599,7 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     // reports each substitution as a named deviation rather than hiding it.
     let deviations = reconcile_extension_versions(&expected, &mut actual, params.extension_version);
     if actual != expected {
-        let differences = catalog_differences(&expected, &actual);
+        let mut differences = catalog_differences(&expected, &actual);
         let counted = if differences.len() >= MAX_REPORTED_DIFFERENCES {
             format!("first {MAX_REPORTED_DIFFERENCES} differences")
         } else if differences.len() == 1 {
@@ -606,6 +607,15 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
         } else {
             format!("{} differences", differences.len())
         };
+        if differences
+            .iter()
+            .any(|d| d.contains(".views[") && d.contains("].definition "))
+        {
+            differences.push(format!(
+                "note: {}",
+                view_comparison_note(source_major, destination_major, &probe_failures)
+            ));
+        }
         return Err(BackupError::phase(
             Phase::Verify,
             format!(
@@ -781,7 +791,8 @@ async fn restate_view_definitions(
     params: &PostgresParams,
     expected: &mut PgPlanPayload,
     destination_major: u32,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut failed = Vec::new();
     for database in &mut expected.databases {
         let has_views = database.schemas.iter().any(|s| !s.views.is_empty());
         if !has_views {
@@ -792,18 +803,67 @@ async fn restate_view_definitions(
             for view in &mut schema.views {
                 match render_view_definition(&conn.client, &view.definition).await {
                     Ok(rendered) => view.definition = rendered,
-                    Err(error) => tracing::warn!(
-                        view = %format!("{}.{}", view.schema, view.name),
-                        %error,
-                        destination_major,
-                        "could not re-render the view definition on the destination; \
-                         comparing the source text verbatim"
-                    ),
+                    Err(error) => {
+                        let qualified = format!("{}.{}.{}", database.name, view.schema, view.name);
+                        tracing::warn!(
+                            view = %qualified,
+                            %error,
+                            destination_major,
+                            "could not re-render the view definition on the destination; \
+                             comparing the source text verbatim"
+                        );
+                        failed.push(format!("{qualified}: {}", error_chain(&error)));
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(failed)
+}
+
+/// An error and every cause under it: a probe failure is only useful with the
+/// server's own message, which `BackupError`'s display leaves in the source.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        cause = next.source();
+    }
+    text
+}
+
+/// How the view definitions in a failed read-back were compared, appended to
+/// the report whenever a view definition is among its differences. Without it
+/// the operator cannot tell a rendering difference between two server majors,
+/// a probe that could not run, and a restore that really changed a view.
+fn view_comparison_note(
+    source_major: u32,
+    destination_major: u32,
+    probe_failures: &[String],
+) -> String {
+    if source_major == destination_major {
+        return format!(
+            "view definitions were compared verbatim: source and destination are both \
+             PostgreSQL {source_major}, so each restored view is expected to render exactly \
+             as the source rendered it"
+        );
+    }
+    let mut note = format!(
+        "view definitions were re-rendered on the destination (PostgreSQL {source_major} -> \
+         {destination_major}) through a temporary view before comparing"
+    );
+    if probe_failures.is_empty() {
+        note.push_str("; every re-render succeeded");
+    } else {
+        note.push_str(&format!(
+            "; {} could not be re-rendered and were compared verbatim: {}",
+            probe_failures.len(),
+            probe_failures.join("; ")
+        ));
+    }
+    note
 }
 
 /// The destination's own rendering of `definition`, via a temporary view.
@@ -914,12 +974,52 @@ fn collect_json_differences(
                 }
             }
         }
+        (Value::String(expected), Value::String(actual))
+            if expected.chars().count() > DIVERGENCE_THRESHOLD
+                || actual.chars().count() > DIVERGENCE_THRESHOLD =>
+        {
+            found.push(format!("{path} {}", string_divergence(expected, actual)))
+        }
         _ => found.push(format!(
             "{path} source={} destination={}",
             compact_json(expected),
             compact_json(actual)
         )),
     }
+}
+
+/// Strings longer than this are reported around their first difference: a view
+/// definition differs at character 900, and its first 240 characters — the old
+/// report — are identical on both sides and say nothing.
+const DIVERGENCE_THRESHOLD: usize = 120;
+/// Characters shown on each side of the first differing one.
+const DIVERGENCE_CONTEXT: usize = 80;
+
+/// `differs at character N (of A/B): source="…x…" destination="…y…"`, each
+/// excerpt a window around the first differing character.
+fn string_divergence(expected: &str, actual: &str) -> String {
+    let expected: Vec<char> = expected.chars().collect();
+    let actual: Vec<char> = actual.chars().collect();
+    let at = expected
+        .iter()
+        .zip(&actual)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| expected.len().min(actual.len()));
+    let window = |text: &[char]| {
+        let start = at.saturating_sub(DIVERGENCE_CONTEXT);
+        let end = (at + DIVERGENCE_CONTEXT).min(text.len());
+        let excerpt: String = text[start.min(end)..end].iter().collect();
+        let lead = if start > 0 { "…" } else { "" };
+        let tail = if end < text.len() { "…" } else { "" };
+        serde_json::Value::String(format!("{lead}{excerpt}{tail}")).to_string()
+    };
+    format!(
+        "differs at character {at} (lengths source={} destination={}): source={} destination={}",
+        expected.len(),
+        actual.len(),
+        window(&expected),
+        window(&actual)
+    )
 }
 
 /// Compare two lists of named objects by name rather than by position: one
@@ -1586,6 +1686,59 @@ mod tests {
         normalize_catalog(&mut source);
         normalize_catalog(&mut destination);
         assert_eq!(source, destination);
+    }
+
+    /// A long definition that differs late is reported where it differs: the
+    /// first 240 characters of two Odoo report views were identical, so the
+    /// old report showed nothing.
+    #[test]
+    fn a_long_string_is_reported_around_its_first_difference() {
+        let head = "x".repeat(500);
+        let source = format!("{head}SELECT a::text FROM t");
+        let destination = format!("{head}SELECT (a)::text FROM t");
+        let report = string_divergence(&source, &destination);
+        assert!(report.starts_with("differs at character 507 "), "{report}");
+        assert!(report.contains("SELECT a::text"), "{report}");
+        assert!(report.contains("SELECT (a)::text"), "{report}");
+        assert!(
+            !report.contains(&"x".repeat(100)),
+            "the window must be bounded: {report}"
+        );
+
+        let expected = serde_json::json!({ "definition": source });
+        let actual = serde_json::json!({ "definition": destination });
+        let mut found = Vec::new();
+        collect_json_differences("v", &expected, &actual, &mut found);
+        assert_eq!(found.len(), 1);
+        assert!(
+            found[0].starts_with("v.definition differs at character 507"),
+            "{found:?}"
+        );
+
+        // A string that is a prefix of the other differs where it ends.
+        let report = string_divergence(&head, &format!("{head} extra"));
+        assert!(report.starts_with("differs at character 500 "), "{report}");
+    }
+
+    /// The note names how view definitions were compared, and every view the
+    /// destination could not re-render, with the server's reason.
+    #[test]
+    fn the_view_note_names_the_comparison_mode_and_probe_failures() {
+        let same = view_comparison_note(16, 16, &[]);
+        assert!(same.contains("compared verbatim"), "{same}");
+        assert!(same.contains("both PostgreSQL 16"), "{same}");
+
+        let cross_ok = view_comparison_note(12, 16, &[]);
+        assert!(cross_ok.contains("re-rendered"), "{cross_ok}");
+        assert!(cross_ok.contains("every re-render succeeded"), "{cross_ok}");
+
+        let failed = vec!["db.public.v: permission denied to create temporary tables".to_string()];
+        let cross_failed = view_comparison_note(12, 16, &failed);
+        assert!(
+            cross_failed.contains("1 could not be re-rendered"),
+            "{cross_failed}"
+        );
+        assert!(cross_failed.contains("permission denied"), "{cross_failed}");
     }
 
     #[test]

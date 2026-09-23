@@ -87,6 +87,19 @@ not valid <nv>)`, plus one `deviation: ...` line per declared departure. The
 same numbers leave the module as fields of the `PostgreSQL destination
 read-back verified` event.
 
+A view definition is compared as the text `pg_get_viewdef(oid, true)` renders.
+When source and destination run the same major version the source text is
+compared **verbatim**: a restored view is expected to render exactly as the
+source rendered it. Across majors each source definition is first re-rendered
+on the destination through a temporary view, so version-dependent formatting
+does not count as a difference; a view whose re-render fails is compared
+verbatim and the server's reason is kept. A failed comparison of a long text —
+a view, a constraint, a function body — is reported at its **first differing
+character**, `differs at character N (lengths source=… destination=…)`, with
+about 80 characters of each side around it, and the report ends with a `note:`
+line naming how the views were compared and every view that could not be
+re-rendered, with its reason.
+
 ## A failed restore removes what it created
 
 `CREATE DATABASE` cannot run inside a transaction, so a restore is not one

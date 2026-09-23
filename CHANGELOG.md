@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### PostgreSQL read-back failures show where the texts differ
+
+- **A long text that differs is reported at its first differing character.**
+  The read-back used to print the first 240 characters of each side, so the
+  three Odoo report views that failed `[Verify]` (exit `5`) showed two
+  identical prefixes. It now prints `differs at character N (lengths source=…
+  destination=…)` with about 80 characters of each side around that point.
+- **The report says how view definitions were compared.** A `note:` line names
+  the mode — verbatim when both servers run the same major, re-rendered through
+  a temporary view on the destination across majors — and lists every view
+  whose re-render failed with the server's reason, which used to be only a
+  `WARN` line in the destination log.
+
 ## 0.0.11 — prerelease (2026-09-23)
 
 ### `--hot-backup`: copy a PostgreSQL source that stays online
