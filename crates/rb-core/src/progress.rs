@@ -43,6 +43,9 @@ pub enum Stage {
     Verifying = 6,
     /// The source has sent everything and waits for the destination's verdict.
     AwaitingPeer = 7,
+    /// The source's plan is ready; it waits for the destination to connect,
+    /// run its preflight checks and accept or refuse the plan.
+    Handshake = 8,
 }
 
 impl Stage {
@@ -55,6 +58,7 @@ impl Stage {
             5 => Stage::Finalizing,
             6 => Stage::Verifying,
             7 => Stage::AwaitingPeer,
+            8 => Stage::Handshake,
             _ => Stage::Connecting,
         }
     }
@@ -70,6 +74,7 @@ impl Stage {
             Stage::Finalizing => "finalize",
             Stage::Verifying => "verify",
             Stage::AwaitingPeer => "waiting",
+            Stage::Handshake => "handshake",
         }
     }
 }
@@ -139,6 +144,10 @@ impl Snapshot {
             Stage::Analyzing => {
                 format!("analyze: reading the source and building the plan, {since}")
             }
+            Stage::Handshake => format!(
+                "handshake: plan ready; waiting for the destination to connect, check and \
+                 accept it, {since}"
+            ),
             Stage::Preflight => {
                 format!("preflight: checking the plan against the destination, {since}")
             }

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### A refused plan says why on both peers, and the waiting source says it waits
+
+- **A failed preflight names the failed checks.** A destination restoring onto
+  an existing database without `--overwrite` ended with `preflight failed:
+  preflight failed`, and the source with `plan rejected: preflight failed`; the
+  reason was only in a `WARN` line on the destination. Now the destination
+  ends with `preflight failed: database:synclinic: 'synclinic' already exists
+  (use --overwrite to replace)` and the source with `plan rejected: destination
+  preflight failed: database:synclinic: …`.
+- **New stage `handshake:` on the source**, from the finished plan to the
+  destination's decision. The source printed `analyze: … 59s in this stage`
+  and `failed during analyze` while it was only waiting for the destination to
+  connect and check the plan.
+
 ## 0.0.15 — prerelease (2026-09-23)
 
 ### The waiting source shows what the destination is doing

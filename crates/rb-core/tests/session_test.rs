@@ -1584,7 +1584,21 @@ async fn a_hot_plan_fails_preflight_without_destination_consent() {
         matches!(derr, rb_core::error::BackupError::Preflight(_)),
         "got: {derr}"
     );
-    assert!(s.await.unwrap().is_err(), "source must see the refusal");
+    // Both peers name the failed check, not only "preflight failed".
+    let derr = derr.to_string();
+    assert!(
+        derr.starts_with("preflight failed: hot backup: ") && !derr.contains("failed: preflight"),
+        "{derr}"
+    );
+    let serr = s
+        .await
+        .unwrap()
+        .expect_err("source must see the refusal")
+        .to_string();
+    assert!(
+        serr.starts_with("plan rejected: destination preflight failed: hot backup: "),
+        "{serr}"
+    );
     assert_eq!(applied.load(Ordering::SeqCst), 0, "nothing may be applied");
 }
 

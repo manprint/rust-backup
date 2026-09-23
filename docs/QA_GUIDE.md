@@ -143,7 +143,7 @@ negotiated data plane carriers=4 separate_data_streams=true
 ```
 
 A progress line, every 5 seconds per source/destination label, starts with the
-stage the run is in (`connecting`, `audit`, `analyze`, `preflight`, `transfer`,
+stage the run is in (`connecting`, `audit`, `analyze`, `handshake`, `preflight`, `transfer`,
 `finalize`, `verify`, `waiting`), reports that stage's own counters and rate over
 the last interval, and ends with the time spent in the stage:
 

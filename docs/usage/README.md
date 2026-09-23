@@ -144,6 +144,7 @@ termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
 | `connecting:` | entrambi | attesa del peer e del piano |
 | `audit:` | sorgente | impronta per il controllo di immutabilità (prima e dopo la copia; mai con `--hot-backup`) |
 | `analyze:` | sorgente | lettura della sorgente e costruzione del piano |
+| `handshake:` | sorgente | piano pronto, in attesa che la destinazione si colleghi, faccia i controlli e lo accetti |
 | `preflight:` | destinazione | controlli del piano sulla destinazione |
 | `transfer:` | entrambi | `items 42/1462  878.80 KiB/~1.41 GiB  (0.1%)  25.11 KiB/s`: il totale con `~` è la **stima** del piano (PostgreSQL la calcola dalle dimensioni su disco, spesso maggiori del flusso reale), la velocità è quella degli ultimi 5 secondi |
 | `finalize:` | destinazione | lavoro dopo i dati, per i moduli che lo hanno: su PostgreSQL indici, vincoli e `REFRESH` delle viste materializzate, `step 120/7800` |
@@ -153,3 +154,8 @@ termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
 Alla fine della fase `transfer:` il totale stimato viene sostituito da quello
 reale. L'ultima riga dice `done:` (con la velocità media e la durata totale) o
 `failed during <fase>:`.
+
+Un preflight fallito nomina i controlli falliti su **entrambi** i peer, per
+esempio sulla destinazione `preflight failed: database:synclinic: 'synclinic'
+already exists (use --overwrite to replace)` e sulla sorgente `plan rejected:
+destination preflight failed: database:synclinic: …`.

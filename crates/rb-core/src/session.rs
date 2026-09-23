@@ -459,6 +459,9 @@ async fn source_run(
     // 2. Analyze and build the self-contained plan (read-only).
     progress.set_stage(Stage::Analyzing);
     let plan = source.analyze().await?;
+    // From here until the PlanAck the source only waits: for the destination
+    // to connect, run its preflight checks and decide.
+    progress.set_stage(Stage::Handshake);
     // The plan's mode is what makes the destination ask its own operator for
     // consent, so a source that skips the audit must say so in the plan — and
     // a plan that claims a snapshot must come from a source that took one.
@@ -992,8 +995,11 @@ where
 
     // 3. Decide: preflight must pass AND the accept policy must approve.
     let approved = preflight.ok && accept(&plan).await;
+    // The failed checks themselves, on both peers: the WARN lines above are on
+    // the destination only, and the source learns the reason from this ack.
+    let failed_checks = failed_check_summary(&preflight);
     let reason = if !preflight.ok {
-        "preflight failed".to_string()
+        format!("destination preflight failed: {failed_checks}")
     } else if !approved {
         "rejected by operator".to_string()
     } else {
@@ -1030,7 +1036,7 @@ where
         .await;
         let _ = stream.shutdown().await;
         return Err(if !preflight.ok {
-            BackupError::Preflight(reason)
+            BackupError::Preflight(failed_checks)
         } else {
             BackupError::PlanRejected(reason)
         });
@@ -1357,6 +1363,21 @@ async fn destination_stream_multi(
     );
     log_verification_extras(&report);
     Ok(plan)
+}
+
+/// `name: detail` for every failed preflight check, `; `-separated.
+fn failed_check_summary(preflight: &Preflight) -> String {
+    let failed: Vec<String> = preflight
+        .checks
+        .iter()
+        .filter(|check| !check.passed)
+        .map(|check| format!("{}: {}", check.name, check.detail))
+        .collect();
+    if failed.is_empty() {
+        "a check failed without a named reason".to_string()
+    } else {
+        failed.join("; ")
+    }
 }
 
 /// How the destination's multi-stream run ended before its verdict frame, so
