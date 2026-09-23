@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.17 — prerelease (2026-09-23)
 
 ### `--overwrite` on the filesystem module
 
