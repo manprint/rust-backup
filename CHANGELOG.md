@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.12 — prerelease (2026-09-23)
 
 ### PostgreSQL read-back failures show where the texts differ
 
