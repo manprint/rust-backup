@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.19 — prerelease (2026-09-23)
 
 ### A large filesystem source no longer loses its channel
 
