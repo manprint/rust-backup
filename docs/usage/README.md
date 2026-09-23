@@ -148,7 +148,7 @@ termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
 | `transfer:` | entrambi | `items 42/1462  878.80 KiB/~1.41 GiB  (0.1%)  25.11 KiB/s`: il totale con `~` è la **stima** del piano (PostgreSQL la calcola dalle dimensioni su disco, spesso maggiori del flusso reale), la velocità è quella degli ultimi 5 secondi |
 | `finalize:` | destinazione | lavoro dopo i dati, per i moduli che lo hanno: su PostgreSQL indici, vincoli e `REFRESH` delle viste materializzate, `step 120/7800` |
 | `verify:` | destinazione | rilettura di quanto scritto: prima il confronto del catalogo, poi `items 384/1462  170.45 MiB/1.03 GiB  (16.4%)` sui byte effettivi |
-| `waiting:` | sorgente | payload inviato, la destinazione sta applicando e verificando |
+| `waiting:` | sorgente | payload inviato, in attesa del verdetto della destinazione; con una destinazione 0.0.15 o successiva la riga riporta anche la sua fase: `waiting: payload sent (2 items, 952.72 MiB), 7s in this stage; destination: verify: reading the restored tables back, items 0/2  619.00 MiB/952.72 MiB  (65.0%) …` |
 
 Alla fine della fase `transfer:` il totale stimato viene sostituito da quello
 reale. L'ultima riga dice `done:` (con la velocità media e la durata totale) o

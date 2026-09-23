@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### The waiting source shows what the destination is doing
+
+- **While it waits for the verdict, the source prints the destination's own
+  progress line**, for every module: `waiting: payload sent (2 items, 952.72
+  MiB), 7s in this stage; destination: verify: reading the restored tables
+  back, items 0/2  619.00 MiB/952.72 MiB  (65.0%)  309.59 MiB/s, 3s in this
+  stage`. Before, the source only said it was waiting, through minutes of index
+  builds and read-back on the other side.
+- New control frame `PeerProgress { stage, line }`, sent by the destination
+  every 2 seconds on the payload-free control stream, negotiated through a new
+  `peer_progress` field in `Plan` and `PlanAck`. A peer from an earlier release
+  neither sends nor receives it; the run works as before.
+
 ## 0.0.14 — prerelease (2026-09-23)
 
 ### Progress lines name the stage and keep moving after the transfer

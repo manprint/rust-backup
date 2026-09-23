@@ -847,56 +847,6 @@ struct ProgressReporter {
     started: std::time::Instant,
 }
 
-/// What the ticker remembers between two lines.
-struct TickState {
-    stage: rb_core::progress::Stage,
-    stage_started: std::time::Instant,
-    bytes: u64,
-    at: std::time::Instant,
-}
-
-impl TickState {
-    fn new(snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) -> Self {
-        TickState {
-            stage: snapshot.stage,
-            stage_started: now,
-            bytes: snapshot.moving_bytes(),
-            at: now,
-        }
-    }
-
-    /// Notice a stage change as soon as it happens (between two lines).
-    fn observe(&mut self, snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) {
-        if snapshot.stage != self.stage {
-            use rb_core::progress::Stage;
-            // The verify stage counts its own bytes from zero; every other
-            // stage keeps advancing the payload counter.
-            if snapshot.stage == Stage::Verifying {
-                self.bytes = 0;
-            } else if self.stage == Stage::Verifying {
-                self.bytes = snapshot.moving_bytes();
-            }
-            self.stage = snapshot.stage;
-            self.stage_started = now;
-        }
-    }
-
-    /// Render `snapshot` against the previous line and remember it.
-    fn line(&mut self, snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) -> String {
-        self.observe(snapshot, now);
-        let window = now.duration_since(self.at).as_secs_f64();
-        let moved = snapshot.moving_bytes().saturating_sub(self.bytes);
-        let rate = if window > 0.0 {
-            (moved as f64 / window) as u64
-        } else {
-            0
-        };
-        self.bytes = snapshot.moving_bytes();
-        self.at = now;
-        snapshot.render(rate, now.duration_since(self.stage_started).as_secs_f64())
-    }
-}
-
 impl ProgressReporter {
     fn spawn(progress: Progress, label: String) -> Self {
         let started = std::time::Instant::now();
@@ -904,7 +854,7 @@ impl ProgressReporter {
         // otherwise finish and drop the reporter before its spawned task is
         // first scheduled, leaving that target with no progress record.
         let first = progress.snapshot();
-        let mut state = TickState::new(&first, started);
+        let mut state = rb_core::progress::Ticker::new(&first, started);
         tracing::info!(target_label = %label, "{}", state.line(&first, started));
         let task_progress = progress.clone();
         let task_label = label.clone();

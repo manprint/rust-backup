@@ -955,6 +955,69 @@ async fn both_sides_publish_progress_totals() {
     }
 }
 
+/// A destination that finalizes for longer than one peer-progress interval
+/// after the last byte, the way PostgreSQL builds its indexes.
+struct SlowFinalizeDest;
+
+#[async_trait]
+impl Destination for SlowFinalizeDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Ok(Preflight::pass())
+    }
+
+    async fn stream_in(&self, _plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
+        while !matches!(src.next().await?, ChunkEvent::End) {}
+        if let Some(progress) = rb_core::progress::current() {
+            progress.begin_work(
+                rb_core::progress::Stage::Finalizing,
+                "building indexes",
+                3,
+                0,
+            );
+            progress.work_step();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        Ok(evidence.report("slow in-memory destination read-back"))
+    }
+}
+
+/// The source waiting for the verdict shows what the destination is doing:
+/// the destination's own progress line reaches it over the control stream.
+#[tokio::test]
+async fn a_waiting_source_receives_the_destination_progress_line() {
+    let ch = TestChannel::pair();
+    let src = MockSource {
+        fp: "stable".into(),
+        payload: vec![1u8; 512],
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let seen = p1.clone();
+    let ch2 = ch.clone();
+    let s = tokio::spawn(async move { session::run_source(&src, &*ch, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&SlowFinalizeDest, &*ch2, &p2, &mut yes).await
+    });
+    s.await.unwrap().expect("source ok");
+    d.await.unwrap().expect("dest ok");
+    let peer = seen
+        .snapshot()
+        .peer
+        .expect("the destination sent its progress line");
+    assert!(
+        peer.starts_with("finalize: building indexes, step 1/3"),
+        "{peer}"
+    );
+}
+
 /// T-SESS1: full source→dest run; payload arrives intact, immutability holds.
 #[tokio::test]
 async fn full_run_ok() {

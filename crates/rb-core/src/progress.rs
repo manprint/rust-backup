@@ -92,6 +92,9 @@ struct Inner {
     work_bytes: AtomicU64,
     work_bytes_total: AtomicU64,
     detail: Mutex<String>,
+    /// The peer's own latest progress line, when it sends one (the source
+    /// learns what the destination is doing while it waits for the verdict).
+    peer: Mutex<Option<String>>,
 }
 
 /// A consistent-enough copy of every counter, for rendering. The counters are
@@ -109,6 +112,7 @@ pub struct Snapshot {
     pub work_bytes: u64,
     pub work_bytes_total: u64,
     pub detail: String,
+    pub peer: Option<String>,
 }
 
 impl Snapshot {
@@ -181,12 +185,19 @@ impl Snapshot {
                     human_bytes(rate),
                 )
             }
-            Stage::AwaitingPeer => format!(
-                "waiting: payload sent ({} items, {}); the destination is applying and \
-                 verifying it, {since}",
-                self.items_done,
-                human_bytes(self.bytes_done),
-            ),
+            Stage::AwaitingPeer => match &self.peer {
+                Some(peer) => format!(
+                    "waiting: payload sent ({} items, {}), {since}; destination: {peer}",
+                    self.items_done,
+                    human_bytes(self.bytes_done),
+                ),
+                None => format!(
+                    "waiting: payload sent ({} items, {}); the destination is applying and \
+                     verifying it, {since}",
+                    self.items_done,
+                    human_bytes(self.bytes_done),
+                ),
+            },
         }
     }
 }
@@ -334,6 +345,14 @@ impl Progress {
                 .lock()
                 .map(|detail| detail.clone())
                 .unwrap_or_default(),
+            peer: inner.peer.lock().ok().and_then(|peer| peer.clone()),
+        }
+    }
+
+    /// Record the peer's latest progress line.
+    pub fn set_peer_line(&self, line: &str) {
+        if let Ok(mut peer) = self.inner.peer.lock() {
+            *peer = Some(line.to_string());
         }
     }
 
@@ -348,6 +367,57 @@ impl Progress {
             0
         };
         transfer_counts(&snapshot, rate, "")
+    }
+}
+
+/// Turns successive snapshots into lines: the rate over the interval since the
+/// previous line (an average since the start keeps falling through minutes of
+/// index builds and read-back, which reads as a stalled transfer) and the time
+/// spent in the current stage. The caller supplies the clock, and should call
+/// [`Ticker::observe`] more often than it renders so a stage change is dated
+/// when it happens rather than at the next line.
+pub struct Ticker {
+    stage: Stage,
+    stage_started: std::time::Instant,
+    bytes: u64,
+    at: std::time::Instant,
+}
+
+impl Ticker {
+    pub fn new(snapshot: &Snapshot, now: std::time::Instant) -> Self {
+        Ticker {
+            stage: snapshot.stage,
+            stage_started: now,
+            bytes: snapshot.moving_bytes(),
+            at: now,
+        }
+    }
+
+    /// Notice a stage change (between two lines).
+    pub fn observe(&mut self, snapshot: &Snapshot, now: std::time::Instant) {
+        if snapshot.stage != self.stage {
+            // The rate restarts with the stage: its window and byte baseline
+            // are the stage's own (the verify stage counts different bytes).
+            self.stage = snapshot.stage;
+            self.stage_started = now;
+            self.bytes = snapshot.moving_bytes();
+            self.at = now;
+        }
+    }
+
+    /// Render `snapshot` against the previous line and remember it.
+    pub fn line(&mut self, snapshot: &Snapshot, now: std::time::Instant) -> String {
+        self.observe(snapshot, now);
+        let window = now.duration_since(self.at).as_secs_f64();
+        let moved = snapshot.moving_bytes().saturating_sub(self.bytes);
+        let rate = if window > 0.0 {
+            (moved as f64 / window) as u64
+        } else {
+            0
+        };
+        self.bytes = snapshot.moving_bytes();
+        self.at = now;
+        snapshot.render(rate, now.duration_since(self.stage_started).as_secs_f64())
     }
 }
 
@@ -436,6 +506,50 @@ mod tests {
             "{verify}"
         );
         assert!(verify.contains("(50.0%)"), "{verify}");
+    }
+
+    /// The waiting source shows the destination's own line once it has one.
+    #[test]
+    fn a_waiting_source_shows_the_destination_line() {
+        let progress = Progress::new(1, 100);
+        progress.set_stage(Stage::Transferring);
+        progress.add_bytes(100);
+        progress.item_done();
+        progress.set_stage(Stage::AwaitingPeer);
+        let before = progress.snapshot().render(0, 3.0);
+        assert!(before.contains("the destination is applying"), "{before}");
+        progress.set_peer_line("finalize: building indexes, step 3/9 (33.3%), 2s in this stage");
+        let after = progress.snapshot().render(0, 4.0);
+        assert!(
+            after.ends_with("4s in this stage; destination: finalize: building indexes, step 3/9 (33.3%), 2s in this stage"),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn the_ticker_dates_a_stage_and_measures_the_recent_rate() {
+        let start = std::time::Instant::now();
+        let progress = Progress::new(1, 1000);
+        progress.set_stage(Stage::Transferring);
+        let mut ticker = Ticker::new(&progress.snapshot(), start);
+        progress.add_bytes(500);
+        let first = ticker.line(
+            &progress.snapshot(),
+            start + std::time::Duration::from_secs(5),
+        );
+        assert!(first.contains("100 B/s"), "{first}");
+        progress.begin_work(Stage::Verifying, "", 1, 500);
+        ticker.observe(
+            &progress.snapshot(),
+            start + std::time::Duration::from_secs(6),
+        );
+        progress.work_bytes(200);
+        let verify = ticker.line(
+            &progress.snapshot(),
+            start + std::time::Duration::from_secs(10),
+        );
+        assert!(verify.contains("50 B/s"), "{verify}");
+        assert!(verify.ends_with("4s in this stage"), "{verify}");
     }
 
     #[test]

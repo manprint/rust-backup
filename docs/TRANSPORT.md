@@ -107,6 +107,18 @@ carrier count is one. This avoids concurrently polling split halves of one yamux
 stream, which can stall a payload writer. The field defaults to false when absent,
 so either side can still interoperate with the legacy multiplexed layout.
 
+On that control stream the destination also reports its progress to the waiting
+source. The source offers `peer_progress=true` in `Plan`, the destination echoes
+it in `PlanAck` (only with `separate_data_streams`), and from then until its
+verdict the destination sends `PeerProgress { stage, line }` every 2 seconds —
+its own rendered progress line (`finalize: …`, `verify: …`). The source shows it
+after its own `waiting:` line and reads past it for the verdict. The frames are
+written by one task that owns the control stream's write half and hands it back
+between two frames, before `Abort` or `VerificationAck` is written, so the
+verdict never interleaves with a progress frame; the reads stay on the other
+half (one direction, one task). A peer missing the field never receives one:
+an older source would read the unknown frame as a protocol error.
+
 For a negotiated transfer, `item_id % carriers` selects exactly one carrier.
 Every data carrier identifies itself with a setup frame because relay accept
 order is not identity. The destination pulls items only in plan order from their

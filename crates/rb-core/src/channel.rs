@@ -599,6 +599,7 @@ pub async fn send_plan<S: DuplexStream>(
             plan: Box::new(plan.clone()),
             carriers: carriers.clamp(1, u32::MAX as usize) as u32,
             separate_data_streams: true,
+            peer_progress: true,
         },
         wire::PLAN_FRAME_LIMIT,
         Phase::Connect,
@@ -611,9 +612,7 @@ pub async fn send_plan<S: DuplexStream>(
 /// A plan whose `format_version` this build does not understand is rejected here
 /// (the plan is self-contained, so a version we cannot interpret must never be
 /// half-applied).
-pub async fn recv_plan<S: DuplexStream>(
-    ctrl: &mut S,
-) -> Result<(crate::plan::BackupPlan, u32, bool)> {
+pub async fn recv_plan<S: DuplexStream>(ctrl: &mut S) -> Result<ReceivedPlan> {
     match wire::recv_frame_bounded::<_, ControlFrame>(ctrl, wire::PLAN_FRAME_LIMIT, Phase::Connect)
         .await?
     {
@@ -621,6 +620,7 @@ pub async fn recv_plan<S: DuplexStream>(
             plan: p,
             carriers,
             separate_data_streams,
+            peer_progress,
         }) => {
             if p.format_version != crate::plan::PLAN_FORMAT_VERSION {
                 return Err(BackupError::PlanRejected(format!(
@@ -630,7 +630,12 @@ pub async fn recv_plan<S: DuplexStream>(
                 )));
             }
             validate_plan_bounds(&p)?;
-            Ok((*p, carriers.max(1), separate_data_streams))
+            Ok(ReceivedPlan {
+                plan: *p,
+                carriers: carriers.max(1),
+                separate_data_streams,
+                peer_progress,
+            })
         }
         Some(ControlFrame::Abort { reason }) => Err(BackupError::PlanRejected(reason)),
         other => Err(BackupError::phase(
@@ -638,6 +643,27 @@ pub async fn recv_plan<S: DuplexStream>(
             format!("expected Plan frame, got {other:?}"),
         )),
     }
+}
+
+/// What the destination learns from the source's `Plan` frame.
+#[derive(Debug)]
+pub struct ReceivedPlan {
+    pub plan: crate::plan::BackupPlan,
+    /// Carriers the source requested (at least one).
+    pub carriers: u32,
+    /// The source keeps payload off the control stream.
+    pub separate_data_streams: bool,
+    /// The source renders `PeerProgress` frames.
+    pub peer_progress: bool,
+}
+
+/// What the source learns from an accepting `PlanAck`.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptedPlan {
+    pub carriers: u32,
+    pub separate_data_streams: bool,
+    /// The destination will send `PeerProgress` frames.
+    pub peer_progress: bool,
 }
 
 /// Validate allocations induced by an otherwise syntactically valid plan.
@@ -687,6 +713,7 @@ pub async fn send_ack<S: DuplexStream>(
     reason: &str,
     carriers: usize,
     separate_data_streams: bool,
+    peer_progress: bool,
 ) -> Result<()> {
     wire::send_frame(
         ctrl,
@@ -695,20 +722,27 @@ pub async fn send_ack<S: DuplexStream>(
             reason: reason.to_string(),
             carriers: carriers.clamp(1, u32::MAX as usize) as u32,
             separate_data_streams,
+            peer_progress,
         },
     )
     .await
 }
 
 /// Source: await the destination's decision.
-pub async fn recv_ack<S: DuplexStream>(ctrl: &mut S) -> Result<(u32, bool)> {
+pub async fn recv_ack<S: DuplexStream>(ctrl: &mut S) -> Result<AcceptedPlan> {
     match wire::recv_frame::<_, ControlFrame>(ctrl).await? {
         Some(ControlFrame::PlanAck {
             accepted: true,
             carriers,
             separate_data_streams,
+            peer_progress,
             ..
-        }) => Ok((carriers.max(1), separate_data_streams)),
+        }) => Ok(AcceptedPlan {
+            carriers: carriers.max(1),
+            // Only meaningful with the control stream free of payload.
+            peer_progress: peer_progress && separate_data_streams,
+            separate_data_streams,
+        }),
         Some(ControlFrame::PlanAck { reason, .. }) => Err(BackupError::PlanRejected(reason)),
         other => Err(BackupError::phase(
             Phase::Connect,

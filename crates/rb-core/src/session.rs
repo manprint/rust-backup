@@ -490,8 +490,9 @@ async fn source_run(
     let mut stream = stream;
     channel::send_plan(&mut stream, &plan, channel.carriers()).await?;
     // recv_ack errors out (PlanRejected) without ever touching the source.
+    let accepted = exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
     let (peer_carriers, separate_data_streams) =
-        exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
+        (accepted.carriers, accepted.separate_data_streams);
     progress.set_stage(Stage::Transferring);
     let agreed_carriers = channel.carriers().min(peer_carriers as usize).max(1);
     if agreed_carriers != channel.carriers() {
@@ -521,8 +522,11 @@ async fn source_run(
             progress,
             max_rate,
             plan,
-            stream,
-            agreed_carriers,
+            Negotiated {
+                control: stream,
+                carriers: agreed_carriers,
+                peer_progress: accepted.peer_progress,
+            },
         )
         .await;
     }
@@ -597,6 +601,14 @@ struct SourceAudit<'a> {
     baseline: Option<&'a str>,
 }
 
+/// The control stream of a separate-data run and what was agreed on it.
+struct Negotiated {
+    control: Box<dyn crate::channel::DuplexStream>,
+    carriers: usize,
+    /// The destination sends `PeerProgress` frames on `control`.
+    peer_progress: bool,
+}
+
 /// Source payload path for the negotiated separate-data layout. The plan/control
 /// stream is kept out of the data plane even with one carrier; an item always
 /// maps to exactly one data substream.
@@ -606,9 +618,13 @@ async fn source_stream_multi(
     progress: &Progress,
     max_rate: Option<u64>,
     plan: BackupPlan,
-    control: Box<dyn crate::channel::DuplexStream>,
-    carriers: usize,
+    negotiated: Negotiated,
 ) -> Result<SourceOutcome> {
+    let Negotiated {
+        control,
+        carriers,
+        peer_progress,
+    } = negotiated;
     let mut streams = Vec::with_capacity(carriers);
     for index in 0..carriers {
         let mut stream = exchange_timeout(
@@ -630,9 +646,20 @@ async fn source_stream_multi(
     // An Abort sent during setup remains buffered on the control stream.
     let (control_read, mut control_write) = tokio::io::split(control);
     let (abort_tx, mut abort_rx) = watch::channel(None::<String>);
+    let peer_view = progress.clone();
     let mut abort_task = tokio::spawn(async move {
         let mut control_read = control_read;
-        let received = wire::recv_frame::<_, ControlFrame>(&mut control_read).await;
+        // A negotiated destination interleaves its progress lines before its
+        // verdict; they are shown, never treated as the verdict. Without the
+        // negotiation one is an unexpected frame and fails the run below.
+        let received = loop {
+            match wire::recv_frame::<_, ControlFrame>(&mut control_read).await {
+                Ok(Some(ControlFrame::PeerProgress { line, .. })) if peer_progress => {
+                    peer_view.set_peer_line(&line);
+                }
+                other => break other,
+            }
+        };
         let observed = match &received {
             Ok(Some(ControlFrame::CompleteAck | ControlFrame::VerificationAck { .. })) => None,
             Ok(Some(ControlFrame::Abort { reason })) => {
@@ -933,14 +960,21 @@ where
     let mut stream = stream;
     // An unreadable/unsupported plan is refused on the wire too, so the source
     // fails fast with the reason instead of blocking on a PlanAck that never comes.
-    let (plan, source_requested_carriers, separate_data_streams) =
-        match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                let _ = channel::send_ack(&mut stream, false, &e.to_string(), 1, false).await;
-                return Err(e);
-            }
-        };
+    let received = match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {
+        Ok(received) => received,
+        Err(e) => {
+            let _ = channel::send_ack(&mut stream, false, &e.to_string(), 1, false, false).await;
+            return Err(e);
+        }
+    };
+    let channel::ReceivedPlan {
+        plan,
+        carriers: source_requested_carriers,
+        separate_data_streams,
+        peer_progress,
+    } = received;
+    // The control stream carries progress only when it carries no payload.
+    let peer_progress = peer_progress && separate_data_streams;
     progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, "destination received plan");
     info!("\n{}", plan.render());
@@ -975,6 +1009,7 @@ where
         &reason,
         agreed_carriers,
         separate_data_streams,
+        peer_progress,
     )
     .await?;
     if approved {
@@ -1013,8 +1048,11 @@ where
             channel,
             progress,
             plan,
-            stream,
-            agreed_carriers,
+            Negotiated {
+                control: stream,
+                carriers: agreed_carriers,
+                peer_progress,
+            },
             applied,
         )
         .await;
@@ -1195,10 +1233,14 @@ async fn destination_stream_multi(
     channel: &dyn DataChannel,
     progress: &Progress,
     plan: BackupPlan,
-    mut control: Box<dyn crate::channel::DuplexStream>,
-    carriers: usize,
+    negotiated: Negotiated,
     applied: &AtomicBool,
 ) -> Result<BackupPlan> {
+    let Negotiated {
+        control,
+        carriers,
+        peer_progress,
+    } = negotiated;
     let mut streams = Vec::with_capacity(carriers);
     for index in 0..carriers {
         streams.push(
@@ -1251,34 +1293,120 @@ async fn destination_stream_multi(
         .collect();
     let mut src =
         MultiStreamChunkSource::new_ordered(streams, expected_item_ids, progress.clone())?;
-    let apply_result = dest.stream_in(&plan, &mut src).await;
+    // From here to the verdict the source only waits; it is told what this
+    // side is doing on the (payload-free) control stream. The forwarder owns
+    // the write half and hands it back before any other frame is written.
+    let (control_read, control_write) = tokio::io::split(control);
+    let forwarder = PeerProgressForwarder::start(control_write, progress.clone(), peer_progress);
+    let (verdict, mut control) = destination_multi_until_verdict(
+        dest,
+        &plan,
+        &mut src,
+        control_read,
+        forwarder,
+        progress,
+        applied,
+    )
+    .await?;
+    let report = match verdict {
+        Ok(report) => report,
+        Err(VerdictError::Apply(error)) => {
+            let sent = wire::send_frame(
+                &mut control,
+                &ControlFrame::Abort {
+                    reason: error.to_string(),
+                },
+            )
+            .await
+            .is_ok();
+            if sent {
+                // Keep the multiplexed connection alive until the source confirms
+                // receipt. Older peers simply hit this short best-effort timeout.
+                let _ = tokio::time::timeout(
+                    ABORT_ACK_TIMEOUT,
+                    wire::recv_frame::<_, ControlFrame>(&mut control),
+                )
+                .await;
+            }
+            let _ = control.shutdown().await;
+            return Err(error);
+        }
+        Err(VerdictError::Verify(error)) => {
+            let _ = wire::send_frame(
+                &mut control,
+                &ControlFrame::Abort {
+                    reason: error.to_string(),
+                },
+            )
+            .await;
+            let _ = control.shutdown().await;
+            return Err(error);
+        }
+        Err(VerdictError::Plain(error)) => return Err(error),
+    };
+    send_completion_ack(&mut control, report.clone()).await?;
+    progress.complete();
+    info!(
+        items = report.items_verified,
+        bytes = report.bytes_verified,
+        blake3 = %report.payload_blake3,
+        detail = %report.detail,
+        carriers = channel.carriers(),
+        "{}",
+        restore_verified_headline(&plan)
+    );
+    log_verification_extras(&report);
+    Ok(plan)
+}
+
+/// How the destination's multi-stream run ended before its verdict frame, so
+/// the caller — which holds the rejoined control stream — tells the source the
+/// right way: an apply failure waits for the source's `AbortAck`, a verify
+/// failure does not, and a protocol failure sends nothing.
+enum VerdictError {
+    Apply(BackupError),
+    Verify(BackupError),
+    Plain(BackupError),
+}
+
+/// Apply, check completion and read back, while the forwarder reports progress
+/// to the source. Always stops the forwarder and returns the rejoined control
+/// stream, whatever happened; only a forwarder that could not hand the stream
+/// back (its task died) leaves nothing to write the verdict to.
+async fn destination_multi_until_verdict(
+    dest: &dyn Destination,
+    plan: &BackupPlan,
+    src: &mut MultiStreamChunkSource,
+    mut control_read: tokio::io::ReadHalf<Box<dyn crate::channel::DuplexStream>>,
+    forwarder: PeerProgressForwarder,
+    progress: &Progress,
+    applied: &AtomicBool,
+) -> Result<(
+    std::result::Result<VerificationReport, VerdictError>,
+    Box<dyn crate::channel::DuplexStream>,
+)> {
+    let outcome =
+        destination_multi_verdict(dest, plan, src, &mut control_read, progress, applied).await;
+    let control_write = forwarder.stop().await?;
+    Ok((outcome, control_read.unsplit(control_write)))
+}
+
+async fn destination_multi_verdict(
+    dest: &dyn Destination,
+    plan: &BackupPlan,
+    src: &mut MultiStreamChunkSource,
+    control_read: &mut tokio::io::ReadHalf<Box<dyn crate::channel::DuplexStream>>,
+    progress: &Progress,
+    applied: &AtomicBool,
+) -> std::result::Result<VerificationReport, VerdictError> {
+    let apply_result = dest.stream_in(plan, src).await;
     if apply_result.is_ok() {
         applied.store(true, Ordering::Relaxed);
     }
+    apply_result.map_err(VerdictError::Apply)?;
     let received_items = src.completed_item_ids();
     let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();
-    if let Err(error) = apply_result {
-        let sent = wire::send_frame(
-            &mut control,
-            &ControlFrame::Abort {
-                reason: error.to_string(),
-            },
-        )
-        .await
-        .is_ok();
-        if sent {
-            // Keep the multiplexed connection alive until the source confirms
-            // receipt. Older peers simply hit this short best-effort timeout.
-            let _ = tokio::time::timeout(
-                ABORT_ACK_TIMEOUT,
-                wire::recv_frame::<_, ControlFrame>(&mut control),
-            )
-            .await;
-        }
-        let _ = control.shutdown().await;
-        return Err(error);
-    }
 
     let expected_items: BTreeSet<u32> = plan
         .items
@@ -1295,78 +1423,128 @@ async fn destination_stream_multi(
             .difference(&expected_items)
             .copied()
             .collect();
-        return Err(BackupError::phase(
+        return Err(VerdictError::Plain(BackupError::phase(
             Phase::Verify,
             format!("item completion mismatch; missing={missing:?} unexpected={unexpected:?}"),
-        ));
+        )));
     }
 
-    match wire::recv_frame::<_, ControlFrame>(&mut control).await? {
+    let done = wire::recv_frame::<_, ControlFrame>(control_read)
+        .await
+        .map_err(VerdictError::Plain)?;
+    match done {
         Some(ControlFrame::Done {
             total_bytes,
             blake3,
         }) => {
             if total_bytes != progress.bytes() {
-                return Err(BackupError::phase(
+                return Err(VerdictError::Plain(BackupError::phase(
                     Phase::Verify,
                     format!(
                         "Done.total_bytes={total_bytes} but received={}",
                         progress.bytes()
                     ),
-                ));
+                )));
             }
             if blake3 != received_digest {
-                return Err(BackupError::phase(
+                return Err(VerdictError::Plain(BackupError::phase(
                     Phase::Verify,
                     "Done.blake3 does not match verified item digests",
-                ));
+                )));
             }
             let evidence = RestoreEvidence {
                 total_bytes,
                 payload_blake3: blake3,
                 item_blake3: received_item_digests,
             };
-            let report = match verify_destination(dest, &plan, &evidence).await {
-                Ok(report) => report,
-                Err(error) => {
-                    let _ = wire::send_frame(
-                        &mut control,
-                        &ControlFrame::Abort {
-                            reason: error.to_string(),
-                        },
-                    )
-                    .await;
-                    let _ = control.shutdown().await;
-                    return Err(error);
+            verify_destination(dest, plan, &evidence)
+                .await
+                .map_err(VerdictError::Verify)
+        }
+        Some(ControlFrame::Abort { reason }) => Err(VerdictError::Plain(BackupError::phase(
+            Phase::Apply,
+            format!("source aborted: {reason}"),
+        ))),
+        other => Err(VerdictError::Plain(BackupError::phase(
+            Phase::Verify,
+            format!("expected Done, got {other:?}"),
+        ))),
+    }
+}
+
+/// Sends this destination's progress line to the source every
+/// [`PEER_PROGRESS_INTERVAL`] while the source waits for the verdict. It owns
+/// the control stream's write half, and [`PeerProgressForwarder::stop`] only
+/// returns it between two frames — a frame is never cut in half, since the next
+/// writer (the verdict) shares the stream. Without the negotiated capability it
+/// only holds the half and sends nothing.
+struct PeerProgressForwarder {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<tokio::io::WriteHalf<Box<dyn crate::channel::DuplexStream>>>,
+}
+
+/// How often the destination tells a waiting source what it is doing.
+const PEER_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
+impl PeerProgressForwarder {
+    fn start(
+        mut control_write: tokio::io::WriteHalf<Box<dyn crate::channel::DuplexStream>>,
+        progress: Progress,
+        enabled: bool,
+    ) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            if !enabled {
+                let _ = stopped.await;
+                return control_write;
+            }
+            let start = Instant::now();
+            let mut ticker = crate::progress::Ticker::new(&progress.snapshot(), start);
+            let mut poll = tokio::time::interval(Duration::from_millis(250));
+            let mut next_send = start + PEER_PROGRESS_INTERVAL;
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = poll.tick() => {}
                 }
-            };
-            send_completion_ack(&mut control, report.clone()).await?;
-            progress.complete();
-            info!(
-                items = report.items_verified,
-                bytes = report.bytes_verified,
-                blake3 = %report.payload_blake3,
-                detail = %report.detail,
-                carriers = channel.carriers(),
-                "{}",
-                restore_verified_headline(&plan)
-            );
-            log_verification_extras(&report);
-        }
-        Some(ControlFrame::Abort { reason }) => {
-            return Err(BackupError::phase(
-                Phase::Apply,
-                format!("source aborted: {reason}"),
-            ));
-        }
-        other => {
-            return Err(BackupError::phase(
-                Phase::Verify,
-                format!("expected Done, got {other:?}"),
-            ));
+                let now = Instant::now();
+                let snapshot = progress.snapshot();
+                if now < next_send {
+                    ticker.observe(&snapshot, now);
+                    continue;
+                }
+                next_send += PEER_PROGRESS_INTERVAL;
+                let frame = ControlFrame::PeerProgress {
+                    stage: snapshot.stage.label().to_string(),
+                    line: ticker.line(&snapshot, now),
+                };
+                // Outside the select: a cancelled write would leave half a
+                // frame on the stream the verdict is written to next.
+                if wire::send_frame(&mut control_write, &frame).await.is_err() {
+                    // The verdict write will surface the broken stream.
+                    let _ = stopped.await;
+                    break;
+                }
+            }
+            control_write
+        });
+        PeerProgressForwarder {
+            stop: Some(stop),
+            task,
         }
     }
-    Ok(plan)
+
+    async fn stop(mut self) -> Result<tokio::io::WriteHalf<Box<dyn crate::channel::DuplexStream>>> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        (&mut self.task).await.map_err(|error| {
+            BackupError::phase(
+                Phase::Verify,
+                format!("destination progress forwarder failed: {error}"),
+            )
+        })
+    }
 }
 
 #[cfg(test)]

@@ -108,6 +108,11 @@ pub enum ControlFrame {
         /// a yamux data stream. False preserves the legacy wire layout.
         #[serde(default)]
         separate_data_streams: bool,
+        /// The source renders `PeerProgress` frames. False on legacy peers, and
+        /// a destination then never sends one: an older source would read the
+        /// unknown frame as a protocol error.
+        #[serde(default)]
+        peer_progress: bool,
     },
     /// Destination → Source: accept/reject decision (async-accept mode).
     PlanAck {
@@ -120,9 +125,20 @@ pub enum ControlFrame {
         /// Echoes the source capability above. Missing on legacy peers.
         #[serde(default)]
         separate_data_streams: bool,
+        /// The destination will send `PeerProgress` frames on the control
+        /// stream. Only ever true when the plan offered it and the data rides
+        /// separate streams (the control stream is otherwise the data plane).
+        #[serde(default)]
+        peer_progress: bool,
     },
     /// Source → Destination: all items streamed; final whole-payload digest.
     Done { total_bytes: u64, blake3: String },
+    /// Destination → Source, only when `peer_progress` was negotiated: the
+    /// destination's current progress line, sent periodically from the end of
+    /// the payload until its verdict, so the waiting source can show what the
+    /// destination is doing (index builds, read-back) instead of only waiting.
+    /// `stage` is the stage label; `line` is the destination's own rendering.
+    PeerProgress { stage: String, line: String },
     /// Legacy destination acknowledgement retained only so current peers can
     /// decode it and fail closed with a precise missing-evidence error.
     CompleteAck,
@@ -368,10 +384,15 @@ mod tests {
             ControlFrame::Plan {
                 carriers,
                 separate_data_streams,
+                peer_progress,
                 ..
             } => {
                 assert_eq!(carriers, 1);
                 assert!(!separate_data_streams);
+                assert!(
+                    !peer_progress,
+                    "a legacy source must never get PeerProgress"
+                );
             }
             other => panic!("expected Plan, got {other:?}"),
         }
@@ -388,10 +409,12 @@ mod tests {
             ControlFrame::PlanAck {
                 carriers,
                 separate_data_streams,
+                peer_progress,
                 ..
             } => {
                 assert_eq!(carriers, 1);
                 assert!(!separate_data_streams);
+                assert!(!peer_progress);
             }
             other => panic!("expected PlanAck, got {other:?}"),
         }
