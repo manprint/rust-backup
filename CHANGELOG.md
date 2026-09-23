@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.13 — prerelease (2026-09-23)
 
 ### PostgreSQL: views that do not survive their own round-trip restore verified
 
