@@ -45,7 +45,11 @@ impl Capabilities {
 }
 
 pub(crate) async fn validate(params: &FilesystemParams, plan: &BackupPlan) -> Result<Preflight> {
-    validate_with(params, plan, Capabilities::current())
+    let (params, plan) = (params.clone(), plan.clone());
+    crate::blocking(Phase::Validate, move || {
+        validate_with(&params, &plan, Capabilities::current())
+    })
+    .await
 }
 
 pub(crate) fn validate_with(
@@ -142,23 +146,30 @@ pub(crate) async fn stream_in(
     plan: &BackupPlan,
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
-    let payload = payload(plan, Phase::Apply)?;
-    validate_entries(&payload)?;
-    let root = Path::new(&params.root);
-    if !destination_is_empty(root)? {
-        if !params.overwrite {
-            return Err(BackupError::phase(
-                Phase::Apply,
-                format!(
-                    "filesystem destination must be empty before restore: {}",
-                    root.display()
-                ),
-            ));
+    let payload = std::sync::Arc::new(payload(plan, Phase::Apply)?);
+    let prepared = std::sync::Arc::clone(&payload);
+    let overwrite = params.overwrite;
+    let root_path = std::path::PathBuf::from(&params.root);
+    crate::blocking(Phase::Apply, move || {
+        validate_entries(&prepared)?;
+        let root = root_path.as_path();
+        if !destination_is_empty(root)? {
+            if !overwrite {
+                return Err(BackupError::phase(
+                    Phase::Apply,
+                    format!(
+                        "filesystem destination must be empty before restore: {}",
+                        root.display()
+                    ),
+                ));
+            }
+            clear_destination_root(root)?;
         }
-        clear_destination_root(root)?;
-    }
-    create_destination_root(root)?;
-    create_directories(root, &payload)?;
+        create_destination_root(root)?;
+        create_directories(root, &prepared)
+    })
+    .await?;
+    let root = Path::new(&params.root);
 
     let by_id: HashMap<_, _> = plan.items.iter().map(|item| (item.id, item)).collect();
     let mut active: Option<ActiveFile> = None;
@@ -230,9 +241,13 @@ pub(crate) async fn stream_in(
             "filesystem stream ended before item completion",
         ));
     }
-    create_nodes(root, &payload)?;
-    apply_metadata(root, &payload, params.preserve_ownership && has_cap_chown())?;
-    Ok(())
+    let chown = params.preserve_ownership && has_cap_chown();
+    let root_path = root.to_path_buf();
+    crate::blocking(Phase::Apply, move || {
+        create_nodes(&root_path, &payload)?;
+        apply_metadata(&root_path, &payload, chown)
+    })
+    .await
 }
 
 /// Re-scan the destination after apply and compare every selected path and

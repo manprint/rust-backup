@@ -6,6 +6,11 @@ use crate::FilesystemParams;
 
 /// Deterministic tree hash over paths, metadata, link targets and file contents.
 pub(crate) async fn fingerprint(params: &FilesystemParams) -> Result<String> {
+    let params = params.clone();
+    crate::blocking(Phase::Analyze, move || fingerprint_tree(&params)).await
+}
+
+fn fingerprint_tree(params: &FilesystemParams) -> Result<String> {
     let root = checked_root(params, Phase::Analyze)?;
     let plan = crate::walk::collect(&root)?;
     let mut hasher = blake3::Hasher::new();

@@ -15,6 +15,8 @@
 //! field in [`resolve_target`], so a flag left unset falls through to YAML and
 //! then to the built-in default.
 
+mod board;
+
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -674,7 +676,15 @@ async fn run_target(reg: &ModuleRegistry, module: &str, a: &TargetArgs) -> anyho
         .ok_or_else(|| anyhow!("unknown module '{module}'"))?;
     let role: Role = a.role.into();
     let (transport, params, auto_accept) = resolve_target(a, module, role)?;
-    execute(&m, role, &transport, &params, auto_accept).await
+    execute(
+        &m,
+        role,
+        &transport,
+        &params,
+        auto_accept,
+        Progress::default(),
+    )
+    .await
 }
 
 /// `plan` dry-run: open the source read-only, analyze, print the plan. No
@@ -716,6 +726,11 @@ async fn run_session(
     if requested_fail_fast {
         cfg.fail_fast = true;
     }
+    if let Some(warning) =
+        board::SessionBoard::new(&cfg.targets, cfg.parallel_targets.max(1)).slot_warning()
+    {
+        tracing::warn!("{warning}");
+    }
     if cfg.parallel_targets <= 1 {
         return run_session_sequential(reg, &cfg).await;
     }
@@ -729,9 +744,16 @@ async fn run_session_sequential(reg: &ModuleRegistry, cfg: &SessionConfig) -> an
             .get(&t.module)
             .ok_or_else(|| anyhow!("unknown module '{}'", t.module))?;
         let params = TargetParams(t.params.clone());
-        execute(&m, t.role, &t.transport, &params, t.auto_accept)
-            .await
-            .with_context(|| format!("target {i} ({}/{:?})", t.module, t.role))?;
+        execute(
+            &m,
+            t.role,
+            &t.transport,
+            &params,
+            t.auto_accept,
+            Progress::default(),
+        )
+        .await
+        .with_context(|| format!("target {i} ({}/{:?})", t.module, t.role))?;
     }
     Ok(())
 }
@@ -741,6 +763,8 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
     let mut pending = cfg.targets.iter().cloned().enumerate();
     let mut running = JoinSet::new();
     let mut errors = Vec::new();
+    let board = board::SessionBoard::new(&cfg.targets, cfg.parallel_targets);
+    let monitor = board.spawn_monitor();
     loop {
         while running.len() < cfg.parallel_targets {
             let Some((i, target)) = pending.next() else {
@@ -749,11 +773,30 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
             let module = reg
                 .get(&target.module)
                 .ok_or_else(|| anyhow!("unknown module '{}'", target.module))?;
+            let board = board.clone();
             running.spawn(async move {
                 let params = TargetParams(target.params.clone());
                 tracing::info!(target = i, module = %target.module, role = ?target.role, "session target");
-                execute(&module, target.role, &target.transport, &params, target.auto_accept).await
-                    .with_context(|| format!("target {i} ({}/{:?})", target.module, target.role))
+                board.set_state(i, board::TargetState::Running);
+                let outcome = execute(
+                    &module,
+                    target.role,
+                    &target.transport,
+                    &params,
+                    target.auto_accept,
+                    board.progress(i),
+                )
+                .await
+                .with_context(|| format!("target {i} ({}/{:?})", target.module, target.role));
+                board.set_state(
+                    i,
+                    if outcome.is_ok() {
+                        board::TargetState::Verified
+                    } else {
+                        board::TargetState::Failed
+                    },
+                );
+                outcome
             });
         }
         let Some(result) = running.join_next().await else {
@@ -782,6 +825,8 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
             errors.push(error);
         }
     }
+    monitor.abort();
+    tracing::info!("{}", board.status());
     if errors.is_empty() {
         return Ok(());
     }
@@ -980,9 +1025,9 @@ async fn execute(
     transport: &TransportConfig,
     params: &TargetParams,
     auto_accept: bool,
+    progress: Progress,
 ) -> anyhow::Result<()> {
     refuse_unsupported_hot_backup(module, params)?;
-    let progress = Progress::default();
     // Clamp the requested carrier count by what THIS module can restore before
     // the transport opens anything. The destination also enforces its own cap
     // during negotiation, but a module's declared capability must be honoured

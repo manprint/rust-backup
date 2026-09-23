@@ -570,9 +570,21 @@ impl DirectConn {
                 .accept()
                 .await
                 .context("accept sibling connection")?;
-            let conn = timeout(NETWORK_TIMEOUT, incoming)
-                .await
-                .context("sibling handshake timed out")??;
+            // A connection that fails its handshake is not the sibling being
+            // waited for: the consumer's losing primary candidates are aborted
+            // mid-handshake and arrive here first. Giving up on the first of
+            // those sent every direct carrier to the relay after a 10 s stall.
+            let conn = match timeout(NETWORK_TIMEOUT, incoming).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(error)) => {
+                    debug!(%error, "skipping a direct sibling whose handshake failed");
+                    continue;
+                }
+                Err(_) => {
+                    debug!("skipping a direct sibling whose handshake timed out");
+                    continue;
+                }
+            };
             match timeout(
                 NETWORK_TIMEOUT,
                 DirectListener::auth_accept(&conn, &self.endpoint, token),

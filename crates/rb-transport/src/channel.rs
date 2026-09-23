@@ -2,9 +2,9 @@
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, Duration};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use rb_core::channel::DataChannel;
 use rb_core::error::{BackupError, Phase, Result};
@@ -35,6 +35,11 @@ pub struct PairedChannel {
     /// inbound server frames. Owns the control substream — nothing else uses it
     /// after setup. Aborted when the channel drops.
     _heartbeat: AbortOnDrop,
+    /// Set by the keepalive driver when the control stream ends, with why. A
+    /// source waiting for the destination's stream must not outlive its
+    /// registration: once the coordinator has dropped it, no destination can
+    /// ever reach it.
+    control_lost: watch::Receiver<Option<String>>,
 }
 
 enum PairedChannelInner {
@@ -71,6 +76,7 @@ impl PairedChannel {
         control: Delimited<mux::Stream>,
         carriers: u32,
     ) -> Self {
+        let (lost_tx, control_lost) = watch::channel(None);
         Self {
             inner: std::sync::Arc::new(Mutex::new(PairedChannelInner::Source {
                 acceptor,
@@ -82,7 +88,8 @@ impl PairedChannel {
                 direct_streams: 0,
             })),
             carriers: carriers.clamp(1, 32) as usize,
-            _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
+            _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control, lost_tx))),
+            control_lost,
         }
     }
 
@@ -98,6 +105,7 @@ impl PairedChannel {
         control: Delimited<mux::Stream>,
         carriers: u32,
     ) -> Self {
+        let (lost_tx, control_lost) = watch::channel(None);
         Self {
             inner: std::sync::Arc::new(Mutex::new(PairedChannelInner::Destination {
                 opener,
@@ -109,7 +117,8 @@ impl PairedChannel {
                 direct_streams: 0,
             })),
             carriers: carriers.clamp(1, 32) as usize,
-            _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control))),
+            _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control, lost_tx))),
+            control_lost,
         }
     }
 
@@ -243,6 +252,10 @@ impl DataChannel for PairedChannel {
     }
 
     async fn accept_stream(&self) -> Result<Box<dyn rb_core::channel::DuplexStream>> {
+        let mut lost = self.control_lost.clone();
+        if let Some(reason) = lost.borrow().clone() {
+            return Err(registration_lost(&reason));
+        }
         let mut inner = self.inner.lock().await;
         match &mut *inner {
             PairedChannelInner::Source {
@@ -284,6 +297,9 @@ impl DataChannel for PairedChannel {
                             match ready {
                                 Ok(Ok(_)) if marker[0] == mux::STREAM_READY => {
                                     *direct_streams += 1;
+                                    tracing::info!(
+                                        "stream from the destination accepted on the direct path"
+                                    );
                                     return Ok(Box::new(qt));
                                 }
                                 Ok(Ok(_)) => tracing::warn!(
@@ -306,10 +322,18 @@ impl DataChannel for PairedChannel {
                 }
 
                 // Fallback to relay
-                let stream = acceptor
-                    .accept()
-                    .await
-                    .ok_or_else(|| BackupError::phase(Phase::Connect, "acceptor closed"))?;
+                let stream = tokio::select! {
+                    stream = acceptor.accept() => stream.ok_or_else(|| {
+                        BackupError::phase(
+                            Phase::Connect,
+                            "the connection to the coordination server closed while waiting \
+                             for the destination",
+                        )
+                    })?,
+                    reason = wait_control_lost(&mut lost) => {
+                        return Err(registration_lost(&reason));
+                    }
+                };
                 let mut s = stream;
                 let mut marker = [0u8; 1];
                 s.read_exact(&mut marker)
@@ -352,7 +376,39 @@ impl Drop for AbortOnDrop {
 /// lifetime: emits a client heartbeat every `CTRL_CLIENT_HEARTBEAT` and drains
 /// inbound server frames (heartbeats plus any late broker messages). Returns when
 /// the control stream errors or closes; the task is aborted when the channel drops.
-async fn drive_control(mut control: Delimited<mux::Stream>) {
+/// Wait until the keepalive driver reports the control stream gone.
+async fn wait_control_lost(lost: &mut watch::Receiver<Option<String>>) -> String {
+    loop {
+        if let Some(reason) = lost.borrow_and_update().clone() {
+            return reason;
+        }
+        if lost.changed().await.is_err() {
+            // The driver was dropped without a verdict: the channel itself is
+            // going away, so nothing is lost that the caller can act on.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+fn registration_lost(reason: &str) -> BackupError {
+    BackupError::phase(
+        Phase::Connect,
+        format!(
+            "the coordination server no longer has this source registered ({reason}); it drops \
+             a peer whose heartbeats stop for 60 s (a network cut, a blocked process) or it \
+             restarted, so no destination can reach this source any more — start the source \
+             again"
+        ),
+    )
+}
+
+async fn drive_control(mut control: Delimited<mux::Stream>, lost: watch::Sender<Option<String>>) {
+    let reason = drive_control_until_lost(&mut control).await;
+    warn!("control stream to the coordination server lost: {reason}");
+    let _ = lost.send(Some(reason));
+}
+
+async fn drive_control_until_lost(control: &mut Delimited<mux::Stream>) -> String {
     let mut tick = tokio::time::interval(CTRL_CLIENT_HEARTBEAT);
     // The first tick fires immediately; skip it so the first heartbeat lands one
     // full interval after setup (setup already proved the link live).
@@ -365,27 +421,57 @@ async fn drive_control(mut control: Delimited<mux::Stream>) {
         tokio::select! {
             _ = tick.tick() => {
                 if let Err(error) = control.send_client(ClientMsg::Heartbeat).await {
-                    warn!(
-                        %error,
-                        "control-plane heartbeat failed; the coordination server will reap \
-                         this channel once its recv deadline elapses"
-                    );
-                    return;
+                    return format!("heartbeat send failed: {error}");
                 }
             }
             msg = control.recv_server() => {
                 match msg {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        debug!("control substream closed by the coordination server");
-                        return;
+                        return "the coordination server closed the control stream".to_string();
                     }
                     Err(error) => {
-                        warn!(%error, "control substream read failed; keepalive stopping");
-                        return;
+                        return format!("control stream read failed: {error}");
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rb_core::channel::DataChannel;
+
+    /// The coordinator reaps a registration whose heartbeats stopped. The
+    /// source waiting for the destination's stream must then fail with that
+    /// reason instead of waiting for a destination that can no longer arrive.
+    #[tokio::test]
+    async fn a_source_whose_control_stream_closes_stops_waiting() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (opener, acceptor) = mux::client(client_io);
+        let (_server_opener, mut server_acceptor) = mux::server(server_io);
+        let mut control = Delimited::new(opener.open().await.expect("open control"));
+        // The first write flushes the lazy SYN so the server side sees it.
+        control
+            .send_client(ClientMsg::Heartbeat)
+            .await
+            .expect("first frame");
+        let server_control = server_acceptor.accept().await.expect("server control");
+        let channel = PairedChannel::source(acceptor, control);
+
+        drop(server_control);
+        let outcome = timeout(Duration::from_secs(5), channel.accept_stream())
+            .await
+            .expect("a lost registration must end the wait");
+        let error = match outcome {
+            Ok(_) => panic!("no destination stream can exist"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("no longer has this source registered"),
+            "{error}"
+        );
     }
 }

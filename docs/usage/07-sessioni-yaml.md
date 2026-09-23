@@ -129,8 +129,44 @@ targets:
 Quando più target falliscono, la sessione esce con il codice del fallimento
 **più grave**, nell'ordine: sorgente modificata (`6`) → integrità/apply/verify
 (`5`) → preflight (`3`) → piano rifiutato (`4`) → connessione (`7`) →
-configurazione (`2`) → altro (`1`). Il messaggio riporta quanti target sono
-falliti e qual è stato il più grave.
+configurazione (`2`) → altro (`1`). Il messaggio elenca tutti i target falliti,
+uno per riga, ciascuno con il suo errore.
+
+### Quando avviare la destinazione: stato dei piani
+
+Con `parallel_targets: N > 1` la sessione lato sorgente dice quando **tutti** i
+piani sono pronti, cioè quando ogni target sorgente ha finito audit e analisi ed
+è in attesa della destinazione. La riga compare una volta sola:
+
+```text
+ALL SOURCE PLANS READY (3/3): start the destination now
+```
+
+Se un target sorgente fallisce prima di avere il piano, la riga diventa
+`SOURCE PLANS SETTLED: 2/3 ready, 1 failed before its plan (see its error); the
+destination can start for the ready ones`.
+
+Ogni minuto, e subito dopo quella riga, la sessione stampa lo stato di ogni
+target:
+
+```text
+session status: source plans ready 2/3
+  target 0 postgres/Source channel=fiera: PLAN READY, waiting for the destination
+  target 1 mongodb/Source channel=mongo-fiera: running (transfer)
+  target 2 filesystem/Source channel=fiera-fs: preparing the plan (audit)
+```
+
+Gli stati possibili sono:
+- `queued, starts when one of the N parallel slots frees`
+- `preparing the plan (audit|analyze|connecting)`
+- `PLAN READY, waiting for the destination`
+- `running (<fase>)`
+- `done (verified)`
+- `FAILED (see its error)`
+
+Se `parallel_targets` è minore del numero di target sorgente, all'avvio compare
+un `WARN`: i piani non possono essere tutti pronti nello stesso momento, perché
+un target in coda parte solo quando uno in corso finisce.
 
 ## Sorgente e destinazione su host diversi
 
@@ -199,6 +235,7 @@ fuori dal file e si passano come variabili d'ambiente, che hanno la precedenza.
 |---------|-----------------|
 | `run --config does not start server:` | rimuovere la sezione `server:` e avviare il coordinatore a parte |
 | la sessione resta appesa | file con i due lati dello stesso canale e `parallel_targets: 1`: portarlo ad almeno 2 |
+| la sorgente fallisce con `the coordination server no longer has this source registered` | il coordinatore ha rimosso la registrazione perché non riceveva heartbeat da 60 s (rete interrotta, processo bloccato) o perché è stato riavviato. Nel log del coordinatore c'è `control substream silent past deadline; reaping channel id=…`. Riavviare la sorgente |
 | `YAML parse: …` (exit `2`) | errore di sintassi o campo con tipo sbagliato (per esempio `port` fra virgolette) |
 | `unknown module 'xyz'` | `module` non è uno fra `postgres`, `mongodb`, `filesystem`, `s3` |
 | la destinazione resta in attesa di conferma | manca `auto_accept: true` (o `--yes`) |

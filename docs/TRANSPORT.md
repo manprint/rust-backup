@@ -62,7 +62,15 @@ With UDP enabled the peers exchange sanitized candidates and attempt direct QUIC
 any failure during direct setup falls back to the TCP relay. Every direct bidi
 stream starts with an explicit readiness byte; QUIC does not expose a stream to
 the acceptor until the opener writes, so omitting it deadlocks plan exchange.
-Heartbeats reap dead rendezvous state.
+Heartbeats reap dead rendezvous state. A source whose registration was reaped
+(its control stream closed by the coordinator) stops waiting for the
+destination's stream at once and fails with `the coordination server no longer
+has this source registered`: no destination can reach it any more. Module work
+that is long and synchronous (a whole-tree walk or hash) must run off the async
+workers (`spawn_blocking`), or it starves the heartbeat task and the
+coordinator reaps a live source. A provider accepting a sibling carrier skips
+connections whose QUIC handshake fails; the consumer's losing primary
+candidates arrive that way and are not the sibling.
 `--no-udp` forces the relay, which is the CI baseline.
 
 Current UDP support includes STUN reflexive candidates, authenticated

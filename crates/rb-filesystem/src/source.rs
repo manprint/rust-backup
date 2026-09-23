@@ -29,6 +29,11 @@ pub(crate) fn validate_source_params(params: &FilesystemParams) -> Result<()> {
 }
 
 pub(crate) async fn analyze(params: &FilesystemParams) -> Result<BackupPlan> {
+    let params = params.clone();
+    crate::blocking(Phase::Analyze, move || analyze_tree(&params)).await
+}
+
+fn analyze_tree(params: &FilesystemParams) -> Result<BackupPlan> {
     let root = checked_root(params, Phase::Analyze)?;
     let payload = crate::walk::collect(&root)?;
     let mut next_id = 1_u32;

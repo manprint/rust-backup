@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### A large filesystem source no longer loses its channel
+
+- **Fixed: a filesystem source over a large tree was dropped by the
+  coordinator.** Its audit (whole-tree hash) and analysis ran synchronously on
+  an async worker for minutes. The transport heartbeat queued behind them, the
+  coordinator reaped the silent registration after 60 s (`control substream
+  silent past deadline; reaping channel id=fiera-fs`), and the destination
+  then waited ten minutes for a source it could no longer see. Tree walks,
+  hashing, preflight, `--overwrite` clearing, directory and metadata passes and
+  the verify scan now run on the blocking pool.
+- **A source whose registration is gone fails at once.** The source used to
+  keep printing `handshake` after the coordinator dropped it. It now fails
+  with `the coordination server no longer has this source registered (…)`,
+  and the lost control stream is logged at `WARN`.
+- **Fixed: direct data carriers fell back to the relay after a 10 s stall.**
+  The provider took the consumer's losing candidate connection, aborted
+  mid-handshake, for the sibling carrier and gave up on it. It now skips such
+  connections, so the plan and the data both ride the direct path when it is
+  up.
+- **The source side of `run` says when every plan is ready.** It logs
+  `ALL SOURCE PLANS READY (3/3): start the destination now` once, and every
+  minute a `session status` block with each target's state (preparing the
+  plan, PLAN READY, running, done, FAILED, queued). A `WARN` names a
+  `parallel_targets` too small for every plan to be ready at once.
+- The source logs `stream from the destination accepted on the direct path`
+  like it does for the relay.
+
 ## 0.0.18 — prerelease (2026-09-23)
 
 ### A channel that does not pair says where it stopped

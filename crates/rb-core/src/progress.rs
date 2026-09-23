@@ -15,7 +15,7 @@
 //! Modules do not receive the handle through their trait: the session runs them
 //! inside [`scope`], and a module reaches the run's handle with [`current`].
 
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::plan::human_bytes;
@@ -100,6 +100,10 @@ struct Inner {
     /// The peer's own latest progress line, when it sends one (the source
     /// learns what the destination is doing while it waits for the verdict).
     peer: Mutex<Option<String>>,
+    /// Latched when the source's plan is first ready (entering
+    /// [`Stage::Handshake`]); never cleared, so a watcher that polls less often
+    /// than the run moves on still sees that the plan was ready.
+    plan_ready: AtomicBool,
 }
 
 /// A consistent-enough copy of every counter, for rendering. The counters are
@@ -290,6 +294,12 @@ impl Progress {
     }
 
     /// The stage the run is in.
+    /// Whether this run's source plan has been ready at any point: the source
+    /// reached [`Stage::Handshake`], whatever it is doing now.
+    pub fn plan_ready(&self) -> bool {
+        self.inner.plan_ready.load(Ordering::Relaxed)
+    }
+
     pub fn stage(&self) -> Stage {
         Stage::from_u8(self.inner.stage.load(Ordering::Relaxed))
     }
@@ -305,6 +315,9 @@ impl Progress {
     /// Enter `stage`, describing it with `detail` and announcing `steps` units
     /// of work and `bytes` bytes to go through (either may be zero).
     pub fn begin_work(&self, stage: Stage, detail: &str, steps: u64, bytes: u64) {
+        if stage == Stage::Handshake {
+            self.inner.plan_ready.store(true, Ordering::Relaxed);
+        }
         if self.stage() == Stage::Transferring && stage != Stage::Transferring {
             self.complete();
         }
@@ -461,6 +474,21 @@ pub fn current() -> Option<Progress> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan-ready flag latches on the handshake and survives every later
+    /// stage, so a slow watcher cannot miss a plan that was ready.
+    #[test]
+    fn plan_ready_latches_on_the_handshake() {
+        let progress = Progress::default();
+        progress.set_stage(Stage::Auditing);
+        progress.set_stage(Stage::Analyzing);
+        assert!(!progress.plan_ready());
+        progress.set_stage(Stage::Handshake);
+        assert!(progress.plan_ready());
+        progress.set_stage(Stage::Transferring);
+        progress.set_stage(Stage::Auditing);
+        assert!(progress.plan_ready());
+    }
 
     /// The byte estimate is replaced by the actual; the ITEM total stays at the
     /// plan value, so a run that covered part of the plan cannot render as a

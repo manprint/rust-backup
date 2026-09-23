@@ -150,3 +150,43 @@ async fn test_direct_data_path_over_loopback() {
         "payload must round-trip over the direct QUIC path"
     );
 }
+
+/// The consumer dials every candidate of the provider at once and keeps the
+/// first to finish; the others are aborted mid-handshake and still reach the
+/// provider's endpoint. A sibling carrier accepted afterwards must skip those
+/// stale connections instead of failing on the first one, which sent every
+/// direct data carrier to the relay after a ten-second stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_carrier_skips_the_losing_candidates() {
+    let tuning = UdpDirectTuning::default();
+    let listener_socket = bind_socket(0).await.expect("bind listener");
+    let port = listener_socket.local_addr().expect("local_addr").port();
+    let listener = DirectListener::new(listener_socket, vec![], tuning)
+        .await
+        .expect("listener");
+    let consumer_socket = bind_socket(0).await.expect("bind consumer");
+    // Two candidates, one listener: exactly the shape of a host candidate plus
+    // a loopback/LAN alias of the same machine.
+    let candidates = vec![
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), port)),
+    ];
+    let provider_task = tokio::spawn(async move { listener.accept(TOKEN).await });
+    let consumer_task =
+        tokio::spawn(
+            async move { connect_direct(consumer_socket, candidates, TOKEN, tuning).await },
+        );
+    let provider = provider_task.await.expect("join").expect("accept");
+    let consumer = consumer_task.await.expect("join").expect("connect");
+
+    let accept = tokio::spawn(async move { provider.accept_sibling(TOKEN).await });
+    let open = consumer.open_sibling(TOKEN);
+    let (opened, accepted) = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        let opened = open.await;
+        (opened, accept.await.expect("join"))
+    })
+    .await
+    .expect("the sibling carrier must connect without stalling");
+    opened.expect("consumer sibling");
+    accepted.expect("provider sibling");
+}

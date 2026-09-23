@@ -15,6 +15,25 @@ mod immutability;
 mod source;
 mod walk;
 
+/// Run a long synchronous filesystem pass (tree walk, whole-tree hash,
+/// metadata apply) on tokio's blocking pool.
+///
+/// On a runtime worker it pins that worker for as long as the tree takes —
+/// minutes on a large filestore — and every task queued behind it waits,
+/// including the transport heartbeat. The coordinator reaps a registration
+/// whose control stream is silent for 60 s, so a source fingerprinting a big
+/// tree lost its channel and the destination then waited for a source that no
+/// longer existed.
+pub(crate) async fn blocking<T, F>(phase: Phase, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        BackupError::phase(phase, format!("filesystem worker task failed: {error}"))
+    })?
+}
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -179,7 +198,11 @@ impl Destination for FilesystemDestination {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport> {
-        dest::verify_metadata(&self.params, plan)?;
+        let (params, owned_plan) = (self.params.clone(), plan.clone());
+        blocking(Phase::Verify, move || {
+            dest::verify_metadata(&params, &owned_plan)
+        })
+        .await?;
         let mut verifier = VerificationSink::new(evidence);
         source::stream_out(&self.params, plan, &mut verifier)
             .await
@@ -315,6 +338,42 @@ mod tests {
             allow_atime_updates: false,
             overwrite: false,
         }
+    }
+
+    /// The whole-tree passes run on the blocking pool. On a single-threaded
+    /// runtime a task spawned before the pass can only run while the pass is
+    /// in flight if the pass yields; run inline, it finished first and every
+    /// other task — the transport heartbeat among them — waited behind it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn tree_passes_leave_the_runtime_free() {
+        let root = tempdir("off-runtime");
+        for index in 0..64 {
+            fs::write(root.join(format!("f{index}")), vec![7_u8; 64 * 1024]).unwrap();
+        }
+        let source = FilesystemSource {
+            params: params(&root),
+        };
+        for pass in ["fingerprint", "analyze"] {
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&ran);
+            let other = tokio::spawn(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            match pass {
+                "fingerprint" => {
+                    source.fingerprint().await.unwrap();
+                }
+                _ => {
+                    source.analyze().await.unwrap();
+                }
+            }
+            assert!(
+                ran.load(std::sync::atomic::Ordering::SeqCst),
+                "{pass} held the runtime thread for its whole run"
+            );
+            other.await.unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     // --- the atime guard (I-IMMUT) ------------------------------------------
