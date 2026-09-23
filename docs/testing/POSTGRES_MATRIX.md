@@ -78,6 +78,7 @@ left behind). `Oracle` names the external check that decides the row:
 | M-PG-VIEW-07 | view over a materialized view | 10 | `40_matviews.sql` | round-trip | schema diff |
 | M-PG-VIEW-08 | recursive CTE view | 10 | `30_views.sql` | round-trip | schema diff |
 | M-PG-VIEW-09 | view with a `COMMENT` | 10 | `30_views.sql` | round-trip | schema diff |
+| M-PG-VIEW-10 | `IN` list on a `varchar` column (Odoo report shape): the definition does not survive its own round-trip | 10 | `30_views.sql` | round-trip | read-back verified; schema diff on the header, fidelity probe row count |
 
 ## MV — materialized views
 

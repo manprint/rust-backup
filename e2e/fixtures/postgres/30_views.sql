@@ -40,6 +40,15 @@ CREATE VIEW mx.v_view_08 AS
   )
   SELECT n FROM counter;
 
+-- VIEW-10: an IN list on a varchar column, the shape of Odoo's report views.
+-- PostgreSQL stores it as `c_varchar::text = ANY (ARRAY['…'::character
+-- varying, …]::text[])` and renders the restored copy as `ARRAY['…'::character
+-- varying::text, …]`: the text does not survive its own round-trip, on any
+-- major, so only a comparison against the destination's rendering can pass.
+CREATE VIEW mx.v_view_10 AS
+  SELECT c_int, c_varchar FROM mx.t_tab_01
+   WHERE c_varchar IN ('varchar-1', 'varchar-2') AND c_varchar NOT IN ('x', 'y');
+
 -- VIEW-09: commented.
 CREATE VIEW mx.v_view_09 AS SELECT c_int FROM mx.t_tab_01;
 COMMENT ON VIEW mx.v_view_09 IS 'view comment for M-PG-VIEW-09';

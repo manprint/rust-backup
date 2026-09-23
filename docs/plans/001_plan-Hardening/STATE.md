@@ -587,7 +587,12 @@ Also record here the resolution of each `UNVERIFIED` reference (R5-R9 in `overvi
   survive its own round-trip (plausible for `UNION`/`WITH` views) is a third candidate. 0.0.12
   ships the diagnostics only: the report shows the first differing character with context and a
   `note:` naming the comparison mode and every failed re-render with its reason. The next run of
-  the user's restore selects the case; the fix itself is still open.
+  the user's restore selects the case.
+  **RESOLVED 2026-09-23 (0.0.13): case (c).** The 0.0.12 report on PostgreSQL 16 → 16 showed
+  `ARRAY['purchase'::character varying, 'done'::character varying]::text[]` on the source and
+  `ARRAY['purchase'::character varying::text, 'done'::character varying::text]` on the
+  destination; reproduced on 10 and 16 (T1 = T2, a fixed point after one round-trip). The
+  temporary-view re-render now runs on every restore; matrix row M-PG-VIEW-10 covers it.
 - No user-deferred question — the user adopted every recommended default at the clarification gate (D11-D27).
 - `UNVERIFIED` external facts (resolve in the owning sub-phase, record the outcome in §8): ~~R5 PostGIS image tags per major~~ **RESOLVED § 1.6**: all nine tags exist (`10-2.5 11-3.3 12-3.4 13-3.5 14-3.5 15-3.5 16-3.5 17-3.5 18-3.6`); ~~R6 PostGIS `spatial_ref_sys` extcondition~~ **RESOLVED § 1.6**: read from `pg_extension.extcondition` at run time, PostGIS registers a multi-line `WHERE NOT (…)` and M-PG-GIS-04 round-trips srid 990001; ~~R7 `tokio-postgres 0.7.x` keepalive setters~~ **RESOLVED § 3.2**: the locked 0.7.18 exposes all four (`keepalives`, `keepalives_idle`, `keepalives_interval`, `keepalives_retries`); ~~R8 MinIO policy action names~~ **RESOLVED § 4.7**: MinIO rejects `s3:GetObjectAcl` as an unsupported action and needs no `s3:GetBucketLocation`; the working set is `s3:ListBucket`, `s3:GetBucketPolicy`, `s3:GetBucketVersioning`, `s3:GetObject`, `s3:GetObjectTagging` (AWS additionally takes `s3:GetObjectAcl`); ~~R9 `mongod --profile 0 --slowms 0` JSON logging~~ **RESOLVED § 4.7**: identical `"c":"COMMAND"` + `attr.command` + `attr.appName` shape on 4.4, 6.0 and 7.0 (8 unrunnable on this kernel).
 - ~~§ 6.1 mismatch list, input for § 6.2~~ **RESOLVED § 6.2**: the single row —

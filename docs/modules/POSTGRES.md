@@ -87,13 +87,18 @@ not valid <nv>)`, plus one `deviation: ...` line per declared departure. The
 same numbers leave the module as fields of the `PostgreSQL destination
 read-back verified` event.
 
-A view definition is compared as the text `pg_get_viewdef(oid, true)` renders.
-When source and destination run the same major version the source text is
-compared **verbatim**: a restored view is expected to render exactly as the
-source rendered it. Across majors each source definition is first re-rendered
-on the destination through a temporary view, so version-dependent formatting
-does not count as a difference; a view whose re-render fails is compared
-verbatim and the server's reason is kept. A failed comparison of a long text —
+A view definition is compared as the text `pg_get_viewdef(oid, true)` renders,
+and every source definition is first **re-rendered on the destination** through
+a temporary view (session-local, gone at disconnect). The restored view must
+render exactly as the destination renders the source text. Comparing the source
+text verbatim is wrong even on one major: PostgreSQL's deparser does not survive
+its own round-trip — `s IN ('a','b')` on a `varchar` column renders as
+`ARRAY['a'::character varying, 'b'::character varying]::text[]` on the source
+and, once re-created from that text, as `ARRAY['a'::character varying::text,
+'b'::character varying::text]` (Odoo's report views are built this way; matrix
+row M-PG-VIEW-10). Across majors the same step absorbs version-dependent
+formatting. A view whose re-render fails is compared verbatim, so the check
+still fails closed, and the server's reason is kept. A failed comparison of a long text —
 a view, a constraint, a function body — is reported at its **first differing
 character**, `differs at character N (lengths source=… destination=…)`, with
 about 80 characters of each side around it, and the report ends with a `note:`

@@ -585,9 +585,8 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     }
 
     let source_major = expected.server_major;
-    let mut probe_failures = Vec::new();
+    let probe_failures = restate_view_definitions(params, &mut expected, destination_major).await?;
     if destination_major != source_major {
-        probe_failures = restate_view_definitions(params, &mut expected, destination_major).await?;
         strip_privileges_newer_than(&mut expected, source_major);
         strip_privileges_newer_than(&mut actual, source_major);
     }
@@ -773,14 +772,20 @@ fn strip_privilege_letters(item: &str, dropped: &[char]) -> String {
 }
 
 /// Re-render every expected view definition through the *destination's* own
-/// deparser, so a cross-major comparison is between two databases rather than
-/// between two versions of `pg_get_viewdef`.
+/// deparser, so the comparison is between two databases rather than between
+/// two renderings of `pg_get_viewdef`.
 ///
 /// `pg_get_viewdef` output is version-dependent — PostgreSQL 10 renders
 /// `SELECT * FROM app.zombies` as `SELECT zombies.id, zombies.email`, 12+ as
 /// `SELECT id, email` — so comparing the source's text with the destination's
 /// re-read text failed for *any* view on *any* cross-major restore, however
-/// faithful the restore was. The probe creates a temporary view (session-local,
+/// faithful the restore was. It is not even stable on one major: a view whose
+/// text went through the parser once renders differently the second time —
+/// `s IN ('a','b')` on a `varchar` column is stored as
+/// `s::text = ANY (ARRAY['a'::character varying, 'b'::character varying]::text[])`,
+/// and that text re-parses to `ARRAY['a'::character varying::text, …]`
+/// (Odoo's report views fail exactly so), which is then a fixed point. The
+/// probe therefore runs on every restore, same major included. It creates a temporary view (session-local,
 /// invisible to other sessions, gone at disconnect) from the source text and
 /// asks the destination to render that; the result is what the destination would
 /// report for a correctly restored view, and comparing it stays exact.
@@ -843,16 +848,14 @@ fn view_comparison_note(
     destination_major: u32,
     probe_failures: &[String],
 ) -> String {
-    if source_major == destination_major {
-        return format!(
-            "view definitions were compared verbatim: source and destination are both \
-             PostgreSQL {source_major}, so each restored view is expected to render exactly \
-             as the source rendered it"
-        );
-    }
+    let versions = if source_major == destination_major {
+        format!("PostgreSQL {source_major} on both sides")
+    } else {
+        format!("PostgreSQL {source_major} -> {destination_major}")
+    };
     let mut note = format!(
-        "view definitions were re-rendered on the destination (PostgreSQL {source_major} -> \
-         {destination_major}) through a temporary view before comparing"
+        "view definitions were re-rendered on the destination ({versions}) through a \
+         temporary view before comparing"
     );
     if probe_failures.is_empty() {
         note.push_str("; every re-render succeeded");
@@ -1725,8 +1728,8 @@ mod tests {
     #[test]
     fn the_view_note_names_the_comparison_mode_and_probe_failures() {
         let same = view_comparison_note(16, 16, &[]);
-        assert!(same.contains("compared verbatim"), "{same}");
-        assert!(same.contains("both PostgreSQL 16"), "{same}");
+        assert!(same.contains("re-rendered"), "{same}");
+        assert!(same.contains("PostgreSQL 16 on both sides"), "{same}");
 
         let cross_ok = view_comparison_note(12, 16, &[]);
         assert!(cross_ok.contains("re-rendered"), "{cross_ok}");

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### PostgreSQL: views that do not survive their own round-trip restore verified
+
+- **Fix: a same-major restore of Odoo failed `[Verify]` (exit `5`) on its
+  report views.** PostgreSQL renders `state IN ('a','b')` on a `varchar` column
+  as `ARRAY['a'::character varying, 'b'::character varying]::text[]`, and the
+  restored copy — re-created from that very text — as `ARRAY['a'::character
+  varying::text, 'b'::character varying::text]`. The read-back compared the
+  source text verbatim whenever both servers ran the same major, so the three
+  views `purchase_bill_union`, `report_all_channels_sales` and
+  `report_stock_quantity` always differed. Every view is now re-rendered on the
+  destination through a temporary view before comparing, as cross-major runs
+  already did; the comparison stays exact against the destination's rendering.
+- New matrix row M-PG-VIEW-10 restores such a view on every major 10..18 and in
+  the cross-version pairs.
+
 ## 0.0.12 — prerelease (2026-09-23)
 
 ### PostgreSQL read-back failures show where the texts differ

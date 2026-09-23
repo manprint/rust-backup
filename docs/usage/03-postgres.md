@@ -488,6 +488,6 @@ Schema completo in [07 — Sessioni YAML](07-sessioni-yaml.md).
 | exit `6` | la sorgente è cambiata durante l'esecuzione: fermare la scrittura sul cluster di origine e ripetere, oppure — se la sorgente deve restare in linea — usare [`--hot-backup`](#backup-a-caldo---hot-backup) su entrambi i lati |
 | exit `3`, `pass --hot-backup to the destination` | la sorgente ha fatto un backup a caldo: aggiungere `--hot-backup` anche alla destinazione |
 | exit `5` | la rilettura della destinazione non coincide: **il ripristino non è valido**, non usarlo |
-| exit `5`, `views[…].definition differs at character N` | la definizione di una vista restaurata non si rende come sulla sorgente; il messaggio mostra il testo delle due parti attorno al primo carattere diverso e una riga `note:` dice se le viste sono state confrontate alla lettera (stessa major) o ridisegnate sulla destinazione, con il motivo di ogni vista che non è stato possibile ridisegnare |
+| exit `5`, `views[…].definition differs at character N` | la vista restaurata non si rende come la destinazione rende il testo della sorgente (ogni definizione viene ridisegnata sulla destinazione con una vista temporanea prima del confronto); il messaggio mostra le due parti attorno al primo carattere diverso e una riga `note:` elenca, con il motivo, ogni vista che non è stato possibile ridisegnare. Fino alla 0.0.12 il confronto era alla lettera sulla stessa major e falliva sulle viste di report di Odoo (`IN` su colonne `varchar`) |
 
 Tabella completa dei codici: [11 — Codici di uscita](11-codici-uscita.md).
