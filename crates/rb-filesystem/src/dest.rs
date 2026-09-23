@@ -59,6 +59,30 @@ pub(crate) fn validate_with(
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     let parent_ok = parent.is_dir();
     let target_empty = destination_is_empty(root)?;
+    let (empty_ok, empty_detail) = if target_empty {
+        (true, String::from("destination root is absent or empty"))
+    } else if !params.overwrite {
+        (
+            false,
+            String::from(
+                "destination root must be absent or empty; pass --overwrite to delete its \
+                 existing entries first",
+            ),
+        )
+    } else {
+        match overwrite_refusal(root) {
+            Some(reason) => (false, reason),
+            None => (
+                true,
+                format!(
+                    "--overwrite: the {} existing entries in {} will be deleted before the \
+                     first payload byte",
+                    top_level_entries(root)?,
+                    root.display()
+                ),
+            ),
+        }
+    };
     let ownership_possible = caps.chown;
     // Device nodes are the one kind whose creation needs a capability of its
     // own. Saying so at preflight is the difference between "this restore
@@ -79,11 +103,7 @@ pub(crate) fn validate_with(
             parent_ok,
             format!("{}", parent.display()),
         )
-        .check(
-            "destination-empty",
-            target_empty,
-            "destination root must be absent or empty; existing entries are never deleted",
-        )
+        .check("destination-empty", empty_ok, empty_detail)
         .check(
             "ownership",
             !ownership_needed || ownership_possible,
@@ -126,13 +146,16 @@ pub(crate) async fn stream_in(
     validate_entries(&payload)?;
     let root = Path::new(&params.root);
     if !destination_is_empty(root)? {
-        return Err(BackupError::phase(
-            Phase::Apply,
-            format!(
-                "filesystem destination must be empty before restore: {}",
-                root.display()
-            ),
-        ));
+        if !params.overwrite {
+            return Err(BackupError::phase(
+                Phase::Apply,
+                format!(
+                    "filesystem destination must be empty before restore: {}",
+                    root.display()
+                ),
+            ));
+        }
+        clear_destination_root(root)?;
     }
     create_destination_root(root)?;
     create_directories(root, &payload)?;
@@ -770,6 +793,75 @@ fn current_uid() -> u32 {
 }
 fn current_gid() -> u32 {
     Gid::current().as_raw()
+}
+
+/// Why `root` cannot be emptied by `--overwrite`, if it cannot: a symlink
+/// would redirect the deletion, a non-directory has no entries to delete, and
+/// `/` is never a restore target worth a recursive delete.
+fn overwrite_refusal(root: &Path) -> Option<String> {
+    let meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(error) => return Some(format!("cannot inspect {}: {error}", root.display())),
+    };
+    if meta.file_type().is_symlink() {
+        return Some(format!(
+            "--overwrite refused: destination root {} is a symlink",
+            root.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Some(format!(
+            "--overwrite refused: destination root {} is not a directory",
+            root.display()
+        ));
+    }
+    match fs::canonicalize(root) {
+        Ok(real) if real == Path::new("/") => Some(String::from(
+            "--overwrite refused: the destination root is /",
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!("cannot resolve {}: {error}", root.display())),
+    }
+}
+
+fn top_level_entries(root: &Path) -> Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(root).map_err(|e| io_error(Phase::Validate, root, e))? {
+        entry.map_err(|e| io_error(Phase::Validate, root, e))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `--overwrite`: delete every entry under `root`, keeping `root` itself (it
+/// may be a mount point). Entries are classified without following links: a
+/// symlink is unlinked, never traversed, and `remove_dir_all` does not follow
+/// symlinks inside the trees it removes, so nothing outside `root` is touched.
+fn clear_destination_root(root: &Path) -> Result<()> {
+    if let Some(reason) = overwrite_refusal(root) {
+        return Err(BackupError::phase(Phase::Validate, reason));
+    }
+    let mut deleted = 0usize;
+    for entry in fs::read_dir(root).map_err(|e| io_error(Phase::Apply, root, e))? {
+        let entry = entry.map_err(|e| io_error(Phase::Apply, root, e))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| io_error(Phase::Apply, &path, e))?;
+        let removed = if kind.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.map_err(|e| io_error(Phase::Apply, &path, e))?;
+        deleted += 1;
+    }
+    tracing::info!(
+        root = %root.display(),
+        deleted,
+        "--overwrite: deleted the existing entries of the destination root"
+    );
+    Ok(())
 }
 
 fn destination_is_empty(path: &Path) -> Result<bool> {

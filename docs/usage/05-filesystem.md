@@ -11,8 +11,11 @@ sfrutta più carrier paralleli (fino a 32).
 # sorgente: sola lettura, non serve alcun privilegio
 rust-backup filesystem source --to 127.0.0.1:7835 --channel fs --root /srv/data
 
-# destinazione: la root deve essere assente o vuota
+# destinazione: la root deve essere assente o vuota…
 rust-backup filesystem destination --to 127.0.0.1:7835 --channel fs --root /srv/restore --yes
+
+# …oppure --overwrite ne cancella il contenuto prima di ripristinare
+rust-backup filesystem destination --to 127.0.0.1:7835 --channel fs --root /srv/restore --yes --overwrite
 ```
 
 Se l'albero contiene file di utenti diversi da quello che esegue la
@@ -40,6 +43,7 @@ sudo rust-backup filesystem destination \
 | Flag | Variabile | Default | Lato | A cosa serve |
 |------|-----------|---------|------|--------------|
 | `--root <percorso>` | `RUST_BACKUP_ROOT` | — (obbligatorio) | entrambi | sorgente: directory da copiare. Destinazione: directory in cui ripristinare, che deve essere **assente o vuota** |
+| `--overwrite[=bool]` | `RUST_BACKUP_OVERWRITE` | falso | destinazione | se la root non è vuota, **cancella tutto il suo contenuto** dopo il preflight e prima del primo byte, poi ripristina. Vedi la sezione su `--overwrite` più sotto |
 | `--no-preserve-ownership[=bool]` | `RUST_BACKUP_NO_PRESERVE_OWNERSHIP` | falso (cioè: ownership preservata) | destinazione | rinuncia esplicita al ripristino di uid/gid. I file diventano dell'utente che esegue il processo; contenuti, permessi, date e link restano verificati |
 | `--allow-atime-updates[=bool]` | `RUST_BACKUP_ALLOW_ATIME_UPDATES` | falso | sorgente | accetta che la lettura aggiorni l'**access time** dei file. Serve solo quando il processo non è proprietario dei file e non ha `CAP_FOWNER`: in quel caso `O_NOATIME` viene rifiutato dal kernel e senza questo flag la corsa termina prima di trasferire qualsiasi byte |
 | `--follow-symlinks[=bool]` | `RUST_BACKUP_FOLLOW_SYMLINKS` | falso | entrambi | **rifiutato da questa build**: seguire un link potrebbe uscire dalla root dichiarata e non preserverebbe il link come tale. I symlink vengono comunque copiati *come symlink* |
@@ -161,21 +165,42 @@ Prima di scrivere qualunque cosa, la destinazione verifica e stampa:
 | Controllo | Significato |
 |-----------|-------------|
 | `destination-parent` | la directory che contiene la root esiste |
-| `destination-empty` | la root è assente o vuota; **voci preesistenti non vengono mai cancellate** |
+| `destination-empty` | la root è assente o vuota; con `--overwrite` passa anche se non lo è, e dice quante voci verranno cancellate |
 | `ownership` | se il ripristino di uid/gid è richiesto, il processo può farlo |
 | `special_files` | se il piano contiene device node, il processo ha root o `CAP_MKNOD` |
 | `estimated-bytes` | quantità di dati da ripristinare |
 
-Non esiste un `--overwrite` per il filesystem: per rifare un ripristino si
-svuota (o si cambia) la root a mano. È deliberato — un `rm -rf` implicito su una
-directory di sistema non è un comportamento che il programma vuole avere.
+## `--overwrite`: cosa cancella e quando
+
+Senza `--overwrite` una root non vuota ferma il preflight (exit `3`):
+
+```text
+FAILED: destination root must be absent or empty; pass --overwrite to delete its existing entries first check=destination-empty
+```
+
+Con `--overwrite` il preflight lo annuncia (`--overwrite: the 12 existing
+entries in /srv/restore will be deleted before the first payload byte`) e, dopo
+l'accettazione del piano e **prima** del primo byte, la destinazione cancella
+ogni voce contenuta nella root. Da sapere:
+
+- la directory root **resta** (può essere un punto di mount): si cancella solo
+  il suo contenuto;
+- i link simbolici vengono rimossi, **mai seguiti**: ciò a cui puntano, fuori
+  dalla root, non viene toccato;
+- sono rifiutate una root che è un symlink, una root che non è una directory e
+  `/`;
+- non è un "riprova senza rischi": il contenuto precedente è già cancellato
+  quando il trasferimento comincia. Se il ripristino fallisce a metà, la root
+  contiene un albero parziale non certificato; per ripetere basta rilanciare
+  con `--overwrite`.
 
 ## Interruzioni
 
 `SIGINT`/`SIGTERM` interrompono: il file attivo viene rimosso, nessuna riga
 `VERIFIED` viene stampata, l'uscita è diversa da zero. I file già completati
 restano su disco: un ripristino interrotto lascia un *albero* parziale, mai un
-*file* parziale — e nulla di esso è certificato. Per ripetere, svuotare la root.
+*file* parziale — e nulla di esso è certificato. Per ripetere, rilanciare con
+`--overwrite` (o svuotare la root).
 
 ## Anteprima senza trasferire nulla
 
@@ -259,7 +284,7 @@ Cosa resta fuori dal perimetro, per scelta esplicita:
 
 | Sintomo | Causa e rimedio |
 |---------|-----------------|
-| preflight `destination-empty` fallito | la root contiene già qualcosa: svuotarla o usarne un'altra |
+| preflight `destination-empty` fallito | la root contiene già qualcosa: aggiungere `--overwrite` per sostituirne il contenuto, oppure svuotarla o usarne un'altra |
 | preflight `ownership` fallito | eseguire la destinazione con `sudo`, oppure accettare `--no-preserve-ownership` |
 | preflight `special_files` fallito | l'albero contiene device node: eseguire la destinazione con `sudo`/`CAP_MKNOD`, oppure copiare un albero che non li contiene |
 | `a unix socket cannot be reproduced` | rimuovere il socket dall'albero copiato (o copiarne una sottodirectory che non lo contiene): un socket non è riproducibile |

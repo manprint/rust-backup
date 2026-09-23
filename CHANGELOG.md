@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### `--overwrite` on the filesystem module
+
+- **`--overwrite` now works for every module.** On the filesystem module it
+  was accepted and silently ignored, so a restore onto a non-empty root failed
+  preflight (`destination-empty`) although the operator had asked to replace
+  it. With the flag the preflight says how many entries will go; after the plan
+  is accepted and before the first payload byte every entry under the root is
+  deleted. The root directory stays (it may be a mount point), symlinks are
+  unlinked and never followed, and a symlinked root, a non-directory root and
+  `/` are refused. Without the flag the refusal now says `pass --overwrite`.
+- New matrix rows M-FS-OVERWRITE (refused without the flag; restored with it;
+  a planted symlink's target survives).
+
 ## 0.0.16 — prerelease (2026-09-23)
 
 ### A refused plan says why on both peers, and the waiting source says it waits

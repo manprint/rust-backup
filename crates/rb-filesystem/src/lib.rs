@@ -50,6 +50,12 @@ pub struct FilesystemParams {
     /// during the first fingerprint instead of silently touching the tree.
     #[serde(default)]
     pub allow_atime_updates: bool,
+    /// Destination only: delete every existing entry under the root before
+    /// the first payload byte is written. The root directory itself stays (it
+    /// may be a mount point); nothing outside it is touched and no symlink is
+    /// followed. Without it a non-empty root fails preflight.
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 fn default_preserve_ownership() -> bool {
@@ -307,6 +313,7 @@ mod tests {
             preserve_ownership: false,
             preserve_xattr: false,
             allow_atime_updates: false,
+            overwrite: false,
         }
     }
 
@@ -939,6 +946,80 @@ mod tests {
             "unexpected error: {error}"
         );
         let _ = fs::remove_dir_all(&destination_root);
+    }
+
+    /// `--overwrite` empties the root before the restore, keeps the root, and
+    /// unlinks a symlink found there without touching what it points to.
+    #[tokio::test]
+    async fn overwrite_empties_the_root_without_following_symlinks() {
+        let destination_root = tempdir("overwrite-destination");
+        let outside = tempdir("overwrite-outside");
+        fs::write(outside.join("keep"), b"outside").unwrap();
+        fs::write(destination_root.join("old-file"), b"x").unwrap();
+        fs::create_dir_all(destination_root.join("old-dir/nested")).unwrap();
+        fs::write(destination_root.join("old-dir/nested/f"), b"y").unwrap();
+        std::os::unix::fs::symlink(&outside, destination_root.join("old-link")).unwrap();
+        std::os::unix::fs::symlink(&outside, destination_root.join("old-dir/link")).unwrap();
+        let plan = hostile_plan(&destination_root, vec![entry("fresh", "dir", 0o040_755)]);
+        let caps = crate::dest::Capabilities {
+            chown: true,
+            mknod: true,
+        };
+
+        let refused = crate::dest::validate_with(&params(&destination_root), &plan, caps).unwrap();
+        assert!(!refused.ok, "a non-empty root needs --overwrite");
+        let mut overwrite = params(&destination_root);
+        overwrite.overwrite = true;
+        let accepted = crate::dest::validate_with(&overwrite, &plan, caps).unwrap();
+        let check = accepted
+            .checks
+            .iter()
+            .find(|check| check.name == "destination-empty")
+            .unwrap();
+        assert!(check.passed, "{}", check.detail);
+        assert!(
+            check.detail.contains("3 existing entries"),
+            "{}",
+            check.detail
+        );
+
+        let destination = FilesystemDestination { params: overwrite };
+        let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+        destination.stream_in(&plan, &mut source).await.unwrap();
+        let mut left: Vec<_> = fs::read_dir(&destination_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["fresh"], "only the restored tree remains");
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
+        let _ = fs::remove_dir_all(&destination_root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// A symlinked root would redirect the deletion: `--overwrite` refuses it.
+    #[test]
+    fn overwrite_refuses_a_symlinked_root() {
+        let real = tempdir("overwrite-real");
+        fs::write(real.join("precious"), b"x").unwrap();
+        let link = real.with_file_name(format!(
+            "{}-link",
+            real.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut overwrite = params(&link);
+        overwrite.overwrite = true;
+        let plan = hostile_plan(&link, Vec::new());
+        let caps = crate::dest::Capabilities {
+            chown: true,
+            mknod: true,
+        };
+        let preflight = crate::dest::validate_with(&overwrite, &plan, caps).unwrap();
+        assert!(!preflight.ok);
+        assert!(real.join("precious").exists());
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&real);
     }
 
     /// `"."`, `"a/./b"` and `".."` are all outside the set of restorable paths.

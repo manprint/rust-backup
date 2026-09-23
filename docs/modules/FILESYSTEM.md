@@ -1,8 +1,12 @@
 # filesystem module
 
 1:1 copy of a directory tree from source to an empty destination root over the
-streaming channel. The destination must be absent or empty: rust-backup never
-deletes pre-existing entries as part of a restore.
+streaming channel. The destination must be absent or empty, unless
+`overwrite=true` (`--overwrite`): then every existing entry under the root is
+deleted after preflight and before the first payload byte. The root directory
+itself stays (it may be a mount point); entries are classified without following
+links, so a symlink is unlinked and never traversed, and nothing outside the
+root is touched. A symlinked root, a non-directory root and `/` are refused.
 
 ## What is preserved
 

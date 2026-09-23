@@ -75,7 +75,7 @@ OWNERSHIP = {
     ],
     "05-filesystem.md": [
         "--root", "--follow-symlinks", "--no-preserve-ownership",
-        "--preserve-xattr", "--allow-atime-updates",
+        "--preserve-xattr", "--allow-atime-updates", "--overwrite",
     ],
     "06-s3.md": [
         "--bucket", "--endpoint", "--region", "--prefix",

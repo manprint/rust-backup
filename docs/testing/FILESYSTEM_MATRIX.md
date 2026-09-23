@@ -65,4 +65,5 @@ destination tree left behind). `Oracle` names the check that decides the row:
 | M-FS-29 | tree deeper than 1024 | none | `rb_seed_fs_refusal_depth` | refused before transfer | refusal |
 | M-FS-30 | sparse 64 MiB file: size and content equal, holes not preserved (documented limit) | none | `rb_seed_filesystem_matrix_fixture` | round-trip (dense) | tree digest + content compare |
 | M-FS-31 | xattr present with `--preserve-xattr` | none | any tree, run with `--preserve-xattr` | refused at connect | refusal |
+| M-FS-OVERWRITE | the root pass restored again onto its non-empty destination, holding a stale file and a symlink to a directory outside the root | root | root pass (A) | refused without `--overwrite`, then round-trip with it | refusal naming `--overwrite`; tree manifest equals the source; the symlink target is untouched |
 | M-FS-32 | non-owner source without `--allow-atime-updates`; round-trip with the flag | root | `rb_seed_filesystem_fixture` owned by root, read by an unprivileged account | refused before transfer, then round-trip | refusal, then tree digest + atime manifest |

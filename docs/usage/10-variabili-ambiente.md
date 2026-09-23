@@ -83,7 +83,7 @@ vince sul default compilato nel programma.
 | `RUST_BACKUP_ACCESS_KEY` | `--access-key` | s3 |
 | `RUST_BACKUP_SECRET_KEY` | `--secret-key` | s3 |
 | `RUST_BACKUP_PATH_STYLE` | `--path-style` | s3 |
-| `RUST_BACKUP_OVERWRITE` | `--overwrite` | postgres, mongodb, s3 (destinazione) |
+| `RUST_BACKUP_OVERWRITE` | `--overwrite` | tutti i moduli (destinazione) |
 | `RUST_BACKUP_EXTENSION_VERSION` | `--extension-version` | postgres (destinazione) |
 | `RUST_BACKUP_HOT_BACKUP` | `--hot-backup` | postgres (sorgente e destinazione) |
 

@@ -12,6 +12,9 @@
 #   (C) refusals     — socket, non-UTF-8 name, tree deeper than 1024.
 #   (D) the two rows that are about privilege rather than content: the access
 #       time guard (M-FS-32) and extended attributes (M-FS-31).
+#   (E) --overwrite (M-FS-OVERWRITE): the root pass restored again onto its own
+#       non-empty destination — refused at preflight without the flag, then
+#       emptied and restored with it, without following a planted symlink.
 #
 # Prints one PASS/FAIL/SKIP line per row and a final `MATRIX FS:` summary.
 # Exits non-zero on any failure.
@@ -32,6 +35,7 @@ install -m 0755 "$RB_E2E_BIN" "$work/rust-backup"
 install -m 0644 "$(dirname "$0")/lib.sh" "$work/lib.sh"
 RB_E2E_BIN="$work/rust-backup"
 PIDS=()
+DEST_EXTRA=()
 PASS=0
 FAIL=0
 SKIP=0
@@ -72,6 +76,7 @@ transfer() { # source dest port channel [run-as-user] [no-preserve]
   if [[ $no_ownership == no-preserve ]]; then
     destination_cmd+=(--no-preserve-ownership)
   fi
+  destination_cmd+=(${DEST_EXTRA[@]+"${DEST_EXTRA[@]}"})
   if [[ -n $run_as ]]; then
     runuser -u "$run_as" -- env RUST_LOG=info "${source_cmd[@]}" >"$work/$channel-source.log" 2>&1 &
   else
@@ -163,6 +168,45 @@ else
   for row in "${ROWS_COMMON[@]}" "${ROWS_ROOT[@]}"; do
     skip_row "M-FS-$row" 'the privileged transfer failed'
   done
+fi
+
+# --- (E) --overwrite onto the non-empty root destination ---------------------
+if [[ -d $root_dst ]]; then
+  outside="$work/overwrite-outside"
+  mkdir -p "$outside"
+  echo keep >"$outside/keep"
+  echo stale >"$root_dst/stale-marker"
+  ln -s "$outside" "$root_dst/stale-link"
+  port=$(rb_free_port)
+  start_server "$port" "$work/overwrite-server.log"
+  if transfer "$root_src" "$root_dst" "$port" fs-matrix-no-overwrite; then
+    fail_row 'M-FS-OVERWRITE/refused' 'a non-empty root was restored without --overwrite'
+  elif grep -qF 'pass --overwrite' "$work/fs-matrix-no-overwrite-destination.log" &&
+      [[ -e $root_dst/stale-marker ]]; then
+    pass_row 'M-FS-OVERWRITE/refused'
+  else
+    fail_row 'M-FS-OVERWRITE/refused' 'the refusal does not name --overwrite or touched the root'
+  fi
+  DEST_EXTRA=(--overwrite)
+  if transfer "$root_src" "$root_dst" "$port" fs-matrix-overwrite; then
+    rb_tree_manifest "$root_dst" >"$work/overwrite-destination.manifest"
+    if diff -q "$work/root-source.manifest" "$work/overwrite-destination.manifest" >/dev/null &&
+        [[ ! -e $root_dst/stale-marker && ! -L $root_dst/stale-link ]]; then
+      pass_row 'M-FS-OVERWRITE/restored'
+    else
+      fail_row 'M-FS-OVERWRITE/restored' 'the overwritten root differs from the source tree'
+    fi
+    if [[ $(cat "$outside/keep" 2>/dev/null) == keep ]]; then
+      pass_row 'M-FS-OVERWRITE/symlink-not-followed'
+    else
+      fail_row 'M-FS-OVERWRITE/symlink-not-followed' 'the target of a planted symlink was deleted'
+    fi
+  else
+    fail_row 'M-FS-OVERWRITE/restored' 'the --overwrite transfer failed'
+  fi
+  DEST_EXTRA=()
+else
+  skip_row 'M-FS-OVERWRITE' 'the privileged transfer failed'
 fi
 
 # --- (B) unprivileged pass --------------------------------------------------
