@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.16 — prerelease (2026-09-23)
 
 ### A refused plan says why on both peers, and the waiting source says it waits
 
