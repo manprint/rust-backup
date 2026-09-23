@@ -5,7 +5,7 @@ use rb_core::error::BackupError;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
 use crate::channel::{PairedChannel, CTRL_CLIENT_HEARTBEAT};
@@ -123,6 +123,11 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
     }
 
     await_registration(&mut control).await?;
+    info!(
+        channel = %cfg.channel,
+        coordinator = %cfg.to,
+        "registered as the source of the channel; the destination can connect now"
+    );
     // Negotiate the direct path on the transport control stream BEFORE it is
     // moved into the channel (best-effort; falls back to relay on any failure).
     #[cfg(feature = "udp")]
@@ -179,7 +184,14 @@ pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Resul
         })?;
     }
 
+    info!(
+        channel = %cfg.channel,
+        coordinator = %cfg.to,
+        "connected to the coordinator; waiting for the source of the channel to register \
+         (up to 10 minutes)"
+    );
     await_registration(&mut control).await?;
+    info!(channel = %cfg.channel, "the source of the channel is registered; pairing with it");
     #[cfg(feature = "udp")]
     let direct = if cfg.udp {
         setup_direct(

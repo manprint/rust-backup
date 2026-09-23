@@ -141,10 +141,10 @@ termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
 
 | fase | lato | cosa riporta |
 |---|---|---|
-| `connecting:` | entrambi | attesa del peer e del piano |
+| `connecting:` | entrambi | collegamento al coordinatore; sulla destinazione nomina il passo: `opening the plan stream to the source`, poi `plan stream open; waiting for the source's plan` (la sorgente lo invia dopo audit e analisi) |
 | `audit:` | sorgente | impronta per il controllo di immutabilità (prima e dopo la copia; mai con `--hot-backup`) |
 | `analyze:` | sorgente | lettura della sorgente e costruzione del piano |
-| `handshake:` | sorgente | piano pronto, in attesa che la destinazione si colleghi, faccia i controlli e lo accetti |
+| `handshake:` | sorgente | due passi distinti: `plan ready; waiting for the destination to connect to the channel and open the plan stream` (la destinazione non si è ancora agganciata) e `plan sent; waiting for the destination's preflight checks and decision`. Ognuno dei due attende al massimo `RUST_BACKUP_PLAN_TIMEOUT` (600 s), poi il target fallisce con il motivo |
 | `preflight:` | destinazione | controlli del piano sulla destinazione |
 | `transfer:` | entrambi | `items 42/1462  878.80 KiB/~1.41 GiB  (0.1%)  25.11 KiB/s`: il totale con `~` è la **stima** del piano (PostgreSQL la calcola dalle dimensioni su disco, spesso maggiori del flusso reale), la velocità è quella degli ultimi 5 secondi |
 | `finalize:` | destinazione | lavoro dopo i dati, per i moduli che lo hanno: su PostgreSQL indici, vincoli e `REFRESH` delle viste materializzate, `step 120/7800` |
@@ -153,7 +153,27 @@ termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
 
 Alla fine della fase `transfer:` il totale stimato viene sostituito da quello
 reale. L'ultima riga dice `done:` (con la velocità media e la durata totale) o
-`failed during <fase>:`.
+`failed during <fase> after <durata>: <motivo>`. L'etichetta di ogni riga nomina
+modulo, ruolo e canale (`target_label=filesystem/Source channel=fiera-fs`).
+
+L'aggancio lascia una riga `INFO` per ogni passo, così un canale che non si
+aggancia dice dove si è fermato:
+
+```text
+registered as the source of the channel; the destination can connect now channel=fiera-fs   (sorgente)
+connected to the coordinator; waiting for the source of the channel to register (up to 10 minutes)   (destinazione)
+the source of the channel is registered; pairing with it                     (destinazione)
+stream to the source opened through the coordinator relay                    (destinazione)
+waiting for the destination to open the plan stream                          (sorgente)
+stream from the destination accepted through the coordinator relay          (sorgente)
+destination connected; sending the plan                                      (sorgente)
+```
+
+In una sessione `run` con più target falliti, il messaggio finale li elenca
+**tutti**, uno per riga (`N target(s) failed:` seguito da `  - target 2
+(filesystem/Destination): …`); il codice di uscita resta quello del più grave.
+Il coordinatore registra a livello `WARN` perché un flusso inoltrato si è
+chiuso (`relayed stream ended: …`).
 
 Un preflight fallito nomina i controlli falliti su **entrambi** i peer, per
 esempio sulla destinazione `preflight failed: database:synclinic: 'synclinic'

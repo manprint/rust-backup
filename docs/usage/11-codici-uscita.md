@@ -21,14 +21,15 @@ echo "exit=$?"     # 0 = copia verificata; qualunque altro valore = nessuna cert
 | `7` | trasporto / connessione | coordinatore irraggiungibile, segreto errato, TLS fallito, peer assente | verificare rete, `--to`, `--channel`, segreto e certificati |
 
 In una sessione con più target falliti vale il codice **più grave**, in
-quest'ordine: `6` → `5` → `3` → `4` → `7` → `2` → `1`.
+quest'ordine: `6` → `5` → `3` → `4` → `7` → `2` → `1`. Il messaggio finale
+elenca comunque l'errore di ogni target fallito.
 
 ## Come si riconosce un'esecuzione riuscita
 
 Non basta l'assenza di errori: devono comparire **entrambe** queste righe, con
 lo stesso BLAKE3, una per peer, e l'ultima riga di avanzamento deve iniziare con
 `done:` e dire `status="verified"` al `100.0%`. Un'esecuzione fallita chiude
-invece con `failed during <fase>:`, che nomina la fase in cui si è fermata.
+invece con `failed during <fase> after <durata>: <motivo>`, che nomina la fase in cui si è fermata e perché.
 
 ```text
 BACKUP VERIFIED: source unchanged; destination read-back matches

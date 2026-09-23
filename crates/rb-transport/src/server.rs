@@ -608,7 +608,8 @@ async fn accept_relays(
             async move {
                 let _permit = permit;
                 if let Err(err) = relay(consumer_stream, registry, &id).await {
-                    tracing::trace!(%err, "relay closed");
+                    // The peers only see a closed stream; the reason lives here.
+                    warn!(%id, "relayed stream ended: {err:#}");
                 }
             }
             .instrument(info_span!("relay")),

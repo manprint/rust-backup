@@ -16,6 +16,7 @@
 //! then to the built-in default.
 
 use std::sync::Arc;
+use tracing::Instrument;
 
 use anyhow::{anyhow, Context};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -790,12 +791,21 @@ async fn run_session_parallel(reg: &ModuleRegistry, cfg: &SessionConfig) -> anyh
     // outermost layer, so an immutability violation in a parallel session
     // reported exit 1 and no reason at all.
     let total = errors.len();
-    let worst = most_severe(errors);
     if total == 1 {
-        return Err(worst);
+        return Err(most_severe(errors));
     }
-    let detail = format!("{worst:#}");
-    Err(worst.context(format!("{total} target(s) failed; most severe: {detail}")))
+    // Every failure is named: a summary that showed only the most severe one
+    // hid, say, a filesystem target that never paired behind a postgres
+    // verify error.
+    let listed: Vec<String> = errors
+        .iter()
+        .map(|error| format!("  - {error:#}"))
+        .collect();
+    let worst = most_severe(errors);
+    Err(worst.context(format!(
+        "{total} target(s) failed:\n{}\nthe exit code is the most severe one's",
+        listed.join("\n")
+    )))
 }
 
 /// The failure a session should be judged by: the one whose exit code is the
@@ -885,8 +895,9 @@ impl ProgressReporter {
         }
     }
 
-    fn finish(&mut self, succeeded: bool) {
+    fn finish(&mut self, failure: Option<&anyhow::Error>) {
         self.task.abort();
+        let succeeded = failure.is_none();
         if succeeded {
             self.progress.complete();
         }
@@ -896,8 +907,11 @@ impl ProgressReporter {
         let line = if succeeded {
             format!("done: {summary} average, {took} in total")
         } else {
+            let reason = failure
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_default();
             format!(
-                "failed during {}: {summary} average, {took} in total",
+                "failed during {} after {took}: {reason} ({summary} average)",
                 self.progress.stage().label()
             )
         };
@@ -974,8 +988,10 @@ async fn execute(
     // during negotiation, but a module's declared capability must be honoured
     // on the side that owns the module handle instead of being dead metadata.
     let transport = &clamp_carriers(module, transport);
-    let mut reporter =
-        ProgressReporter::spawn(progress.clone(), format!("{}/{:?}", module.name(), role));
+    let mut reporter = ProgressReporter::spawn(
+        progress.clone(),
+        format!("{}/{:?} channel={}", module.name(), role, transport.channel),
+    );
     let result: anyhow::Result<()> = async {
         match role {
             Role::Source => {
@@ -1028,8 +1044,16 @@ async fn execute(
         }
         Ok(())
     }
+    // Every line the transport and the session log for this run names its
+    // target, so the lines of parallel targets can be told apart.
+    .instrument(tracing::info_span!(
+        "target",
+        module = %module.name(),
+        role = ?role,
+        channel = %transport.channel
+    ))
     .await;
-    reporter.finish(result.is_ok());
+    reporter.finish(result.as_ref().err());
     result
 }
 

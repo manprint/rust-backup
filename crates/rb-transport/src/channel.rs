@@ -213,6 +213,7 @@ impl DataChannel for PairedChannel {
                                 );
                             } else {
                                 *direct_streams += 1;
+                                tracing::info!("stream to the source opened on the direct path");
                                 return Ok(Box::new(qt));
                             }
                         }
@@ -231,6 +232,7 @@ impl DataChannel for PairedChannel {
                 s.write_all(&[mux::STREAM_READY])
                     .await
                     .map_err(|e| BackupError::phase(Phase::Connect, format!("write ready: {e}")))?;
+                tracing::info!("stream to the source opened through the coordinator relay");
                 Ok(Box::new(s))
             }
             PairedChannelInner::Source { .. } => Err(BackupError::phase(
@@ -319,6 +321,9 @@ impl DataChannel for PairedChannel {
                         "invalid stream ready marker",
                     ));
                 }
+                tracing::info!(
+                    "stream from the destination accepted through the coordinator relay"
+                );
                 Ok(Box::new(s))
             }
             PairedChannelInner::Destination { .. } => Err(BackupError::phase(

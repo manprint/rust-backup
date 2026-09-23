@@ -415,8 +415,13 @@ async fn run_source_scoped(
             Ok(outcome)
         }
         Err(run_error) => {
+            // The run is reported as failing in the stage that failed, not in
+            // the audit that follows it.
+            let failed_stage = progress.stage();
             progress.set_stage(Stage::Auditing);
-            match source.fingerprint().await {
+            let audited = source.fingerprint().await;
+            progress.set_stage(failed_stage);
+            match audited {
                 Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
                     "source fingerprint changed during backup ({fp_before} -> {fp_after})"
                 ))),
@@ -489,9 +494,25 @@ async fn source_run(
     info!("\n{}", plan.render());
 
     // 3. Provider accepts the consumer's substream; exchange plan + decision.
-    let stream = channel.accept_stream().await?;
+    // The wait is bounded like every other handshake step: a destination that
+    // never connects must end the run with a reason, not leave the source
+    // printing "handshake" forever.
+    progress.set_detail(
+        "plan ready; waiting for the destination to connect to the channel and open the plan \
+         stream",
+    );
+    info!("waiting for the destination to open the plan stream");
+    let stream = exchange_timeout(
+        "the destination to open the plan stream (is the destination running, on the same \
+         channel and coordinator?)",
+        channel.accept_stream(),
+    )
+    .await?;
     let mut stream = stream;
+    info!("destination connected; sending the plan");
     channel::send_plan(&mut stream, &plan, channel.carriers()).await?;
+    progress.set_detail("plan sent; waiting for the destination's preflight checks and decision");
+    info!("plan sent; waiting for the destination's preflight checks and decision");
     // recv_ack errors out (PlanRejected) without ever touching the source.
     let accepted = exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
     let (peer_carriers, separate_data_streams) =
@@ -959,8 +980,14 @@ where
     Fut: std::future::Future<Output = bool> + Send,
 {
     // 1. Consumer opens the substream and receives the plan.
+    progress.set_detail("opening the plan stream to the source");
     let stream = channel.open_stream().await?;
     let mut stream = stream;
+    progress.set_detail(
+        "plan stream open; waiting for the source's plan (the source sends it after its audit \
+         and analysis)",
+    );
+    info!("plan stream open; waiting for the source's plan");
     // An unreadable/unsupported plan is refused on the wire too, so the source
     // fails fast with the reason instead of blocking on a PlanAck that never comes.
     let received = match exchange_timeout("source plan", channel::recv_plan(&mut stream)).await {

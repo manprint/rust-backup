@@ -137,17 +137,28 @@ impl Snapshot {
     pub fn render(&self, rate: u64, stage_secs: f64) -> String {
         let since = format!("{} in this stage", human_duration(stage_secs));
         match self.stage {
-            Stage::Connecting => format!("connecting: waiting for the peer and the plan, {since}"),
+            Stage::Connecting => {
+                let what = if self.detail.is_empty() {
+                    "waiting for the peer and the plan"
+                } else {
+                    self.detail.as_str()
+                };
+                format!("connecting: {what}, {since}")
+            }
             Stage::Auditing => {
                 format!("audit: fingerprinting the source for the immutability check, {since}")
             }
             Stage::Analyzing => {
                 format!("analyze: reading the source and building the plan, {since}")
             }
-            Stage::Handshake => format!(
-                "handshake: plan ready; waiting for the destination to connect, check and \
-                 accept it, {since}"
-            ),
+            Stage::Handshake => {
+                let what = if self.detail.is_empty() {
+                    "plan ready; waiting for the destination to connect, check and accept it"
+                } else {
+                    self.detail.as_str()
+                };
+                format!("handshake: {what}, {since}")
+            }
             Stage::Preflight => {
                 format!("preflight: checking the plan against the destination, {since}")
             }

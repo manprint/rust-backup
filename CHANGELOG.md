@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### A channel that does not pair says where it stopped
+
+- **The source no longer waits forever for the destination.** After its plan
+  was ready the source printed `handshake` with no bound; a destination that
+  never opened the plan stream left it there indefinitely. It now fails after
+  `RUST_BACKUP_PLAN_TIMEOUT` (600 s) with `plan exchange timed out waiting for
+  the destination to open the plan stream`.
+- **Every pairing step is logged.** The source logs that it is registered on the
+  channel, that it waits for the plan stream, that the destination connected and
+  that the plan was sent; the destination logs that it waits for the source to
+  register, that the source is there and that the plan stream is open. Both say
+  whether the stream rides the relay or the direct path. The `connecting` and
+  `handshake` progress lines name the current step.
+- **A failed target says why on its own last line**:
+  `failed during <stage> after <duration>: <reason>`. It used to show only the
+  counters. The source's failure line names the stage that failed, not the
+  immutability audit that runs afterwards.
+- **A multi-target `run` lists every failed target.** It used to print only the
+  most severe one, which hid a filesystem target that never paired behind a
+  PostgreSQL verify error. The exit code is still the most severe one's.
+- Every progress label carries the channel (`filesystem/Source channel=fiera-fs`).
+- The coordinator logs at `WARN` why a relayed stream ended (it was `TRACE`).
+
 ## 0.0.17 — prerelease (2026-09-23)
 
 ### `--overwrite` on the filesystem module

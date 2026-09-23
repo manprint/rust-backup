@@ -148,12 +148,12 @@ stage the run is in (`connecting`, `audit`, `analyze`, `handshake`, `preflight`,
 the last interval, and ends with the time spent in the stage:
 
 ```
-transfer: items 3/4  14.94 MiB/~16.00 MiB  (93.4%)  1019.60 KiB/s, 15s in this stage  target_label=filesystem/Destination
-verify: reading the restored data back, items 1/4  4.00 MiB/14.94 MiB  (26.8%)  3.10 MiB/s, 1s in this stage  target_label=filesystem/Destination
+transfer: items 3/4  14.94 MiB/~16.00 MiB  (93.4%)  1019.60 KiB/s, 15s in this stage  target_label=filesystem/Destination channel=qa
+verify: reading the restored data back, items 1/4  4.00 MiB/14.94 MiB  (26.8%)  3.10 MiB/s, 1s in this stage  target_label=filesystem/Destination channel=qa
 ```
 
 `~` marks the plan's byte estimate, which is replaced by the actual total when
-the transfer ends. The last line is `done: …` or `failed during <stage>: …`.
+the transfer ends. The last line is `done: …` or `failed during <stage> after <duration>: <reason> …`. The source's `handshake` line names its step (waiting for the destination to open the plan stream, or plan sent and waiting for the decision), each bounded by `RUST_BACKUP_PLAN_TIMEOUT`; a multi-target `run` lists every failed target in its final error.
 
 Exit `0` is not by itself the success criterion. It additionally requires both
 peer logs to end with `status="verified"` at `100.0%`, matching 64-character

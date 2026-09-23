@@ -163,7 +163,7 @@ Un `-P` vince sul flag tipizzato corrispondente e sullo YAML.
 
 | Variabile | Default | Significato |
 |-----------|---------|-------------|
-| `RUST_BACKUP_PLAN_TIMEOUT` | `600` s | attesa dello scambio del piano con il peer. Se la controparte non si presenta entro questo tempo, il comando fallisce |
+| `RUST_BACKUP_PLAN_TIMEOUT` | `600` s | attesa dello scambio del piano con il peer, su entrambi i lati: la sorgente attende al massimo questo tempo che la destinazione apra il flusso del piano, poi la sua decisione. Se la controparte non si presenta entro questo tempo, il comando fallisce con il motivo |
 | `RUST_BACKUP_VERIFY_TIMEOUT` | `86400` s | attesa, lato sorgente, della verifica per rilettura fatta dalla destinazione. È separato dal tempo di trasferimento perché la rilettura è una seconda lettura completa del backend |
 
 Su dataset molto grandi il valore da alzare è quasi sempre il secondo.
