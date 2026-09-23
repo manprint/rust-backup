@@ -830,8 +830,15 @@ fn severity_rank(code: i32) -> usize {
 /// How often a running transfer logs its progress line (I-OBSERV).
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Periodic progress reporter (phase-agnostic: it renders whatever counters the
-/// session has published). Aborted with its guard when the run ends, so a
+/// How often the reporter looks at the stage between two lines, so "N in this
+/// stage" is measured from the stage change rather than from the next line.
+const STAGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Periodic progress reporter. Each line names the stage the run is in (see
+/// `rb_core::progress::Stage`), its own counters, how long that stage has run,
+/// and the rate over the last interval rather than since the start — an
+/// average keeps falling through minutes of index builds and read-back, which
+/// reads as a stalled transfer. Aborted with its guard when the run ends, so a
 /// finished run never keeps logging.
 struct ProgressReporter {
     task: tokio::task::JoinHandle<()>,
@@ -840,31 +847,84 @@ struct ProgressReporter {
     started: std::time::Instant,
 }
 
+/// What the ticker remembers between two lines.
+struct TickState {
+    stage: rb_core::progress::Stage,
+    stage_started: std::time::Instant,
+    bytes: u64,
+    at: std::time::Instant,
+}
+
+impl TickState {
+    fn new(snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) -> Self {
+        TickState {
+            stage: snapshot.stage,
+            stage_started: now,
+            bytes: snapshot.moving_bytes(),
+            at: now,
+        }
+    }
+
+    /// Notice a stage change as soon as it happens (between two lines).
+    fn observe(&mut self, snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) {
+        if snapshot.stage != self.stage {
+            use rb_core::progress::Stage;
+            // The verify stage counts its own bytes from zero; every other
+            // stage keeps advancing the payload counter.
+            if snapshot.stage == Stage::Verifying {
+                self.bytes = 0;
+            } else if self.stage == Stage::Verifying {
+                self.bytes = snapshot.moving_bytes();
+            }
+            self.stage = snapshot.stage;
+            self.stage_started = now;
+        }
+    }
+
+    /// Render `snapshot` against the previous line and remember it.
+    fn line(&mut self, snapshot: &rb_core::progress::Snapshot, now: std::time::Instant) -> String {
+        self.observe(snapshot, now);
+        let window = now.duration_since(self.at).as_secs_f64();
+        let moved = snapshot.moving_bytes().saturating_sub(self.bytes);
+        let rate = if window > 0.0 {
+            (moved as f64 / window) as u64
+        } else {
+            0
+        };
+        self.bytes = snapshot.moving_bytes();
+        self.at = now;
+        snapshot.render(rate, now.duration_since(self.stage_started).as_secs_f64())
+    }
+}
+
 impl ProgressReporter {
     fn spawn(progress: Progress, label: String) -> Self {
         let started = std::time::Instant::now();
         // Emit the initial snapshot synchronously. A very small transfer can
         // otherwise finish and drop the reporter before its spawned task is
         // first scheduled, leaving that target with no progress record.
-        tracing::info!(
-            target_label = %label,
-            "{}",
-            progress.line(started.elapsed().as_secs_f64())
-        );
+        let first = progress.snapshot();
+        let mut state = TickState::new(&first, started);
+        tracing::info!(target_label = %label, "{}", state.line(&first, started));
         let task_progress = progress.clone();
         let task_label = label.clone();
         let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval_at(
-                tokio::time::Instant::now() + PROGRESS_INTERVAL,
-                PROGRESS_INTERVAL,
+            let mut poll = tokio::time::interval_at(
+                tokio::time::Instant::now() + STAGE_POLL_INTERVAL,
+                STAGE_POLL_INTERVAL,
             );
+            let mut next_line = std::time::Instant::now() + PROGRESS_INTERVAL;
             loop {
-                tick.tick().await;
-                tracing::info!(
-                    target_label = %task_label,
-                    "{}",
-                    task_progress.line(started.elapsed().as_secs_f64())
-                );
+                poll.tick().await;
+                let now = std::time::Instant::now();
+                let snapshot = task_progress.snapshot();
+                if now < next_line {
+                    state.observe(&snapshot, now);
+                    continue;
+                }
+                next_line += PROGRESS_INTERVAL;
+                let line = state.line(&snapshot, now);
+                tracing::info!(target_label = %task_label, "{line}");
             }
         });
         ProgressReporter {
@@ -880,11 +940,21 @@ impl ProgressReporter {
         if succeeded {
             self.progress.complete();
         }
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let took = rb_core::progress::human_duration(elapsed);
+        let summary = self.progress.line(elapsed);
+        let line = if succeeded {
+            format!("done: {summary} average, {took} in total")
+        } else {
+            format!(
+                "failed during {}: {summary} average, {took} in total",
+                self.progress.stage().label()
+            )
+        };
         tracing::info!(
             target_label = %self.label,
             status = if succeeded { "verified" } else { "failed" },
-            "{}",
-            self.progress.line(self.started.elapsed().as_secs_f64())
+            "{line}"
         );
     }
 }

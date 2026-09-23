@@ -24,7 +24,7 @@ use crate::channel::{
 use crate::error::{BackupError, Phase, Result};
 use crate::module::{Destination, Source};
 use crate::plan::{BackupMode, BackupPlan, Preflight};
-use crate::progress::Progress;
+use crate::progress::{self, Progress, Stage};
 use crate::verification::{RestoreEvidence, VerificationReport};
 use crate::wire::{self, ControlFrame};
 
@@ -288,6 +288,14 @@ async fn verify_destination(
         bytes = evidence.total_bytes,
         "destination read-back verification started"
     );
+    if let Some(progress) = progress::current() {
+        progress.begin_work(
+            Stage::Verifying,
+            "reading the restored data back",
+            evidence.item_blake3.len() as u64,
+            evidence.total_bytes,
+        );
+    }
     tokio::time::timeout(destination_verify_timeout(), dest.verify(plan, evidence))
         .await
         .map_err(|_| {
@@ -330,6 +338,19 @@ pub async fn run_source_limited(
     progress: &Progress,
     max_rate: Option<u64>,
 ) -> Result<SourceOutcome> {
+    progress::scope(
+        progress.clone(),
+        run_source_scoped(source, channel, progress, max_rate),
+    )
+    .await
+}
+
+async fn run_source_scoped(
+    source: &dyn Source,
+    channel: &dyn DataChannel,
+    progress: &Progress,
+    max_rate: Option<u64>,
+) -> Result<SourceOutcome> {
     // 1. Immutability baseline (read-only). A hot backup has none: its source
     // is online and changes while it is read, so an audit would fail every
     // run. Consistency comes from the module's single snapshot instead.
@@ -341,6 +362,7 @@ pub async fn run_source_limited(
         );
         None
     } else {
+        progress.set_stage(Stage::Auditing);
         Some(source.fingerprint().await?)
     };
 
@@ -392,18 +414,21 @@ pub async fn run_source_limited(
             );
             Ok(outcome)
         }
-        Err(run_error) => match source.fingerprint().await {
-            Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
-                "source fingerprint changed during backup ({fp_before} -> {fp_after})"
-            ))),
-            Ok(_) => {
-                info!("source run failed; source verified unchanged");
-                Err(run_error)
+        Err(run_error) => {
+            progress.set_stage(Stage::Auditing);
+            match source.fingerprint().await {
+                Ok(fp_after) if fp_after != fp_before => Err(BackupError::SourceMutated(format!(
+                    "source fingerprint changed during backup ({fp_before} -> {fp_after})"
+                ))),
+                Ok(_) => {
+                    info!("source run failed; source verified unchanged");
+                    Err(run_error)
+                }
+                // The run already failed, so preserve its more useful primary
+                // error even if the best-effort failure-path audit also fails.
+                Err(_) => Err(run_error),
             }
-            // The run already failed, so preserve its more useful primary
-            // error even if the best-effort failure-path audit also fails.
-            Err(_) => Err(run_error),
-        },
+        }
     }
 }
 
@@ -432,6 +457,7 @@ async fn source_run(
     source_baseline: Option<&str>,
 ) -> Result<SourceOutcome> {
     // 2. Analyze and build the self-contained plan (read-only).
+    progress.set_stage(Stage::Analyzing);
     let plan = source.analyze().await?;
     // The plan's mode is what makes the destination ask its own operator for
     // consent, so a source that skips the audit must say so in the plan — and
@@ -466,6 +492,7 @@ async fn source_run(
     // recv_ack errors out (PlanRejected) without ever touching the source.
     let (peer_carriers, separate_data_streams) =
         exchange_timeout("destination PlanAck", channel::recv_ack(&mut stream)).await?;
+    progress.set_stage(Stage::Transferring);
     let agreed_carriers = channel.carriers().min(peer_carriers as usize).max(1);
     if agreed_carriers != channel.carriers() {
         info!(
@@ -539,6 +566,7 @@ async fn source_run(
         },
     )
     .await?;
+    progress.set_stage(Stage::AwaitingPeer);
     let completion = tokio::time::timeout(
         destination_verify_timeout(),
         wire::recv_frame::<_, ControlFrame>(&mut stream),
@@ -551,6 +579,9 @@ async fn source_run(
         )
     })??;
     let verification = validate_completion_ack(completion)?;
+    if source_baseline.is_some() {
+        progress.set_stage(Stage::Auditing);
+    }
     audit_source_before_ack(source, source_baseline, &mut stream).await?;
     send_completion_ack_ack(&mut stream).await?;
 
@@ -662,6 +693,7 @@ async fn source_stream_multi(
         let _ = abort_task.await;
         return Err(error);
     }
+    progress.set_stage(Stage::AwaitingPeer);
     // Borrow the handle rather than moving it: `timeout` drops its inner future
     // when the deadline elapses, and dropping a `JoinHandle` does *not* cancel
     // the task. Moving it here left the control-plane watcher — which owns the
@@ -687,6 +719,9 @@ async fn source_stream_multi(
     })?;
     let completion = completion?;
     let verification = validate_completion_ack(completion)?;
+    if audit.baseline.is_some() {
+        progress.set_stage(Stage::Auditing);
+    }
     audit_source_before_ack(audit.source, audit.baseline, &mut control_write).await?;
     send_completion_ack_ack_split(&mut control_read, &mut control_write).await?;
     Ok(SourceOutcome {
@@ -871,7 +906,11 @@ where
     // destination without an uncertified copy of the source, so the run is
     // wrapped here rather than at each of its return sites.
     let applied = AtomicBool::new(false);
-    let outcome = run_destination_applied(dest, channel, progress, accept, &applied).await;
+    let outcome = progress::scope(
+        progress.clone(),
+        run_destination_applied(dest, channel, progress, accept, &applied),
+    )
+    .await;
     if outcome.is_err() && applied.load(Ordering::Relaxed) {
         dest.abandon().await;
     }
@@ -907,6 +946,7 @@ where
     info!("\n{}", plan.render());
 
     // 2. Preflight (disk space, accessibility, version compat, privileges).
+    progress.set_stage(Stage::Preflight);
     let preflight = hot_backup_consent(dest.validate(&plan).await?, &plan, dest);
     for c in &preflight.checks {
         if c.passed {
@@ -937,6 +977,9 @@ where
         separate_data_streams,
     )
     .await?;
+    if approved {
+        progress.set_stage(Stage::Transferring);
+    }
     if !approved {
         // That frame is the only way the source learns *why* it is stopping:
         // with it, the source reports a plan rejection (exit 4); without it,

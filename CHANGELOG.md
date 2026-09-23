@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Progress lines name the stage and keep moving after the transfer
+
+- **Every progress line starts with the stage the run is in** — `connecting`,
+  `audit`, `analyze`, `preflight`, `transfer`, `finalize`, `verify`, `waiting` —
+  and ends with the time spent in it. A PostgreSQL restore of 1.03 GiB spent
+  1m45s building indexes and constraints and 20 s reading the data back while
+  its line stayed at `items 1462/1462  1.03 GiB/1.41 GiB  (73.2%)`, with a rate
+  that kept falling; the source side printed the same frozen line.
+- **The read-back is now progress:** `verify: … items 384/1462  170.45
+  MiB/1.03 GiB  (16.4%)` for every module, after a `comparing the restored
+  catalog with the plan` step on PostgreSQL. PostgreSQL's post-data work is
+  `finalize: building indexes and constraints, refreshing materialized views,
+  step 120/7800`. The source says `waiting: payload sent …` until the
+  destination's verdict, and `audit:` while fingerprinting.
+- **The rate is the last 5 seconds**, not the average since start; the byte
+  total is marked `~` while it is the plan's estimate and replaced by the
+  actual total when the transfer ends. The final line reads `done: …  average,
+  <duration> in total` or `failed during <stage>: …`.
+
 ## 0.0.13 — prerelease (2026-09-23)
 
 ### PostgreSQL: views that do not survive their own round-trip restore verified

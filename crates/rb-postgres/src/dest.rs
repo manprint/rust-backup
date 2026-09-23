@@ -19,6 +19,7 @@ use tokio_postgres::{Client, CopyInSink};
 use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{human_bytes, BackupPlan, Preflight};
+use rb_core::progress::Stage;
 
 use crate::ddl::{build_cluster_ddl, create_database, quote_ident, quote_qualified};
 use crate::model::PgPlanPayload;
@@ -370,11 +371,31 @@ async fn restore_databases(
     let metas = item_metas(plan)?;
     let table_rows = apply_data(&conns, &metas, src).await?;
 
-    // 4. Per-database post_data.
+    // 4. Per-database post_data. Index builds and constraint validation run
+    //    here, after the last byte arrived, and can take longer than the load
+    //    itself: they are the finalize stage of the run's progress.
+    let post_data_steps: usize = ddl.per_database.iter().map(|db| db.post_data.len()).sum();
+    let progress = rb_core::progress::current();
+    if let Some(progress) = &progress {
+        progress.begin_work(
+            Stage::Finalizing,
+            "building indexes and constraints, refreshing materialized views",
+            post_data_steps as u64,
+            0,
+        );
+    }
     for dbddl in &ddl.per_database {
         if let Some(conn) = conns.get(&dbddl.name) {
-            run_statements(&conn.client, &dbddl.post_data).await?;
+            for stmt in &dbddl.post_data {
+                run_statements(&conn.client, std::slice::from_ref(stmt)).await?;
+                if let Some(progress) = &progress {
+                    progress.work_step();
+                }
+            }
         }
+    }
+    if let Some(progress) = &progress {
+        progress.set_detail("counting the rows of refreshed materialized views");
     }
 
     // 5. A populated materialized view's rows are produced here, by the

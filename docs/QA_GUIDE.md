@@ -142,12 +142,18 @@ than the requested one.
 negotiated data plane carriers=4 separate_data_streams=true
 ```
 
-A progress line reports completed items, transferred bytes, percent and rate per
-source/destination label:
+A progress line, every 5 seconds per source/destination label, starts with the
+stage the run is in (`connecting`, `audit`, `analyze`, `preflight`, `transfer`,
+`finalize`, `verify`, `waiting`), reports that stage's own counters and rate over
+the last interval, and ends with the time spent in the stage:
 
 ```
-items 3/4  14.94 MiB/16.00 MiB  (93.4%)  1019.60 KiB/s  target_label=filesystem/Destination
+transfer: items 3/4  14.94 MiB/~16.00 MiB  (93.4%)  1019.60 KiB/s, 15s in this stage  target_label=filesystem/Destination
+verify: reading the restored data back, items 1/4  4.00 MiB/14.94 MiB  (26.8%)  3.10 MiB/s, 1s in this stage  target_label=filesystem/Destination
 ```
+
+`~` marks the plan's byte estimate, which is replaced by the actual total when
+the transfer ends. The last line is `done: …` or `failed during <stage>: …`.
 
 Exit `0` is not by itself the success criterion. It additionally requires both
 peer logs to end with `status="verified"` at `100.0%`, matching 64-character

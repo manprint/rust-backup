@@ -941,6 +941,12 @@ async fn both_sides_publish_progress_totals() {
     });
     s.await.unwrap().expect("source ok");
     d.await.unwrap().expect("dest ok");
+    // The read-back is progress too: the destination ends in the verify stage
+    // with its item and byte totals announced; the cold source ends auditing.
+    let verify = r2.snapshot();
+    assert_eq!(verify.stage, rb_core::progress::Stage::Verifying);
+    assert_eq!((verify.work_total, verify.work_bytes_total), (1, 2048));
+    assert_eq!(r1.stage(), rb_core::progress::Stage::Auditing);
     for (side, p) in [("source", r1), ("destination", r2)] {
         let line = p.line(1.0);
         assert!(line.contains("items 1/1"), "{side}: {line}");

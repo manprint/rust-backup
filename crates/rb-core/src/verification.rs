@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::channel::{completion_digest, ChunkSink};
 use crate::error::{BackupError, Phase, Result};
+use crate::progress::Progress;
 
 /// Source commitments already checked by the transport receiver. A destination
 /// module must independently reproduce these digests from its persisted state.
@@ -134,6 +135,9 @@ pub struct VerificationSink {
     verified: BTreeMap<u32, String>,
     bytes: u64,
     finished: bool,
+    /// The run's handle, when the sink is built inside a session: the read-back
+    /// reports its items and bytes as the verify stage's work.
+    progress: Option<Progress>,
 }
 
 impl VerificationSink {
@@ -144,6 +148,7 @@ impl VerificationSink {
             verified: BTreeMap::new(),
             bytes: 0,
             finished: false,
+            progress: crate::progress::current(),
         }
     }
 
@@ -199,6 +204,9 @@ impl ChunkSink for VerificationSink {
         hasher.update(data);
         *bytes += data.len() as u64;
         self.bytes += data.len() as u64;
+        if let Some(progress) = &self.progress {
+            progress.work_bytes(data.len() as u64);
+        }
         Ok(())
     }
 
@@ -224,6 +232,9 @@ impl ChunkSink for VerificationSink {
             )));
         }
         self.verified.insert(item_id, actual);
+        if let Some(progress) = &self.progress {
+            progress.work_step();
+        }
         Ok(())
     }
 
@@ -272,6 +283,28 @@ mod tests {
             payload_blake3: completion_digest(&item_blake3),
             item_blake3,
         }
+    }
+
+    /// Inside a session the read-back advances the verify stage: an operator
+    /// otherwise saw a transfer line frozen for the whole read-back.
+    #[tokio::test]
+    async fn readback_inside_a_session_reports_its_progress() {
+        let bytes = b"persisted bytes";
+        let progress = crate::progress::Progress::default();
+        progress.begin_work(crate::progress::Stage::Verifying, "", 1, bytes.len() as u64);
+        crate::progress::scope(progress.clone(), async {
+            let mut sink = VerificationSink::new(&evidence(bytes));
+            sink.send_chunk(7, 0, bytes).await.unwrap();
+            sink.finish_item(7, bytes.len() as u64, &crate::wire::blake3_hex(bytes))
+                .await
+                .unwrap();
+        })
+        .await;
+        let snapshot = progress.snapshot();
+        assert_eq!(
+            (snapshot.work_done, snapshot.work_bytes),
+            (1, bytes.len() as u64)
+        );
     }
 
     #[tokio::test]

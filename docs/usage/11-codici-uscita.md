@@ -26,13 +26,14 @@ quest'ordine: `6` → `5` → `3` → `4` → `7` → `2` → `1`.
 ## Come si riconosce un'esecuzione riuscita
 
 Non basta l'assenza di errori: devono comparire **entrambe** queste righe, con
-lo stesso BLAKE3, una per peer, e l'ultima riga di avanzamento deve dire
-`status="verified"` al `100.0%`.
+lo stesso BLAKE3, una per peer, e l'ultima riga di avanzamento deve iniziare con
+`done:` e dire `status="verified"` al `100.0%`. Un'esecuzione fallita chiude
+invece con `failed during <fase>:`, che nomina la fase in cui si è fermata.
 
 ```text
 BACKUP VERIFIED: source unchanged; destination read-back matches
 RESTORE VERIFIED: persisted destination matches source
-items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s  status="verified"
+done: items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s average, 11s in total  status="verified"
 ```
 
 Il programma non stampa mai quelle righe per una copia parziale. Una conferma di

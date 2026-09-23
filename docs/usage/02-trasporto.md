@@ -175,7 +175,7 @@ negotiated data plane carriers=1            carrier effettivi concordati
 destination read-back verification started  la destinazione sta rileggendo ciò che ha scritto
 BACKUP VERIFIED: source unchanged; destination read-back matches
 RESTORE VERIFIED: persisted destination matches source
-items 2/2  97.66 KiB/97.66 KiB  (100.0%)  status="verified"
+done: items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s average, 11s in total  status="verified"
 ```
 
 Le due righe `VERIFIED` riportano lo **stesso** BLAKE3 del payload completo: se i

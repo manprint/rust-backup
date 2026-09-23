@@ -283,7 +283,14 @@ impl Destination for PostgresDestination {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport> {
+        let progress = rb_core::progress::current();
+        if let Some(progress) = &progress {
+            progress.set_detail("comparing the restored catalog with the plan");
+        }
         let catalog = dest::verify_catalog(&self.params, plan).await?;
+        if let Some(progress) = &progress {
+            progress.set_detail("reading the restored tables back");
+        }
         let mut verifier = VerificationSink::new(evidence);
         // The read-back runs the source path against the destination, on its
         // own read-only pool — it can never reach the source host.

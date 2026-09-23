@@ -31,7 +31,7 @@ stesso BLAKE3, e l'exit code è `0`:
 ```text
 BACKUP VERIFIED: source unchanged; destination read-back matches   items=2 bytes=100005 blake3=64a7…
 RESTORE VERIFIED: persisted destination matches source             items=2 bytes=100005 blake3=64a7…
-items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s  status="verified"
+done: items 2/2  97.66 KiB/97.66 KiB  (100.0%)  8.86 KiB/s average, 11s in total  status="verified"
 ```
 
 ## Indice
@@ -135,6 +135,21 @@ filesystem: la root di destinazione deve essere assente o vuota).
 I log vanno su **stderr** (`stdout` resta libero per la stampa del piano di
 `plan`). `-v` porta il livello a `debug`, `-vv` a `trace`; `RUST_LOG` ha la
 precedenza su entrambi e accetta la sintassi dei filtri `tracing`
-(`RUST_LOG=rb_transport=debug,info`). Durante il trasferimento una riga di
-avanzamento (fase, elementi, byte, percentuale, velocità) viene emessa ogni
-5 secondi.
+(`RUST_LOG=rb_transport=debug,info`). Per tutta l'esecuzione, ogni 5 secondi,
+viene emessa una riga di avanzamento che inizia con la **fase** in corso e
+termina con da quanto tempo vi si trova (`… 1m45s in this stage`):
+
+| fase | lato | cosa riporta |
+|---|---|---|
+| `connecting:` | entrambi | attesa del peer e del piano |
+| `audit:` | sorgente | impronta per il controllo di immutabilità (prima e dopo la copia; mai con `--hot-backup`) |
+| `analyze:` | sorgente | lettura della sorgente e costruzione del piano |
+| `preflight:` | destinazione | controlli del piano sulla destinazione |
+| `transfer:` | entrambi | `items 42/1462  878.80 KiB/~1.41 GiB  (0.1%)  25.11 KiB/s`: il totale con `~` è la **stima** del piano (PostgreSQL la calcola dalle dimensioni su disco, spesso maggiori del flusso reale), la velocità è quella degli ultimi 5 secondi |
+| `finalize:` | destinazione | lavoro dopo i dati, per i moduli che lo hanno: su PostgreSQL indici, vincoli e `REFRESH` delle viste materializzate, `step 120/7800` |
+| `verify:` | destinazione | rilettura di quanto scritto: prima il confronto del catalogo, poi `items 384/1462  170.45 MiB/1.03 GiB  (16.4%)` sui byte effettivi |
+| `waiting:` | sorgente | payload inviato, la destinazione sta applicando e verificando |
+
+Alla fine della fase `transfer:` il totale stimato viene sostituito da quello
+reale. L'ultima riga dice `done:` (con la velocità media e la durata totale) o
+`failed during <fase>:`.
