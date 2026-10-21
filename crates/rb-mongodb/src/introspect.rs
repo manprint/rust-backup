@@ -26,15 +26,32 @@ pub(crate) const SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
 /// Connect and introspect the whole reachable cluster (read-only).
 pub async fn introspect_cluster(params: &MongoDbParams) -> Result<MongoPlanPayload> {
     let conn = ReadOnlyConnection::connect(params).await?;
-    let db_names = select_databases(&conn, params).await?;
+    introspect_with(&conn, params).await
+}
+
+/// Introspect the cluster over an existing source connection.
+pub(crate) async fn introspect_with(
+    conn: &ReadOnlyConnection,
+    params: &MongoDbParams,
+) -> Result<MongoPlanPayload> {
+    let db_names = select_databases(conn, params).await?;
 
     let mut databases = Vec::new();
+    let mut skipped = Vec::new();
     for name in db_names {
-        databases.push(introspect_database(&conn, &name, params).await?);
+        let found = introspect_collections(conn, &name, |_| true).await?;
+        skipped.extend(found.skipped);
+        let users = introspect_users(&conn.client.database(&name)).await;
+        databases.push(MongoDatabase {
+            name,
+            collections: found.collections,
+            users,
+        });
     }
+    refuse_skipped(&skipped, params.allow_skipped_namespaces)?;
 
     Ok(MongoPlanPayload {
-        server_version: conn.server_version,
+        server_version: conn.server_version.clone(),
         server_major: conn.server_major,
         databases,
     })
@@ -60,13 +77,24 @@ async fn select_databases(
         .collect())
 }
 
-/// Introspect one database: its collections (+ options + indexes + estimates)
-/// and (best-effort) its users.
-async fn introspect_database(
+/// The ordinary collections of one database, plus every namespace passed over
+/// because it is not one.
+pub(crate) struct Collections {
+    pub(crate) collections: Vec<MongoCollection>,
+    /// `db.name (Type)` of each view, time-series or other non-ordinary
+    /// namespace.
+    pub(crate) skipped: Vec<String>,
+}
+
+/// Introspect the collections of one database whose name `wanted` accepts:
+/// options, indexes and estimates. `system.*` collections are never included.
+/// The destination's read-back passes the planned names only, so an unrelated
+/// collection — or view — in the same database is neither read nor reported.
+pub(crate) async fn introspect_collections(
     conn: &ReadOnlyConnection,
     db_name: &str,
-    params: &MongoDbParams,
-) -> Result<MongoDatabase> {
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Collections> {
     let db = conn.client.database(db_name);
 
     let specs = db.list_collections().await.map_err(|e| {
@@ -76,11 +104,11 @@ async fn introspect_database(
     let mut collections = Vec::new();
     let mut skipped = Vec::new();
     for spec in specs {
+        if spec.name.starts_with("system.") || !wanted(&spec.name) {
+            continue;
+        }
         // Only ordinary collections carry restorable document data; views are
         // derived and time-series have a special on-disk shape (out of scope).
-        // Skipping them SILENTLY meant a cluster with views restored without
-        // them and still reported a verified 1:1 copy, so they are refused
-        // unless the operator opts in explicitly.
         if spec.collection_type != CollectionType::Collection {
             skipped.push(format!(
                 "{}.{} ({:?})",
@@ -88,36 +116,37 @@ async fn introspect_database(
             ));
             continue;
         }
-        if spec.name.starts_with("system.") {
-            continue;
-        }
         collections.push(introspect_collection(&db, db_name, &spec.name, &spec.options).await?);
     }
-    if !skipped.is_empty() && params.allow_skipped_namespaces {
+    Ok(Collections {
+        collections,
+        skipped,
+    })
+}
+
+/// Skipping a view or time-series collection SILENTLY meant a cluster holding
+/// one restored without it and still reported a verified 1:1 copy, so they are
+/// refused unless the operator opts in explicitly.
+fn refuse_skipped(skipped: &[String], allowed: bool) -> Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    if allowed {
         tracing::warn!(
             namespaces = %skipped.join(", "),
             "allow_skipped_namespaces is set: this backup is NOT a 1:1 copy"
         );
+        return Ok(());
     }
-    if !skipped.is_empty() && !params.allow_skipped_namespaces {
-        return Err(BackupError::phase(
-            Phase::Analyze,
-            format!(
-                "this build does not restore views or time-series collections, and will not \
-                 report a 1:1 copy without them: {}. Exclude those databases, or set \
-                 allow_skipped_namespaces=true to accept a partial copy.",
-                skipped.join(", ")
-            ),
-        ));
-    }
-
-    let users = introspect_users(&db).await;
-
-    Ok(MongoDatabase {
-        name: db_name.to_string(),
-        collections,
-        users,
-    })
+    Err(BackupError::phase(
+        Phase::Analyze,
+        format!(
+            "this build does not restore views or time-series collections, and will not \
+             report a 1:1 copy without them: {}. Exclude those databases, or set \
+             allow_skipped_namespaces=true to accept a partial copy.",
+            skipped.join(", ")
+        ),
+    ))
 }
 
 /// Introspect one collection's options, indexes, and size estimates.

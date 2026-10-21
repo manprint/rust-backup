@@ -324,7 +324,31 @@ for CASE in "${CASES[@]}"; do
     echo "FAIL: --overwrite did not recreate exact state"; FAIL=$((FAIL+1))
   fi
 
-  # 6) Least-privilege source with server-side evidence (T-IMMUT-MONGO-LP).
+  # 6) The destination database may hold a collection and a view the plan
+  # does not name. Preflight refuses only a collision, so the restore must leave
+  # both alone and verification must not count them against the copy.
+  mongo_eval "$DST" appdb '
+    db.unrelated.insertOne({ _id: "keep-me", note: "destination-only" });
+    db.createView("unrelated_view", "unrelated", []);
+  ' >/dev/null
+  unrelated_ok=0
+  if run_transfer "$SRC_PORT" "$DST_PORT" "mongojob-unrelated-${CASE_ID}" overwrite; then
+    kept="$(mongo_eval "$DST" appdb \
+      'print(db.unrelated.countDocuments({ _id: "keep-me" }) + "|" + db.getCollectionInfos({ name: "unrelated_view" }).length)')"
+    mongo_eval "$DST" appdb 'db.unrelated_view.drop(); db.unrelated.drop();' >/dev/null
+    if [[ $kept == "1|1" ]] && \
+       diff <(printf '%s\n' "$fp_before" | sed '/^$/d') <(cluster_digest "$DST" appdb | sed '/^$/d') >/tmp/rb-mongo-unrelated.diff; then
+      unrelated_ok=1
+    fi
+  fi
+  if (( unrelated_ok == 1 )); then
+    echo "PASS: unrelated destination collection and view survive a verified restore"; PASS=$((PASS+1))
+  else
+    echo "FAIL: restore beside unrelated destination namespaces (see /tmp/rb-mongo-dst.log, /tmp/rb-mongo-unrelated.diff)"
+    FAIL=$((FAIL+1))
+  fi
+
+  # 7) Least-privilege source with server-side evidence (T-IMMUT-MONGO-LP).
   # A second source container, seeded identically but with authentication on and
   # every command logged, is read by a user that holds only the privileges of
   # the documented recipe. Three things must hold together: the transfer

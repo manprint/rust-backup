@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::{BackupModule, Destination, Source, TargetParams};
-use rb_core::plan::{human_bytes, BackupPlan, PlanItem, Preflight};
+use rb_core::plan::{human_bytes, summarize, BackupPlan, PlanItem, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 use rb_core::wire::CHUNK_SIZE;
 
@@ -241,20 +241,6 @@ pub(crate) fn http_status<E>(
     error
         .raw_response()
         .map(|response| response.status().as_u16())
-}
-
-/// Render at most a few entries of a fault list plus the total, so a preflight
-/// line stays readable for a 200 000-object plan.
-fn summarize(entries: &[String]) -> String {
-    const SHOWN: usize = 5;
-    if entries.len() <= SHOWN {
-        return entries.join(", ");
-    }
-    format!(
-        "{}, and {} more",
-        entries[..SHOWN].join(", "),
-        entries.len() - SHOWN
-    )
 }
 
 /// Create the destination bucket, supplying the location constraint every AWS
@@ -1674,15 +1660,6 @@ mod tests {
         assert!(resolve(&with_endpoint(None)));
         assert!(resolve(&with_endpoint(Some(true))));
         assert!(!resolve(&with_endpoint(Some(false))));
-    }
-
-    /// Fault lists stay readable for a plan at the item cap.
-    #[test]
-    fn fault_summaries_are_bounded() {
-        let many: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
-        let rendered = summarize(&many);
-        assert!(rendered.contains("and 95 more"), "{rendered}");
-        assert_eq!(summarize(&many[..2]), "k0, k1");
     }
 
     #[test]

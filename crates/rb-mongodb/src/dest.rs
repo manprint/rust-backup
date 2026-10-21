@@ -18,9 +18,10 @@ use mongodb::IndexModel;
 
 use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
-use rb_core::plan::{human_bytes, BackupPlan, Preflight};
+use rb_core::plan::{human_bytes, summarize, BackupPlan, Preflight};
 
-use crate::model::MongoPlanPayload;
+use crate::connect::ReadOnlyConnection;
+use crate::model::{MongoCollection, MongoPlanPayload};
 use crate::source::ItemMeta;
 use crate::{MongoConnection, MongoDbParams};
 
@@ -55,6 +56,105 @@ pub fn check_namespace(database: &str, collection: &str) -> Result<()> {
     Ok(())
 }
 
+/// Map every collection item of `plan` to the namespace its documents restore
+/// into, or list every reason the items cannot be trusted.
+///
+/// `PlanItem::meta` is peer-controlled, exactly like the catalog, and it is what
+/// routes the data: a plan whose catalog is clean could otherwise point an
+/// item's documents at `admin.system.users`, or at a collection the destination
+/// already holds — past the namespace guard, past the existence check (both
+/// read the catalog only) and outside the set a failed run cleans up. So an
+/// item is accepted only when it names a namespace the catalog declares, each
+/// catalog collection is fed by exactly one item, and nothing else is in the
+/// plan.
+pub(crate) fn resolve_items(
+    plan: &BackupPlan,
+    payload: &MongoPlanPayload,
+) -> std::result::Result<HashMap<u32, ItemMeta>, Vec<String>> {
+    let mut faults = Vec::new();
+    let mut catalog: HashMap<ItemMeta, Option<u32>> = HashMap::new();
+    for db in &payload.databases {
+        for coll in &db.collections {
+            let namespace = ItemMeta {
+                database: db.name.clone(),
+                collection: coll.name.clone(),
+            };
+            if catalog.insert(namespace, None).is_some() {
+                faults.push(format!("the catalog lists {}.{} twice", db.name, coll.name));
+            }
+        }
+    }
+
+    let mut targets = HashMap::new();
+    for item in &plan.items {
+        if item.kind != "collection" {
+            faults.push(format!("item {} has unknown kind {:?}", item.id, item.kind));
+            continue;
+        }
+        let meta: ItemMeta = match serde_json::from_value(item.meta.clone()) {
+            Ok(meta) => meta,
+            Err(error) => {
+                faults.push(format!("item {} has unreadable meta: {error}", item.id));
+                continue;
+            }
+        };
+        if let Err(error) = check_namespace(&meta.database, &meta.collection) {
+            faults.push(format!("item {}: {error}", item.id));
+            continue;
+        }
+        let namespace = format!("{}.{}", meta.database, meta.collection);
+        match catalog.get_mut(&meta) {
+            None => faults.push(format!(
+                "item {} targets {namespace}, which the plan's catalog does not declare",
+                item.id
+            )),
+            Some(Some(first)) => faults.push(format!(
+                "items {first} and {} both target {namespace}",
+                item.id
+            )),
+            Some(owner) => {
+                *owner = Some(item.id);
+                if targets.insert(item.id, meta).is_some() {
+                    faults.push(format!("item id {} appears twice", item.id));
+                }
+            }
+        }
+    }
+    let mut unfed: Vec<String> = catalog
+        .iter()
+        .filter(|(_, owner)| owner.is_none())
+        .map(|(namespace, _)| {
+            format!(
+                "{}.{} has no plan item",
+                namespace.database, namespace.collection
+            )
+        })
+        .collect();
+    unfed.sort();
+    faults.extend(unfed);
+
+    if faults.is_empty() {
+        Ok(targets)
+    } else {
+        Err(faults)
+    }
+}
+
+/// [`resolve_items`] as a phase-tagged refusal, for the exchanges that act on
+/// the plan rather than merely report on it.
+pub(crate) fn require_items(
+    plan: &BackupPlan,
+    payload: &MongoPlanPayload,
+    phase: Phase,
+) -> Result<HashMap<u32, ItemMeta>> {
+    resolve_items(plan, payload).map_err(|faults| {
+        BackupError::phase(
+            phase,
+            format!("refusing the plan's items: {}", summarize(&faults)),
+        )
+    })
+}
+
 /// Facts gathered from the destination needed to assess the plan.
 #[derive(Debug, Clone, Default)]
 pub struct DestProbe {
@@ -69,20 +169,15 @@ pub async fn validate(params: &MongoDbParams, plan: &BackupPlan) -> Result<Prefl
     let payload: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Validate, format!("bad plan payload: {e}")))?;
     let probe = probe_dest(params, &payload).await?;
-    Ok(assess(
-        &payload,
-        &probe,
-        params.overwrite,
-        plan.estimated_bytes,
-    ))
+    Ok(assess(plan, &payload, &probe, params.overwrite))
 }
 
 /// Pure assessment: fold the probe + plan into a [`Preflight`].
 pub fn assess(
+    plan: &BackupPlan,
     payload: &MongoPlanPayload,
     probe: &DestProbe,
     overwrite: bool,
-    estimated_bytes: u64,
 ) -> Preflight {
     let mut pf = Preflight::pass();
 
@@ -117,6 +212,17 @@ pub fn assess(
         },
     );
 
+    let item_faults = resolve_items(plan, payload).err().unwrap_or_default();
+    pf = pf.check(
+        "plan_items",
+        item_faults.is_empty(),
+        if item_faults.is_empty() {
+            "every plan item restores into exactly one namespace the catalog declares".to_string()
+        } else {
+            summarize(&item_faults)
+        },
+    );
+
     for db in &payload.databases {
         for coll in &db.collections {
             let key = format!("{}.{}", db.name, coll.name);
@@ -139,7 +245,7 @@ pub fn assess(
         true,
         format!(
             "≈ {} to restore; destination free space is not verifiable remotely",
-            human_bytes(estimated_bytes)
+            human_bytes(plan.estimated_bytes)
         ),
     );
 
@@ -178,6 +284,9 @@ pub async fn stream_in(
 ) -> Result<()> {
     let payload: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
+    // Re-checked here, before the first write: preflight and apply are two
+    // separate exchanges, and only this one acts on the items.
+    let targets = require_items(plan, &payload, Phase::Validate)?;
     let conn = MongoConnection::connect(params).await?;
 
     // `--overwrite` destroys every target namespace first, as one pass, before
@@ -196,7 +305,7 @@ pub async fn stream_in(
     // later failure removes exactly what this run brought into existence and
     // never a collection it found already there.
     let preexisting = existing_target_namespaces(&conn, &payload).await?;
-    let outcome = restore_namespaces(params, &conn, &payload, plan, src).await;
+    let outcome = restore_namespaces(params, &conn, &payload, &targets, src).await;
     if let Err(error) = outcome {
         remove_partially_restored(&conn, &payload, &preexisting).await;
         return Err(error);
@@ -210,7 +319,7 @@ async fn restore_namespaces(
     params: &MongoDbParams,
     conn: &MongoConnection,
     payload: &MongoPlanPayload,
-    plan: &BackupPlan,
+    targets: &HashMap<u32, ItemMeta>,
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
     // 1. Create every collection (with its options), dropping first on overwrite.
@@ -225,8 +334,7 @@ async fn restore_namespaces(
     }
 
     // 2. Bulk data: one linear pass over the chunk stream, routed by item id.
-    let metas = item_metas(plan);
-    apply_data(conn, &metas, src).await?;
+    apply_data(conn, targets, src).await?;
 
     // 3. Indexes (after data load, so building is cheaper).
     for db in &payload.databases {
@@ -345,18 +453,35 @@ async fn remove_partially_restored(
     }
 }
 
-/// Re-introspect each restored database and compare collection options and
-/// indexes with the source plan. Users and volatile size/count estimates are
-/// intentionally outside the restorable contract.
+/// Re-read the catalog of every restored collection and compare its options
+/// and indexes with the source plan. Only the planned collections are read: the
+/// destination database may legitimately hold others (preflight only refuses a
+/// collision), and a view among them must not fail the run either. Users and
+/// volatile size/count estimates are outside the restorable contract.
 pub async fn verify_catalog(params: &MongoDbParams, plan: &BackupPlan) -> Result<()> {
-    let mut expected: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
+    let expected: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
-    normalize_catalog(&mut expected);
+    // The read-back that follows routes by the same item meta.
+    require_items(plan, &expected, Phase::Verify)?;
 
+    let conn = ReadOnlyConnection::connect(params).await.map_err(|error| {
+        BackupError::phase_src(
+            Phase::Verify,
+            "reconnect to read the restored catalog",
+            error,
+        )
+    })?;
+    let mut faults = Vec::new();
     for expected_db in &expected.databases {
-        let mut scoped = params.clone();
-        scoped.database = Some(expected_db.name.clone());
-        let mut actual = crate::introspect::introspect_cluster(&scoped)
+        let planned: HashSet<&str> = expected_db
+            .collections
+            .iter()
+            .map(|coll| coll.name.as_str())
+            .collect();
+        let restored =
+            crate::introspect::introspect_collections(&conn, &expected_db.name, |name| {
+                planned.contains(name)
+            })
             .await
             .map_err(|error| {
                 BackupError::phase_src(
@@ -365,45 +490,84 @@ pub async fn verify_catalog(params: &MongoDbParams, plan: &BackupPlan) -> Result
                     error,
                 )
             })?;
-        normalize_catalog(&mut actual);
-        let actual_db = actual.databases.into_iter().next().ok_or_else(|| {
-            BackupError::phase(
-                Phase::Verify,
-                format!(
-                    "restored MongoDB database {:?} is missing",
-                    expected_db.name
-                ),
-            )
-        })?;
-        if &actual_db != expected_db {
-            return Err(BackupError::phase(
-                Phase::Verify,
-                format!(
-                    "MongoDB catalog mismatch for database {:?}",
-                    expected_db.name
-                ),
-            ));
-        }
+        faults.extend(catalog_faults(
+            &expected_db.name,
+            &expected_db.collections,
+            restored,
+        ));
+    }
+    if !faults.is_empty() {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!("MongoDB catalog mismatch: {}", summarize(&faults)),
+        ));
     }
     Ok(())
 }
 
-fn normalize_catalog(payload: &mut MongoPlanPayload) {
-    payload.server_version.clear();
-    payload.server_major = 0;
-    payload.databases.sort_by(|a, b| a.name.cmp(&b.name));
-    for database in &mut payload.databases {
-        // Credentials are not available from a logical backup and are not
-        // restored; this limitation is already enforced/documented separately.
-        database.users.clear();
-        database.collections.sort_by(|a, b| a.name.cmp(&b.name));
-        for collection in &mut database.collections {
-            collection.estimated_docs = 0;
-            collection.estimated_bytes = 0;
-            collection
-                .indexes
-                .sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+/// What differs between the planned collections of one database and what the
+/// destination now holds under those names.
+fn catalog_faults(
+    database: &str,
+    expected: &[MongoCollection],
+    restored: crate::introspect::Collections,
+) -> Vec<String> {
+    let mut faults: Vec<String> = restored
+        .skipped
+        .iter()
+        .map(|namespace| format!("{namespace} is not an ordinary collection"))
+        .collect();
+    let mut restored: HashMap<String, MongoCollection> = restored
+        .collections
+        .into_iter()
+        .map(|coll| (coll.name.clone(), coll))
+        .collect();
+    for want in expected {
+        let namespace = format!("{database}.{}", want.name);
+        let Some(got) = restored.remove(&want.name) else {
+            let not_ordinary = format!("{namespace} (");
+            if !faults.iter().any(|fault| fault.starts_with(&not_ordinary)) {
+                faults.push(format!("{namespace} is missing"));
+            }
+            continue;
+        };
+        if got.options != want.options {
+            faults.push(format!("{namespace} has different collection options"));
         }
+        let (want_indexes, got_indexes) = (index_specs(&want.indexes), index_specs(&got.indexes));
+        if want_indexes != got_indexes {
+            faults.push(format!(
+                "{namespace} has different indexes (planned: {}; restored: {})",
+                index_names(&want.indexes),
+                index_names(&got.indexes)
+            ));
+        }
+    }
+    faults
+}
+
+/// Index specs in a canonical order, so the comparison does not depend on the
+/// order the server lists them in.
+fn index_specs(indexes: &[serde_json::Value]) -> Vec<String> {
+    let mut specs: Vec<String> = indexes.iter().map(|spec| spec.to_string()).collect();
+    specs.sort();
+    specs
+}
+
+fn index_names(indexes: &[serde_json::Value]) -> String {
+    let mut names: Vec<&str> = indexes
+        .iter()
+        .map(|spec| {
+            spec.get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or("?")
+        })
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -471,19 +635,6 @@ async fn build_indexes(db: &mongodb::Database, coll: &crate::model::MongoCollect
         })?;
     }
     Ok(())
-}
-
-/// Map `item.id` → its descriptor (collection-kind items only).
-fn item_metas(plan: &BackupPlan) -> HashMap<u32, ItemMeta> {
-    plan.items
-        .iter()
-        .filter(|i| i.kind == "collection")
-        .filter_map(|i| {
-            serde_json::from_value::<ItemMeta>(i.meta.clone())
-                .ok()
-                .map(|m| (i.id, m))
-        })
-        .collect()
 }
 
 /// Drain the chunk stream, reassemble documents, and `insert_many` them in
@@ -700,7 +851,7 @@ mod tests {
     #[test]
     fn passes_on_clean_destination() {
         let payload = crate::model::test_fixture(); // source major 6, appdb.accounts
-        let pf = assess(&payload, &probe(6, &[]), false, 1024);
+        let pf = assess(&plan_for(&payload), &payload, &probe(6, &[]), false);
         assert!(
             pf.ok,
             "clean equal-version destination should pass: {:?}",
@@ -715,7 +866,7 @@ mod tests {
     #[test]
     fn fails_when_destination_older() {
         let payload = crate::model::test_fixture();
-        let pf = assess(&payload, &probe(5, &[]), false, 0);
+        let pf = assess(&plan_for(&payload), &payload, &probe(5, &[]), false);
         assert!(!pf.ok);
         assert!(pf
             .checks
@@ -728,7 +879,8 @@ mod tests {
         let payload = crate::model::test_fixture();
         let p = probe(6, &["appdb.accounts"]);
 
-        let blocked = assess(&payload, &p, false, 0);
+        let plan = plan_for(&payload);
+        let blocked = assess(&plan, &payload, &p, false);
         assert!(
             !blocked.ok,
             "existing collection must block without overwrite"
@@ -738,22 +890,177 @@ mod tests {
             .iter()
             .any(|c| c.name == "collection:appdb.accounts" && !c.passed));
 
-        let allowed = assess(&payload, &p, true, 0);
+        let allowed = assess(&plan, &payload, &p, true);
         assert!(
             allowed.ok,
             "overwrite must allow restoring over existing collection"
         );
     }
 
+    fn plan_for(payload: &MongoPlanPayload) -> BackupPlan {
+        crate::introspect::build_plan(payload, "t".to_string())
+    }
+
+    fn two_collection_payload() -> MongoPlanPayload {
+        let mut payload = crate::model::test_fixture();
+        let mut orders = payload.databases[0].collections[0].clone();
+        orders.name = "orders".to_string();
+        payload.databases[0].collections.push(orders);
+        payload
+    }
+
+    fn faults_of(plan: &BackupPlan, payload: &MongoPlanPayload) -> Vec<String> {
+        resolve_items(plan, payload).expect_err("the plan's items must be refused")
+    }
+
     #[test]
-    fn item_metas_indexes_collection_items_by_id() {
-        let payload = crate::model::test_fixture();
-        let bp = crate::introspect::build_plan(&payload, "t".to_string());
-        let metas = item_metas(&bp);
-        assert_eq!(metas.len(), 1);
-        let m = metas.get(&0).expect("item 0");
-        assert_eq!(m.database, "appdb");
-        assert_eq!(m.collection, "accounts");
+    fn resolve_items_maps_each_item_to_its_catalog_namespace() {
+        let payload = two_collection_payload();
+        let targets = resolve_items(&plan_for(&payload), &payload).expect("a source-built plan");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[&0].database, "appdb");
+        assert_eq!(targets[&0].collection, "accounts");
+        assert_eq!(targets[&1].collection, "orders");
+    }
+
+    /// The item meta routes the documents, and it is as peer-controlled as the
+    /// catalog. A clean catalog must not let an item write into a system
+    /// namespace, into a collection the catalog never declared (one the
+    /// existence check and the cleanup set never saw), or into a namespace
+    /// another item already feeds.
+    #[test]
+    fn hostile_item_meta_is_refused_before_any_write() {
+        let payload = two_collection_payload();
+
+        let mut system = plan_for(&payload);
+        system.items[0].meta =
+            serde_json::json!({"database": "admin", "collection": "system.users"});
+        let faults = faults_of(&system, &payload);
+        assert!(
+            faults
+                .iter()
+                .any(|f| f.contains("refusing system or invalid namespace")),
+            "{faults:?}"
+        );
+
+        let mut undeclared = plan_for(&payload);
+        undeclared.items[0].meta =
+            serde_json::json!({"database": "appdb", "collection": "payroll"});
+        let faults = faults_of(&undeclared, &payload);
+        assert!(
+            faults
+                .iter()
+                .any(|f| f.contains("appdb.payroll, which the plan's catalog does not declare")),
+            "{faults:?}"
+        );
+        assert!(
+            faults
+                .iter()
+                .any(|f| f == "appdb.accounts has no plan item"),
+            "{faults:?}"
+        );
+
+        let mut duplicate = plan_for(&payload);
+        duplicate.items[1].meta = duplicate.items[0].meta.clone();
+        let faults = faults_of(&duplicate, &payload);
+        assert!(
+            faults
+                .iter()
+                .any(|f| f == "items 0 and 1 both target appdb.accounts"),
+            "{faults:?}"
+        );
+
+        let mut unreadable = plan_for(&payload);
+        unreadable.items[0].meta = serde_json::Value::Null;
+        let faults = faults_of(&unreadable, &payload);
+        assert!(
+            faults.iter().any(|f| f.contains("unreadable meta")),
+            "{faults:?}"
+        );
+
+        let mut foreign = plan_for(&payload);
+        foreign.items[0].kind = "object".to_string();
+        let faults = faults_of(&foreign, &payload);
+        assert!(
+            faults.iter().any(|f| f.contains("unknown kind")),
+            "{faults:?}"
+        );
+
+        let mut twice = payload.clone();
+        let again = twice.databases[0].collections[0].clone();
+        twice.databases[0].collections.push(again);
+        let faults = faults_of(&plan_for(&twice), &twice);
+        assert!(
+            faults
+                .iter()
+                .any(|f| f == "the catalog lists appdb.accounts twice"),
+            "{faults:?}"
+        );
+
+        // Preflight reports it, and the apply-time re-check refuses it.
+        let pf = assess(&system, &payload, &probe(6, &[]), true);
+        assert!(!pf.ok);
+        assert!(pf
+            .checks
+            .iter()
+            .any(|c| c.name == "plan_items" && !c.passed));
+        let error = require_items(&system, &payload, Phase::Validate).expect_err("refused");
+        assert!(
+            format!("{error}").contains("refusing the plan's items"),
+            "{error}"
+        );
+    }
+
+    fn collections(list: Vec<MongoCollection>, skipped: &[&str]) -> crate::introspect::Collections {
+        crate::introspect::Collections {
+            collections: list,
+            skipped: skipped.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_restored_catalog_that_matches_the_plan_has_no_faults() {
+        let payload = two_collection_payload();
+        let planned = &payload.databases[0].collections;
+        let mut restored = planned.clone();
+        restored.reverse();
+        for coll in &mut restored {
+            // Volatile estimates never matter.
+            coll.estimated_docs = 0;
+            coll.estimated_bytes = 0;
+        }
+        assert!(catalog_faults("appdb", planned, collections(restored, &[])).is_empty());
+    }
+
+    #[test]
+    fn catalog_faults_name_the_collection_and_what_differs() {
+        let payload = two_collection_payload();
+        let planned = &payload.databases[0].collections;
+
+        let missing = catalog_faults("appdb", planned, collections(vec![planned[0].clone()], &[]));
+        assert_eq!(missing, vec!["appdb.orders is missing".to_string()]);
+
+        let mut changed = planned.clone();
+        changed[0].options = Some(serde_json::json!({"capped": true, "size": 4096}));
+        changed[1].indexes.clear();
+        let faults = catalog_faults("appdb", planned, collections(changed, &[]));
+        assert_eq!(faults.len(), 2, "{faults:?}");
+        assert_eq!(faults[0], "appdb.accounts has different collection options");
+        assert_eq!(
+            faults[1],
+            "appdb.orders has different indexes (planned: email_1; restored: none)"
+        );
+
+        let view = catalog_faults(
+            "appdb",
+            planned,
+            collections(vec![planned[0].clone()], &["appdb.orders (View)"]),
+        );
+        assert_eq!(
+            view,
+            vec!["appdb.orders (View) is not an ordinary collection".to_string()],
+            "a planned name that came back as a view is reported once, as what it is"
+        );
     }
 
     #[test]

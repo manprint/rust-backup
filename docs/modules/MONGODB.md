@@ -12,8 +12,12 @@ bounded batches, then creates indexes.
 
 ## Completion proof
 
-After apply, the destination re-lists collections, options and indexes and
-compares the restorable catalog with the source plan. It then reads every BSON
+After apply, the destination re-lists the options and indexes of every planned
+collection and compares them with the source plan; a mismatch names each
+collection and what differs (missing, options, indexes). Only the planned
+collections are read: the destination database may hold others — preflight
+refuses only a collision — and they, views included, are neither touched nor
+counted against the copy. It then reads every BSON
 document in deterministic `_id` order and reproduces every item and payload
 BLAKE3 commitment. The source also fingerprints all documents before and after
 the run. Empty collections, nested documents, arrays, nulls, compound/partial
@@ -45,6 +49,15 @@ preflight and again immediately before each `createCollection`, so the check
 cannot be bypassed through a validate/apply race. Without this a plan naming
 `admin.system.users` would, under `--overwrite`, drop every account on the
 destination cluster.
+
+The catalog is not the only peer-controlled routing: each plan item's `meta`
+names the namespace its documents go to. Preflight's `plan_items` check accepts
+the items only when every one names a namespace the catalog declares, each
+catalog collection is fed by exactly one item, and the plan holds nothing else;
+apply and verify re-check it before acting. Otherwise a clean catalog could
+still route documents into `admin.system.users`, or into a collection the
+destination already holds without `--overwrite` — past the existence check and
+outside the set a failed run cleans up.
 
 Streamed BSON is self-delimiting by a 4-byte length prefix. A prefix below the
 minimum document size, a negative one, or one past MongoDB's own 16 MiB document

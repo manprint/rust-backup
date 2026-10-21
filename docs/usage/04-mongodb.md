@@ -57,6 +57,10 @@ Database, opzioni delle collection, indici e documenti BSON. Il dettaglio
 dell'ordine di ripristino e delle garanzie è in
 [docs/modules/MONGODB.md](../modules/MONGODB.md).
 
+Il database di destinazione può già contenere altre collection, viste comprese:
+non vengono toccate né contate nella verifica. Solo una collection con lo stesso
+nome di una del piano richiede `--overwrite`.
+
 **Utenti e ruoli non vengono ricreati**: `usersInfo` non espone le credenziali,
 quindi ricrearli produrrebbe utenti senza password. Vanno gestiti a parte.
 

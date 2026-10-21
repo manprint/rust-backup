@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Security
+
+- **Fixed: a MongoDB plan item could write into any destination namespace.**
+  The destination routed each item's documents by its `meta`
+  (`database`/`collection`), but only the plan's catalog went through the
+  namespace guard, the existence check and the cleanup set. A peer could send a
+  clean catalog and point an item at `admin.system.users`, or at a collection
+  the destination already held, without `--overwrite`. Preflight now fails a
+  `plan_items` check unless every item names a namespace the catalog declares,
+  each catalog collection is fed by exactly one item, and nothing else is in the
+  plan; apply and verify re-check it before acting. Source-built plans of every
+  version satisfy it.
+
+### MongoDB
+
+- **Fixed: a restore into a database holding other collections failed
+  verification.** Preflight refuses only a collision, but the read-back
+  compared the whole destination database with the plan — an unrelated
+  collection counted as a mismatch, and an unrelated view failed the
+  re-introspection outright. Only the planned collections are read back now,
+  and a mismatch names each collection and what differs (missing, options,
+  indexes) instead of `catalog mismatch for database …`.
+
 ### S3
 
 - **Fixed: an S3 plan of ~150 000 objects failed in the handshake.** Every plan

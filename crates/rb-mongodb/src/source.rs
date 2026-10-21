@@ -24,8 +24,10 @@ use crate::connect::{sort_by_id, ReadOnlyConnection};
 use crate::MongoDbParams;
 
 /// The per-item descriptor carried in `PlanItem::meta` (set by `build_plan`,
-/// consumed by both source `stream_out` and destination `stream_in`).
-#[derive(Debug, Deserialize)]
+/// consumed by both source `stream_out` and destination `stream_in`). On the
+/// destination it is peer-controlled: `dest::resolve_items` admits it only when
+/// it names a namespace the plan's catalog declares.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 pub(crate) struct ItemMeta {
     pub(crate) database: String,
     pub(crate) collection: String,

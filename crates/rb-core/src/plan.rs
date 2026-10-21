@@ -182,6 +182,20 @@ impl Preflight {
     }
 }
 
+/// Render at most a few entries of a fault list plus the total, so a preflight
+/// or verification line stays readable for a plan at the item ceiling.
+pub fn summarize(entries: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if entries.len() <= SHOWN {
+        return entries.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        entries[..SHOWN].join(", "),
+        entries.len() - SHOWN
+    )
+}
+
 /// Format a byte count compactly (KiB/MiB/GiB).
 pub fn human_bytes(n: u64) -> String {
     const U: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
@@ -195,5 +209,20 @@ pub fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{f:.2} {}", U[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fault lists stay readable for a plan at the item ceiling.
+    #[test]
+    fn fault_summaries_are_bounded() {
+        let many: Vec<String> = (0..100).map(|i| format!("k{i}")).collect();
+        let rendered = summarize(&many);
+        assert!(rendered.contains("and 95 more"), "{rendered}");
+        assert_eq!(summarize(&many[..2]), "k0, k1");
+        assert_eq!(summarize(&[]), "");
     }
 }
