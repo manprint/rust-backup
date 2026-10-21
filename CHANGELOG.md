@@ -46,6 +46,11 @@
   scan, and each audit opens one connection instead of two.
 - The source sends one reused 1 MiB buffer per item instead of allocating a
   chunk per send.
+- `--overwrite` no longer drops each collection a second time right before
+  creating it: the first pass already dropped them all, and the second could
+  only destroy a namespace created since, which the cleanup would then remove
+  as if the run had made it. Such a namespace now fails with `NamespaceExists`.
+- `MongoDbParams` no longer prints the password or the URI in debug output.
 
 ### S3
 

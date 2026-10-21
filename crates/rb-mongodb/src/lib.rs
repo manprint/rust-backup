@@ -32,7 +32,7 @@ use rb_core::plan::{BackupPlan, Preflight};
 use rb_core::verification::{RestoreEvidence, VerificationReport, VerificationSink};
 
 /// MongoDB connection parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MongoDbParams {
     /// Full connection URI (e.g. `mongodb://host:27017/db`). When set, the
     /// discrete host/port/credential fields are ignored.
@@ -81,6 +81,25 @@ fn default_mongo_host() -> String {
 
 fn default_mongo_port() -> u16 {
     27017
+}
+
+/// Hand-written so a debug print never carries a credential: the password, and
+/// the whole URI, which may hold one in its userinfo or in an option such as
+/// `tlsCertificateKeyFilePassword`.
+impl std::fmt::Debug for MongoDbParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongoDbParams")
+            .field("uri", &self.uri.as_ref().map(|_| "[REDACTED]"))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("database", &self.database)
+            .field("allow_skipped_namespaces", &self.allow_skipped_namespaces)
+            .field("auth_db", &self.auth_db)
+            .field("overwrite", &self.overwrite)
+            .finish()
+    }
 }
 
 impl MongoDbParams {
@@ -214,6 +233,32 @@ mod tests {
         assert_eq!(p.command_db(), "appdb");
         p.database = None;
         assert_eq!(p.command_db(), "admin");
+    }
+
+    #[test]
+    fn debug_output_redacts_credentials() {
+        let params = MongoDbParams {
+            uri: Some("mongodb://admin:hunter2@h:27017/?tlsCertificateKeyFilePassword=pw".into()),
+            host: "h".into(),
+            port: 27017,
+            user: Some("admin".into()),
+            password: Some("hunter2".into()),
+            database: None,
+            auth_db: None,
+            overwrite: false,
+            allow_skipped_namespaces: false,
+        };
+        let rendered = format!("{params:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(
+            !rendered.contains("tlsCertificateKeyFilePassword"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(
+            rendered.contains("\"admin\""),
+            "the user name is not a secret: {rendered}"
+        );
     }
 
     #[tokio::test]

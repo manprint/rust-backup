@@ -316,7 +316,7 @@ pub async fn stream_in(
     // later failure removes exactly what this run brought into existence and
     // never a collection it found already there.
     let preexisting = existing_target_namespaces(&conn, &payload).await?;
-    let outcome = restore_namespaces(params, &conn, &payload, &targets, src).await;
+    let outcome = restore_namespaces(&conn, &payload, &targets, src).await;
     if let Err(error) = outcome {
         remove_partially_restored(&conn, &payload, &preexisting).await;
         return Err(error);
@@ -327,20 +327,22 @@ pub async fn stream_in(
 /// The restore proper. Split out of [`stream_in`] so every `?` funnels through
 /// one error path that can undo what the run created.
 async fn restore_namespaces(
-    params: &MongoDbParams,
     conn: &MongoConnection,
     payload: &MongoPlanPayload,
     targets: &HashMap<u32, ItemMeta>,
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
-    // 1. Create every collection (with its options), dropping first on overwrite.
-    //    The namespace guard is re-applied here: preflight and apply are two
-    //    separate exchanges, and only this one destroys anything.
+    // 1. Create every collection (with its options). `--overwrite` already
+    //    dropped them all, before the pre-existing snapshot; dropping again
+    //    here could only destroy a namespace somebody created since, which the
+    //    cleanup would then remove as if this run had made it. The namespace
+    //    guard is re-applied: preflight and apply are two separate exchanges,
+    //    and only this one creates anything.
     for db in &payload.databases {
         let database = conn.client.database(&db.name);
         for coll in &db.collections {
             check_namespace(&db.name, &coll.name)?;
-            create_collection(&database, coll, params.overwrite).await?;
+            create_collection(&database, coll).await?;
         }
     }
 
@@ -582,28 +584,9 @@ fn index_names(indexes: &[serde_json::Value]) -> String {
     }
 }
 
-/// Create one collection via the `create` command, merging its captured options.
-/// On `overwrite`, drop any existing collection first (best-effort).
-async fn create_collection(
-    db: &mongodb::Database,
-    coll: &crate::model::MongoCollection,
-    overwrite: bool,
-) -> Result<()> {
-    if overwrite {
-        // A NamespaceNotFound on a fresh destination is fine; anything else is
-        // a real failure that would otherwise resurface as an opaque
-        // NamespaceExists from the `create` below.
-        if let Err(error) = db.collection::<Document>(&coll.name).drop().await {
-            if !is_namespace_not_found(&error) {
-                return Err(BackupError::phase_src(
-                    Phase::Apply,
-                    format!("drop existing collection {}", coll.name),
-                    error,
-                ));
-            }
-        }
-    }
-
+/// Create one collection via the `create` command, merging its captured
+/// options. A namespace that exists by now fails with `NamespaceExists`.
+async fn create_collection(db: &mongodb::Database, coll: &MongoCollection) -> Result<()> {
     let mut cmd = doc! { "create": &coll.name };
     if let Some(opts) = &coll.options {
         // `bson::to_document` SERIALIZES the JSON value, and bson's serializer
@@ -632,7 +615,7 @@ fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
 }
 
 /// Build the captured (non-`_id_`) indexes for one collection.
-async fn build_indexes(db: &mongodb::Database, coll: &crate::model::MongoCollection) -> Result<()> {
+async fn build_indexes(db: &mongodb::Database, coll: &MongoCollection) -> Result<()> {
     if coll.indexes.is_empty() {
         return Ok(());
     }
