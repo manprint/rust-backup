@@ -107,7 +107,7 @@ in una unit systemd o in un job di CI.
 
 | Variabile | Default | Significato |
 |-----------|---------|-------------|
-| `RUST_LOG` | `info` | filtro dei log in sintassi `tracing`, per esempio `rb_transport=debug,info`. Ha la precedenza su `-v` |
+| `RUST_LOG` | `info` | filtro dei log in sintassi `tracing`, per esempio `rb_transport=debug,info`. Senza, il livello (`info`, `debug` con `-v`, `trace` con `-vv`) vale per tutti i crate di rust-backup — moduli compresi — e le dipendenze restano silenziose. Ha la precedenza su `-v` |
 | `RUST_BACKUP_PLAN_TIMEOUT` | `600` (secondi) | attesa dello scambio del piano con il peer. `0` o testo non numerico ricadono sul default |
 | `RUST_BACKUP_VERIFY_TIMEOUT` | `86400` (secondi) | attesa, lato sorgente, della verifica per rilettura della destinazione. Deliberatamente separata dal tempo di trasferimento: la rilettura è una seconda lettura completa |
 | `RUST_BACKUP_IO_IDLE_TIMEOUT` | `600` (secondi) | tempo massimo **senza un solo byte di avanzamento** su una singola lettura o scrittura del payload. Non è il tempo di trasferimento: la finestra di controllo di flusso resta piena per tutto il tempo in cui la destinazione applica quello che ha già ricevuto (una parte multipart S3, un lotto `insert_many`, un `COPY` in attesa di un lock), ed è esattamente ciò che la contropressione deve permettere. Serve solo a far fallire un peer bloccato davvero; la liveness del canale è già provata dall'heartbeat di controllo (20 s) e dal reaper del server di coordinamento (60 s). `0` o testo non numerico ricadono sul default |

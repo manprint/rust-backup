@@ -1114,14 +1114,38 @@ fn prompt_yes_rendered(rendered: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// The crates whose events reach the log by default: every crate of this
+/// workspace, dependencies left quiet unless `RUST_LOG` asks for them.
+///
+/// The module crates used to be missing, so every line a module logged —
+/// including its warnings and errors, such as an S3 multipart upload that
+/// could not be aborted and keeps billed parts behind — was filtered out
+/// before an operator could see it.
+const LOG_TARGETS: &[&str] = &[
+    "rust_backup",
+    "rb_core",
+    "rb_transport",
+    "rb_postgres",
+    "rb_mongodb",
+    "rb_filesystem",
+    "rb_s3",
+];
+
+fn default_log_filter(level: &str) -> String {
+    LOG_TARGETS
+        .iter()
+        .map(|target| format!("{target}={level}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn init_tracing(verbose: u8) {
     let level = match verbose {
         0 => "info",
         1 => "debug",
         _ => "trace",
     };
-    let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| format!("rust_backup={level},rb_core={level},rb_transport={level}"));
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default_log_filter(level));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -1937,5 +1961,23 @@ targets:
             vec!["filesystem", "mongodb", "postgres", "s3"],
             "module registry names"
         );
+    }
+
+    /// A module's own log lines (its warnings and errors included) must reach
+    /// the operator without `RUST_LOG`: every registered module's crate is in
+    /// the default filter.
+    #[test]
+    fn the_default_log_filter_covers_every_module_crate() {
+        let filter = default_log_filter("info");
+        for name in build_registry().names() {
+            assert!(
+                filter
+                    .split(',')
+                    .any(|directive| directive == format!("rb_{name}=info")),
+                "module {name} is missing from the default log filter {filter:?}"
+            );
+        }
+        assert!(filter.contains("rust_backup=info") && filter.contains("rb_core=info"));
+        tracing_subscriber::EnvFilter::try_new(&filter).expect("the default filter parses");
     }
 }

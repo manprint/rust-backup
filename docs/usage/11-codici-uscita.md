@@ -95,7 +95,8 @@ di righe che non torna lo fa diventare `5`. Il dettaglio delle righe è in
    rete.
 5. **Alzare la verbosità.**
    ```bash
-   RUST_LOG=rust_backup=debug,rb_core=debug,rb_transport=debug rust-backup …
+   rust-backup -v …    # debug per tutti i crate di rust-backup, moduli compresi
+   RUST_LOG=rb_s3=debug,info rust-backup …    # un solo crate più dettagliato
    ```
 6. **Isolare il trasporto.** Con `--no-udp` su entrambi i lati si esclude il
    percorso diretto QUIC; se il problema sparisce, è la rete UDP.
