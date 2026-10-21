@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — release (2026-10-21)
+
+A full review of every module, S3 and MongoDB first. It closes two ways a
+peer or a local user could make a restore write or read outside its scope, a
+PostgreSQL privilege-widening loss, an S3 plan ceiling far below the documented
+one and a MongoDB verify that failed correct restores; makes the S3, MongoDB and
+filesystem data paths markedly faster; and refreshes the toolchain and every
+dependency. Plans stay wire-compatible with 0.1.0 in both directions, but run
+**both peers on 0.1.1**: an older destination ignores the new PostgreSQL grant
+options and per-role database settings, and an older filesystem source keeps the
+symlink-following read.
 
 ### Security
 
