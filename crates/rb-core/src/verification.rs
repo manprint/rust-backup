@@ -241,20 +241,36 @@ impl ChunkSink for VerificationSink {
     async fn finish(&mut self) -> Result<()> {
         self.ensure_open()?;
         if !self.active.is_empty() {
-            let mut ids: Vec<_> = self.active.keys().copied().collect();
+            let mut ids: Vec<u32> = self.active.keys().copied().collect();
             ids.sort_unstable();
             return Err(BackupError::phase(
                 Phase::Verify,
-                format!("destination read-back left incomplete items={ids:?}"),
+                format!(
+                    "destination read-back left {} item(s) incomplete: {}",
+                    ids.len(),
+                    summarize_ids(&ids)
+                ),
             ));
         }
-        let expected_ids: Vec<_> = self.evidence.item_blake3.keys().copied().collect();
-        let actual_ids: Vec<_> = self.verified.keys().copied().collect();
-        if actual_ids != expected_ids {
+        // `verified` only ever holds ids the evidence lists (`finish_item`
+        // refuses any other), so the only possible difference is a missing one.
+        // The lists themselves are not printed: at the plan's item ceiling they
+        // were megabytes of error text, past what an `Abort` frame can carry.
+        let missing: Vec<u32> = self
+            .evidence
+            .item_blake3
+            .keys()
+            .filter(|id| !self.verified.contains_key(id))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
             return Err(BackupError::phase(
                 Phase::Verify,
                 format!(
-                    "destination read-back item mismatch: expected={expected_ids:?} actual={actual_ids:?}"
+                    "destination read-back is missing {} of {} item(s): {}",
+                    missing.len(),
+                    self.evidence.item_blake3.len(),
+                    summarize_ids(&missing)
                 ),
             ));
         }
@@ -270,6 +286,12 @@ impl ChunkSink for VerificationSink {
     }
 }
 
+/// A few item ids plus the count, for an error line that stays readable.
+fn summarize_ids(ids: &[u32]) -> String {
+    let rendered: Vec<String> = ids.iter().map(|id| format!("item={id}")).collect();
+    crate::plan::summarize(&rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +305,41 @@ mod tests {
             payload_blake3: completion_digest(&item_blake3),
             item_blake3,
         }
+    }
+
+    /// A read-back that comes up short names a few missing items and the
+    /// count, never the full id lists: at the item ceiling those were
+    /// megabytes, past what an `Abort` frame carries.
+    #[tokio::test]
+    async fn a_short_readback_names_the_missing_items_briefly() {
+        let present = b"present";
+        let item_blake3: BTreeMap<u32, String> = (0..1000)
+            .map(|id| (id, crate::wire::blake3_hex(present)))
+            .collect();
+        let evidence = RestoreEvidence {
+            total_bytes: 1000 * present.len() as u64,
+            payload_blake3: completion_digest(&item_blake3),
+            item_blake3,
+        };
+        let mut sink = VerificationSink::new(&evidence);
+        sink.send_chunk(0, 0, present).await.unwrap();
+        sink.finish_item(0, present.len() as u64, &crate::wire::blake3_hex(present))
+            .await
+            .unwrap();
+        let text = sink
+            .finish()
+            .await
+            .expect_err("999 items are missing")
+            .to_string();
+        assert!(text.contains("missing 999 of 1000 item(s)"), "{text}");
+        assert!(text.contains("item=1, item=2"), "{text}");
+        assert!(text.contains("and 994 more"), "{text}");
+        assert!(text.len() < 300, "{text}");
+
+        let mut open = VerificationSink::new(&evidence);
+        open.send_chunk(5, 0, present).await.unwrap();
+        let text = open.finish().await.expect_err("item 5 is open").to_string();
+        assert!(text.contains("1 item(s) incomplete: item=5"), "{text}");
     }
 
     /// Inside a session the read-back advances the verify stage: an operator

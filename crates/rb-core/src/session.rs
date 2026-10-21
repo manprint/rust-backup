@@ -39,6 +39,12 @@ const DEFAULT_PLAN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// a transport-level EOF.
 const DESTINATION_ABORT_GRACE: Duration = Duration::from_secs(1);
 const ABORT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for the best-effort `Abort` on the data carriers after a source
+/// failure. A carrier whose window a wedged destination stopped draining would
+/// otherwise hold the failure path for the whole payload idle timeout per
+/// carrier, before the control-plane `Abort` — the one that carries the reason
+/// reliably — was even sent.
+const DATA_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_DESTINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn plan_exchange_timeout() -> Duration {
@@ -430,8 +436,16 @@ async fn run_source_scoped(
                     Err(run_error)
                 }
                 // The run already failed, so preserve its more useful primary
-                // error even if the best-effort failure-path audit also fails.
-                Err(_) => Err(run_error),
+                // error even if the best-effort failure-path audit also fails —
+                // but say so: the run then ends without immutability evidence.
+                Err(audit_error) => {
+                    warn!(
+                        error = %audit_error,
+                        "source run failed and the failure-path immutability audit could not \
+                         run; the source is NOT verified unchanged"
+                    );
+                    Err(run_error)
+                }
             }
         }
     }
@@ -717,7 +731,8 @@ async fn source_stream_multi(
             let _ = wire::send_frame(&mut control_write, &ControlFrame::AbortAck).await;
             let _ = abort_task.await;
         } else {
-            data_sink.abort(&error.to_string()).await;
+            let _ =
+                tokio::time::timeout(DATA_ABORT_TIMEOUT, data_sink.abort(&error.to_string())).await;
             let _ = wire::send_frame(
                 &mut control_write,
                 &ControlFrame::Abort {

@@ -587,24 +587,52 @@ impl ChunkSource for MultiStreamChunkSource {
 
 // --- Plan-exchange handshake (carried on the control substream) -------------
 
+/// Borrowing twin of [`ControlFrame::Plan`] for the sending side. It encodes to
+/// exactly the same JSON (a test pins it), without cloning a plan that reaches
+/// ~100 MB for an S3 bucket at the item ceiling.
+#[derive(serde::Serialize)]
+enum OutgoingPlan<'a> {
+    Plan {
+        plan: &'a crate::plan::BackupPlan,
+        carriers: u32,
+        separate_data_streams: bool,
+        peer_progress: bool,
+    },
+}
+
 /// Source → Destination: send the plan.
 pub async fn send_plan<S: DuplexStream>(
     ctrl: &mut S,
     plan: &crate::plan::BackupPlan,
     carriers: usize,
 ) -> Result<()> {
-    wire::send_frame_bounded(
-        ctrl,
-        &ControlFrame::Plan {
-            plan: Box::new(plan.clone()),
-            carriers: carriers.clamp(1, u32::MAX as usize) as u32,
-            separate_data_streams: true,
-            peer_progress: true,
-        },
-        wire::PLAN_FRAME_LIMIT,
+    let frame = OutgoingPlan::Plan {
+        plan,
+        carriers: carriers.clamp(1, u32::MAX as usize) as u32,
+        separate_data_streams: true,
+        peer_progress: true,
+    };
+    let body = wire::encode_frame(&frame, Phase::Connect)?;
+    if body.len() > wire::PLAN_FRAME_LIMIT {
+        return Err(plan_too_large(body.len(), plan.items.len()));
+    }
+    wire::send_encoded(ctrl, &body, Phase::Connect).await
+}
+
+/// The refusal for a plan under the item ceiling whose encoding still outgrows
+/// the plan frame — long names or large metadata. It says what to do, not only
+/// the two numbers.
+fn plan_too_large(encoded: usize, items: usize) -> BackupError {
+    BackupError::phase(
         Phase::Connect,
+        format!(
+            "the plan encodes to {} bytes for {items} item(s); limit is {} bytes (the plan \
+             travels as one frame). Back up a narrower scope: one database, a key prefix, \
+             a sub-directory",
+            encoded,
+            wire::PLAN_FRAME_LIMIT
+        ),
     )
-    .await
 }
 
 /// Destination: receive the plan.
@@ -748,5 +776,69 @@ pub async fn recv_ack<S: DuplexStream>(ctrl: &mut S) -> Result<AcceptedPlan> {
             Phase::Connect,
             format!("expected PlanAck, got {other:?}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
+
+    fn plan() -> BackupPlan {
+        BackupPlan {
+            format_version: PLAN_FORMAT_VERSION,
+            module: "s3".to_string(),
+            mode: BackupMode::Copy1to1,
+            created_at: "2026-10-21T00:00:00Z".to_string(),
+            source_summary: "bucket \"b\" — ünïcode".to_string(),
+            items: vec![PlanItem {
+                id: 3,
+                ordinal: 3,
+                kind: "object".to_string(),
+                name: "a/b+c%20d".to_string(),
+                estimated_bytes: 42,
+                meta: serde_json::json!({"nested": [1, null, {"k": "v"}]}),
+            }],
+            estimated_bytes: 42,
+            integrity: IntegritySpec::default(),
+            payload: serde_json::json!({"objects": [{"key": "a/b+c%20d", "size": 42}]}),
+        }
+    }
+
+    /// Every peer, old or new, decodes the plan as a `ControlFrame`: the
+    /// borrowing twin must produce exactly its bytes.
+    #[test]
+    fn the_outgoing_plan_frame_encodes_exactly_like_control_frame_plan() {
+        let plan = plan();
+        let borrowed = wire::encode_frame(
+            &OutgoingPlan::Plan {
+                plan: &plan,
+                carriers: 4,
+                separate_data_streams: true,
+                peer_progress: true,
+            },
+            Phase::Connect,
+        )
+        .unwrap();
+        let owned = wire::encode_frame(
+            &ControlFrame::Plan {
+                plan: Box::new(plan),
+                carriers: 4,
+                separate_data_streams: true,
+                peer_progress: true,
+            },
+            Phase::Connect,
+        )
+        .unwrap();
+        assert_eq!(borrowed, owned);
+    }
+
+    #[test]
+    fn an_oversized_plan_frame_names_the_sizes_and_the_way_out() {
+        let text = plan_too_large(wire::PLAN_FRAME_LIMIT + 1, 150_000).to_string();
+        assert!(text.contains("[Connect]"), "{text}");
+        assert!(text.contains("150000 item(s)"), "{text}");
+        assert!(text.contains("limit is"), "{text}");
+        assert!(text.contains("narrower scope"), "{text}");
     }
 }

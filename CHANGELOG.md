@@ -52,6 +52,23 @@
   as if the run had made it. Such a namespace now fails with `NamespaceExists`.
 - `MongoDbParams` no longer prints the password or the URI in debug output.
 
+### Session
+
+- **Fixed: a failed run whose immutability audit could not run said nothing
+  about it.** The primary error is still what the run exits with, but a `WARN`
+  now states that the source is not verified unchanged.
+- **Fixed: a source failure could wait up to the payload idle timeout per
+  carrier** delivering a best-effort `Abort` to a destination that had stopped
+  draining, before the control-plane `Abort` carrying the reason was sent. The
+  data-carrier abort now has 5 seconds.
+- A read-back that comes up short names a few missing items and the count
+  instead of printing both full id lists — megabytes at the item ceiling, past
+  what an `Abort` frame carries.
+- The plan is serialized from a borrow instead of a clone (an S3 plan at the
+  item ceiling is ~100 MB), with byte-identical output. A plan under the item
+  ceiling that still outgrows the 128 MiB frame now says so and what to do,
+  instead of `frame is N bytes; limit is L`.
+
 ### S3
 
 - **Fixed: an S3 plan of ~150 000 objects failed in the handshake.** Every plan

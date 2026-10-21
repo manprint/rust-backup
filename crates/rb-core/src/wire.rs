@@ -213,17 +213,29 @@ where
     S: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = serde_json::to_vec(frame)
-        .map_err(|e| BackupError::phase_src(phase, "frame serialize", e))?;
+    let body = encode_frame(frame, phase)?;
     if body.len() > limit {
         return Err(BackupError::phase(
             phase,
             format!("frame is {} bytes; limit is {limit}", body.len()),
         ));
     }
+    send_encoded(stream, &body, phase).await
+}
+
+/// The JSON body of a frame, before its length prefix.
+pub(crate) fn encode_frame<T: Serialize>(frame: &T, phase: Phase) -> Result<Vec<u8>> {
+    serde_json::to_vec(frame).map_err(|e| BackupError::phase_src(phase, "frame serialize", e))
+}
+
+/// Write an already encoded, already bounded frame body with its length prefix.
+pub(crate) async fn send_encoded<S>(stream: &mut S, body: &[u8], phase: Phase) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let len = (body.len() as u32).to_le_bytes();
     write_all_idle(stream, &len).await?;
-    write_all_idle(stream, &body).await?;
+    write_all_idle(stream, body).await?;
     stream
         .flush()
         .await

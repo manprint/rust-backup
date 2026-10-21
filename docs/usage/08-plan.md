@@ -120,7 +120,12 @@ bucket troppo grande si divide in più run con radici (o `--prefix`) più strett
 Il piano viaggia come un frame solo, quindi al tetto sugli elementi si accompagna
 un limite di dimensione del frame (128 MiB) dimensionato per contenerne 200 000.
 Un piano sotto il tetto ma con nomi o metadati abnormi può sbattere su
-quest'ultimo; anche in quel caso il rifiuto è della sorgente e dice i byte.
+quest'ultimo; anche in quel caso il rifiuto è della sorgente, dice i byte e
+suggerisce di restringere l'ambito:
+
+```text
+the plan encodes to 140000000 bytes for 150000 item(s); limit is 134217728 bytes (the plan travels as one frame). Back up a narrower scope: one database, a key prefix, a sub-directory
+```
 
 ## Codici di uscita
 

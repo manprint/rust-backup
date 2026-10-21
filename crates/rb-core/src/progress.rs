@@ -293,13 +293,13 @@ impl Progress {
         self.inner.bytes_done.load(Ordering::Relaxed)
     }
 
-    /// The stage the run is in.
     /// Whether this run's source plan has been ready at any point: the source
     /// reached [`Stage::Handshake`], whatever it is doing now.
     pub fn plan_ready(&self) -> bool {
         self.inner.plan_ready.load(Ordering::Relaxed)
     }
 
+    /// The stage the run is in.
     pub fn stage(&self) -> Stage {
         Stage::from_u8(self.inner.stage.load(Ordering::Relaxed))
     }
