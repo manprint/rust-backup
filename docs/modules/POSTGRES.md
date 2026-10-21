@@ -18,7 +18,9 @@ major (`libc` on 10–14, ICU metadata on 15+, ICU rules on 16+, and `builtin` o
 
 ## Captured and restore order
 
-The source captures cluster roles, memberships, databases, schemas, extensions,
+The source captures cluster roles, memberships (with each grant's `INHERIT` and
+`SET` options on PostgreSQL 16+), databases with their settings — database-wide
+and per role (`ALTER ROLE … IN DATABASE … SET`) — schemas, extensions,
 tables, sequence state, table data, constraints, indexes, grants and ownership
 metadata, together with the comments carried by each of them — including
 comments on constraints and on indexes — and the relation options of views and
@@ -268,6 +270,28 @@ destination cluster. `search_path` and `DateStyle` are list-valued and appended
 verbatim as `pg_dump` does; a semicolon inside one is refused rather than
 emitted.
 
+## The plan is code: restore only from a source you trust
+
+A logical restore replays the source's definitions, and many of them are SQL by
+nature: view and materialized-view queries, function and procedure bodies
+(`SECURITY DEFINER` ones included), trigger functions, column defaults, check
+constraints, row-level-security policy expressions and the row filters of
+extension configuration tables. The destination executes them with its
+administrative account, exactly as `pg_restore` executes a dump file — whoever
+controls the plan controls that SQL. What can be escaped is escaped:
+identifiers are quoted and settings are emitted as literals (above), so a name or
+a GUC value cannot become a second statement. A body cannot be escaped; it is
+the object.
+
+So treat a destination like `pg_restore` on a dump of unknown origin:
+
+- pair it only with a source you trust, and protect the channel with a shared
+  secret (`--secret-file`) so no other peer can pair on its name;
+- read the plan the destination shows before accepting it (no `--yes` for a
+  source you have not checked);
+- restore with an account no more privileged than the restore needs, into a
+  cluster that holds nothing a hostile definition could reach.
+
 ## Objects this build refuses to copy silently
 
 `verify_catalog` compares the source model against a re-introspection *through
@@ -297,7 +321,13 @@ constraint name, and a `NOT VALID` not-null constraint, which does not actually
 forbid the rows already in the table. Constraints carrying the server's own
 default name are copied as before, so an ordinary cluster is unaffected — and
 because a partition's not-null constraint is inherited from its parent, its name
-on the destination is the same one PostgreSQL would pick natively.
+on the destination is the same one PostgreSQL would pick natively. "Default
+name" is the server's own rule: the `_not_null` label is kept whole and the
+table and column names are cut down to fit 63 bytes, the longer one first — a
+long table or column name is not "named". A constraint the server had to
+number (`_not_null1`, after a name collision) or one whose table or column was
+renamed after it was created no longer carries the name a restore would give it,
+and is refused like a named one.
 
 The error names every offender. `allow_unsupported_objects=true`
 (`-P allow_unsupported_objects=true`) accepts a knowingly partial copy; the run
@@ -423,6 +453,19 @@ previous contents must survive a failed attempt.
   leaves no gap at all. The read-back therefore normalizes both sides and
   enforces the full column order, names, types, defaults and comments.
 - PostgreSQL passwords are never captured or restored.
+- **Connections scale with the databases copied.** A run holds one connection
+  to the bootstrap database plus one per copied database, on the source and on
+  the destination (see "Connections, timeouts and keepalives"); a hot backup
+  must, since each database's snapshot lives in its own transaction. A cluster
+  with more databases than the server has free connection slots fails to
+  connect — back it up in narrower runs (`--database`), or raise
+  `max_connections`.
+- A grant from a source older than PostgreSQL 16 has no `INHERIT`/`SET`
+  options; it is restored as a plain `GRANT`, which a 16+ destination records
+  with the defaults that keep its meaning (`INHERIT` from the member role's
+  attribute, `SET TRUE`), and the read-back expects exactly those.
+- The grantor of a membership (`GRANTED BY`, PostgreSQL 16+) is not captured:
+  the restoring account becomes the grantor.
 - Roles are cluster-wide and are **not** rolled back. The destination removes the
   databases a failed restore created, but roles it created stay behind; drop them
   by hand if the cluster must be returned to its exact prior state.

@@ -123,18 +123,30 @@ pub fn alter_role_settings(r: &PgRole) -> Result<Vec<String>> {
         .collect()
 }
 
-/// `GRANT group TO member [WITH ADMIN OPTION];`.
+/// `GRANT group TO member [WITH ADMIN OPTION[, INHERIT b][, SET b]];`. The
+/// PostgreSQL 16 options appear only when the source had them, and then the
+/// destination is 16+ too (it is never older than the source).
 pub fn grant_membership(m: &PgMembership) -> String {
-    let admin = if m.admin_option {
-        " WITH ADMIN OPTION"
+    let mut options = Vec::new();
+    if m.admin_option {
+        options.push("ADMIN OPTION".to_string());
+    }
+    let sql_bool = |value: bool| if value { "TRUE" } else { "FALSE" };
+    if let Some(inherit) = m.inherit_option {
+        options.push(format!("INHERIT {}", sql_bool(inherit)));
+    }
+    if let Some(set) = m.set_option {
+        options.push(format!("SET {}", sql_bool(set)));
+    }
+    let with = if options.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(" WITH {}", options.join(", "))
     };
     format!(
-        "GRANT {} TO {}{};",
+        "GRANT {} TO {}{with};",
         quote_ident(&m.role),
         quote_ident(&m.member),
-        admin
     )
 }
 
@@ -262,18 +274,26 @@ pub fn create_database(d: &PgDatabase, destination_major: u32) -> Result<String>
     Ok(s)
 }
 
-/// `ALTER DATABASE … SET k TO v;` for each database GUC.
+/// `ALTER DATABASE … SET k TO v;` for each database GUC, then `ALTER ROLE r IN
+/// DATABASE … SET k TO v;` for each per-role one (roles exist by then).
 pub fn alter_database_settings(d: &PgDatabase) -> Result<Vec<String>> {
-    d.config
-        .iter()
-        .map(|kv| {
+    let database = quote_ident(&d.name);
+    let database_wide = d.config.iter().map(|kv| {
+        Ok(format!(
+            "ALTER DATABASE {database} SET {};",
+            set_clause(kv)?
+        ))
+    });
+    let per_role = d.role_config.iter().flat_map(|(role, config)| {
+        config.iter().map(|kv| {
             Ok(format!(
-                "ALTER DATABASE {} SET {};",
-                quote_ident(&d.name),
+                "ALTER ROLE {} IN DATABASE {database} SET {};",
+                quote_ident(role),
                 set_clause(kv)?
             ))
         })
-        .collect()
+    });
+    database_wide.chain(per_role).collect()
 }
 
 // --- per-database emitters ---------------------------------------------------
@@ -1332,6 +1352,8 @@ mod tests {
             role: "readers".into(),
             member: "app_owner".into(),
             admin_option: false,
+            inherit_option: None,
+            set_option: None,
         };
         assert_eq!(grant_membership(&m), "GRANT \"readers\" TO \"app_owner\";");
 
@@ -1355,6 +1377,59 @@ mod tests {
         assert_eq!(
             alter_database_settings(&d).expect("database settings"),
             vec!["ALTER DATABASE \"appdb\" SET statement_timeout TO '0';"]
+        );
+    }
+
+    /// PostgreSQL 16 grant options survive: a plain `GRANT` would inherit, so
+    /// `WITH INHERIT FALSE` lost on the way gave the copy wider privileges.
+    #[test]
+    fn membership_grant_options_are_restored_as_captured() {
+        let m = PgMembership {
+            role: "admin".into(),
+            member: "app".into(),
+            admin_option: true,
+            inherit_option: Some(false),
+            set_option: Some(true),
+        };
+        assert_eq!(
+            grant_membership(&m),
+            "GRANT \"admin\" TO \"app\" WITH ADMIN OPTION, INHERIT FALSE, SET TRUE;"
+        );
+        let m = PgMembership {
+            admin_option: false,
+            inherit_option: Some(true),
+            set_option: Some(false),
+            ..m
+        };
+        assert_eq!(
+            grant_membership(&m),
+            "GRANT \"admin\" TO \"app\" WITH INHERIT TRUE, SET FALSE;"
+        );
+    }
+
+    /// `ALTER ROLE r IN DATABASE d SET …` is restored after the database-wide
+    /// settings, with the same quoting.
+    #[test]
+    fn per_role_database_settings_are_restored() {
+        let mut d = PgDatabase {
+            name: "app\"db".into(),
+            config: vec!["work_mem=64MB".into()],
+            ..Default::default()
+        };
+        d.role_config.insert(
+            "report\"er".into(),
+            vec![
+                "search_path=app, public".into(),
+                "statement_timeout=5s".into(),
+            ],
+        );
+        assert_eq!(
+            alter_database_settings(&d).expect("database settings"),
+            vec![
+                "ALTER DATABASE \"app\"\"db\" SET work_mem TO '64MB';",
+                "ALTER ROLE \"report\"\"er\" IN DATABASE \"app\"\"db\" SET search_path TO app, public;",
+                "ALTER ROLE \"report\"\"er\" IN DATABASE \"app\"\"db\" SET statement_timeout TO '5s';",
+            ]
         );
     }
 

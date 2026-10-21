@@ -637,6 +637,17 @@ impl SourcePool {
         }
     }
 
+    /// The destination's own read-back. It reads exactly like a source, but
+    /// the role-can-write probe is about the source's immutability: run as the
+    /// destination's admin it warned "source role … can write to the source"
+    /// about a cluster that is meant to be written.
+    pub(crate) fn read_back(params: PostgresParams) -> Self {
+        Self {
+            probed: AtomicBool::new(true),
+            ..Self::new(params)
+        }
+    }
+
     pub(crate) fn params(&self) -> &PostgresParams {
         &self.params
     }

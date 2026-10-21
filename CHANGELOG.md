@@ -42,6 +42,35 @@
   plan payload is no longer cloned before it is decoded.
 - Read errors name the file and the caller's phase.
 
+### PostgreSQL
+
+- **Fixed: PostgreSQL 16 grant options were lost, widening privileges.** Only
+  `admin_option` was read, so `GRANT admin TO app WITH INHERIT FALSE, SET FALSE`
+  came back as a plain grant, which inherits — and the read-back, comparing the
+  same model, agreed. Each grant's `INHERIT` and `SET` options are now captured,
+  restored and verified; a grant from an older source is expected back with the
+  defaults that keep its meaning.
+- **Fixed: `ALTER ROLE … IN DATABASE … SET` was dropped without a word.** Only
+  the database-wide row of `pg_db_role_setting` was read; per-role settings
+  inside a database are now captured, restored after the database-wide ones and
+  verified.
+- **Fixed: PostgreSQL 18 refused default-named NOT NULL constraints on long
+  names.** The probe for operator-named constraints rebuilt the server's
+  default name by cutting `<table>_<column>_not_null` at 63 bytes; the server
+  keeps the `_not_null` label and truncates the names instead, so any table and
+  column longer than 53 bytes together was refused as "named". The probe now
+  follows the server's own rule, checked against it for every length pair.
+- The destination's catalog read-back no longer warns that the "source role can
+  write to the source" about its own admin account.
+- `COPY` out sends each 1 MiB chunk from its buffer instead of copying it into a
+  fresh allocation first.
+- `PostgresParams` no longer derives `Debug`: the hand-written one redacts the
+  password.
+- Documented that the plan is SQL — view and function bodies, defaults,
+  policies — executed by the destination like `pg_restore` executes a dump, and
+  how to pair only with a trusted source (`docs/modules/POSTGRES.md`); and that
+  connections scale with the databases copied.
+
 ### MongoDB
 
 - **Fixed: a restore into a database holding other collections failed

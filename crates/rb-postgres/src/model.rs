@@ -9,6 +9,8 @@
 //! Category fields are kept as short strings (matching the catalog's single-char
 //! codes where applicable) for serde stability and readable DDL.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level payload describing a PostgreSQL cluster slice for 1:1 restore.
@@ -59,6 +61,15 @@ pub struct PgMembership {
     pub role: String,
     pub member: String,
     pub admin_option: bool,
+    /// PostgreSQL 16+: whether the member inherits the role's privileges
+    /// (`GRANT … WITH INHERIT`). `None` from an older source, whose grants have
+    /// no such option — inheritance followed the member's own `INHERIT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_option: Option<bool>,
+    /// PostgreSQL 16+: whether the member may `SET ROLE` to the role
+    /// (`GRANT … WITH SET`). `None` from an older source, where it always could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_option: Option<bool>,
 }
 
 /// A non-default tablespace.
@@ -107,6 +118,10 @@ pub struct PgDatabase {
     pub comment: Option<String>,
     /// Database-level config (`ALTER DATABASE … SET …`).
     pub config: Vec<String>,
+    /// Per-role config inside this database (`ALTER ROLE r IN DATABASE d SET
+    /// …`), keyed by role. Missing in plans produced before this field existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_config: BTreeMap<String, Vec<String>>,
     /// Raw `datacl` aclitem strings. A database's default ACL grants `CONNECT`
     /// and `TEMPORARY` to `PUBLIC`, so an empty list here means "the template
     /// default" and a non-empty one is restored by revoking those defaults
@@ -428,6 +443,8 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                 role: "readers".to_string(),
                 member: "app_owner".to_string(),
                 admin_option: false,
+                inherit_option: None,
+                set_option: None,
             }],
             tablespaces: vec![PgTablespace {
                 name: "fast".to_string(),
@@ -449,6 +466,7 @@ pub(crate) fn test_fixture() -> PgPlanPayload {
                 is_template: false,
                 comment: Some("the app db".to_string()),
                 config: vec!["statement_timeout=0".to_string()],
+                role_config: Default::default(),
                 acl: vec![],
                 extensions: vec![PgExtension {
                     name: "pgcrypto".to_string(),

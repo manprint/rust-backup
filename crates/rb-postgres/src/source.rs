@@ -170,9 +170,12 @@ where
             frame.map_err(|e| BackupError::phase(Phase::Transfer, format!("copy_out: {e}")))?;
         buf.extend_from_slice(&bytes);
         while buf.len() >= CHUNK_SIZE {
-            let chunk: Vec<u8> = buf.drain(..CHUNK_SIZE).collect();
-            hasher.update(&chunk);
-            sink.send_chunk(item_id, offset, &chunk).await?;
+            // Send from the buffer itself, then shift out what was sent: a
+            // `drain(..).collect()` copied every MiB into a fresh allocation.
+            let chunk = &buf[..CHUNK_SIZE];
+            hasher.update(chunk);
+            sink.send_chunk(item_id, offset, chunk).await?;
+            buf.drain(..CHUNK_SIZE);
             offset += CHUNK_SIZE as u64;
         }
     }

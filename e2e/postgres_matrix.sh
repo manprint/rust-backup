@@ -996,6 +996,21 @@ SQL
       "SELECT array_to_string(s.setconfig, '@@')
          FROM pg_db_role_setting s JOIN pg_database d ON d.oid = s.setdatabase
         WHERE d.datname = '${DATABASE}' AND s.setrole = 0"
+    # A role's own setting inside this database, and (16+) each grant's
+    # INHERIT/SET options: both were once dropped without a word.
+    docker exec "$1" psql -U postgres -At -F'|' -c \
+      "SELECT r.rolname, array_to_string(s.setconfig, '@@')
+         FROM pg_db_role_setting s JOIN pg_database d ON d.oid = s.setdatabase
+         JOIN pg_roles r ON r.oid = s.setrole
+        WHERE d.datname = '${DATABASE}' ORDER BY 1"
+    if (( SOURCE_MAJOR >= 16 )); then
+      docker exec "$1" psql -U postgres -At -F'|' -c \
+        "SELECT g.rolname, m.rolname, am.admin_option, am.inherit_option, am.set_option
+           FROM pg_auth_members am
+           JOIN pg_roles g ON g.oid = am.roleid JOIN pg_roles m ON m.oid = am.member
+          WHERE left(g.rolname, 3) <> 'pg_' AND left(m.rolname, 3) <> 'pg_'
+          ORDER BY 1, 2"
+    fi
   }
   if [[ "$(role_settings "$SRC")" == "$(role_settings "$DST")" ]] && \
      [[ "$(docker exec "$DST" psql -U postgres -At -c \

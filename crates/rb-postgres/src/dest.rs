@@ -561,7 +561,7 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     for (index, expected_db) in expected.databases.iter().enumerate() {
         let mut scoped = params.clone();
         scoped.database = Some(expected_db.name.clone());
-        let observed_pool = crate::connect::SourcePool::new(scoped);
+        let observed_pool = crate::connect::SourcePool::read_back(scoped);
         let mut observed = crate::introspect::introspect_cluster(&observed_pool)
             .await
             .map_err(|error| {
@@ -610,6 +610,9 @@ pub async fn verify_catalog(params: &PostgresParams, plan: &BackupPlan) -> Resul
     if destination_major != source_major {
         strip_privileges_newer_than(&mut expected, source_major);
         strip_privileges_newer_than(&mut actual, source_major);
+    }
+    if destination_major >= 16 {
+        expect_default_grant_options(&mut expected);
     }
     normalize_catalog(&mut expected);
     normalize_catalog(&mut actual);
@@ -728,6 +731,31 @@ const PRIVILEGE_SINCE: &[(char, u32)] = &[('m', 17)];
 /// `arwdDxtm`. Restoring the source's grants is correct, and revoking the
 /// destination's native default from its owner would not be — so the comparison
 /// ignores letters that did not exist on the source.
+/// A grant from a source older than PostgreSQL 16 carries no `INHERIT`/`SET`
+/// options, and is restored as a plain `GRANT`. A 16+ destination then records
+/// the defaults that reproduce the old semantics — `INHERIT` from the member
+/// role's own attribute, `SET TRUE` — so that is what the read-back must show.
+fn expect_default_grant_options(payload: &mut PgPlanPayload) {
+    let inherits: HashMap<&str, bool> = payload
+        .roles
+        .iter()
+        .map(|role| (role.name.as_str(), role.inherit))
+        .collect();
+    let defaults: Vec<Option<bool>> = payload
+        .memberships
+        .iter()
+        .map(|membership| inherits.get(membership.member.as_str()).copied())
+        .collect();
+    for (membership, inherit) in payload.memberships.iter_mut().zip(defaults) {
+        if membership.inherit_option.is_none() {
+            membership.inherit_option = inherit;
+        }
+        if membership.set_option.is_none() {
+            membership.set_option = Some(true);
+        }
+    }
+}
+
 fn strip_privileges_newer_than(payload: &mut PgPlanPayload, source_major: u32) {
     let dropped: Vec<char> = PRIVILEGE_SINCE
         .iter()
@@ -1506,6 +1534,67 @@ mod tests {
             overwrite: true,
             extension_version: ExtensionVersionPolicy::Source,
         }
+    }
+
+    /// A pre-16 grant restored on 16+ reads back with the options that keep
+    /// its old meaning; a 16+ grant keeps exactly what the source had.
+    #[test]
+    fn pre_16_grants_are_expected_with_the_options_that_keep_their_meaning() {
+        use crate::model::{PgMembership, PgRole};
+        let grant = |member: &str, inherit_option, set_option| PgMembership {
+            role: "admin".into(),
+            member: member.into(),
+            admin_option: false,
+            inherit_option,
+            set_option,
+        };
+        let mut payload = PgPlanPayload {
+            roles: vec![
+                PgRole {
+                    name: "inherits".into(),
+                    inherit: true,
+                    ..Default::default()
+                },
+                PgRole {
+                    name: "noinherit".into(),
+                    inherit: false,
+                    ..Default::default()
+                },
+            ],
+            memberships: vec![
+                grant("inherits", None, None),
+                grant("noinherit", None, None),
+                grant("inherits", Some(false), Some(false)),
+            ],
+            ..Default::default()
+        };
+        expect_default_grant_options(&mut payload);
+        assert_eq!(
+            payload.memberships,
+            vec![
+                grant("inherits", Some(true), Some(true)),
+                grant("noinherit", Some(false), Some(true)),
+                grant("inherits", Some(false), Some(false)),
+            ]
+        );
+    }
+
+    /// Plans from older builds lack the new fields, and a pre-16 source
+    /// still emits none of them: the plan format is unchanged for both.
+    #[test]
+    fn plans_without_grant_options_or_role_settings_still_decode() {
+        let membership: crate::model::PgMembership = serde_json::from_value(serde_json::json!({
+            "role": "r", "member": "m", "admin_option": true
+        }))
+        .unwrap();
+        assert_eq!(membership.inherit_option, None);
+        assert_eq!(membership.set_option, None);
+        let encoded = serde_json::to_value(&membership).unwrap();
+        assert!(encoded.get("inherit_option").is_none(), "{encoded}");
+        assert!(encoded.get("set_option").is_none(), "{encoded}");
+        let database = crate::model::PgDatabase::default();
+        let encoded = serde_json::to_value(&database).unwrap();
+        assert!(encoded.get("role_config").is_none(), "{encoded}");
     }
 
     #[test]

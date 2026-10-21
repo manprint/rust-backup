@@ -55,7 +55,10 @@ pub enum ExtensionVersionPolicy {
 }
 
 /// PostgreSQL connection parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand so the password never reaches a log line or an
+/// error report.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresParams {
     /// Host to connect to (required).
     pub host: String,
@@ -127,6 +130,25 @@ pub struct PostgresParams {
     /// later state.
     #[serde(default)]
     pub hot_backup: bool,
+}
+
+impl std::fmt::Debug for PostgresParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresParams")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("database", &self.database)
+            .field("sslmode", &self.sslmode)
+            .field("sslrootcert", &self.sslrootcert)
+            .field("admin", &self.admin)
+            .field("overwrite", &self.overwrite)
+            .field("extension_version", &self.extension_version)
+            .field("allow_unsupported_objects", &self.allow_unsupported_objects)
+            .field("hot_backup", &self.hot_backup)
+            .finish()
+    }
 }
 
 fn default_pg_port() -> u16 {
@@ -294,7 +316,7 @@ impl Destination for PostgresDestination {
         let mut verifier = VerificationSink::new(evidence);
         // The read-back runs the source path against the destination, on its
         // own read-only pool — it can never reach the source host.
-        let read_back = SourcePool::new(self.params.clone());
+        let read_back = SourcePool::read_back(self.params.clone());
         source::stream_out(&read_back, plan, &mut verifier)
             .await
             .map_err(|error| {
@@ -471,6 +493,31 @@ mod tests {
         assert_eq!(before, 1);
         assert_eq!(after, 1, "the snapshot must not see a later commit");
         assert_eq!(fresh, 2, "an ordinary pool sees the commit");
+    }
+
+    #[test]
+    fn debug_output_redacts_the_password() {
+        let params = PostgresParams {
+            host: "db".into(),
+            port: 5432,
+            user: "backup".into(),
+            password: Some("hunter2".into()),
+            database: None,
+            sslmode: "prefer".into(),
+            sslrootcert: None,
+            admin: false,
+            overwrite: false,
+            extension_version: ExtensionVersionPolicy::Source,
+            allow_unsupported_objects: false,
+            hot_backup: false,
+        };
+        let rendered = format!("{params:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(
+            rendered.contains("\"backup\""),
+            "the user is not a secret: {rendered}"
+        );
     }
 
     fn live_pg_params() -> Option<PostgresParams> {

@@ -41,5 +41,13 @@ $$;
 GRANT readers TO app_owner;
 ALTER ROLE app_owner SET "myapp.k" = '1; ALTER ROLE app_owner SUPERUSER';
 ALTER ROLE app_owner SET statement_timeout = '5min';
+-- A role's setting inside one database (`ALTER ROLE … IN DATABASE … SET`) is a
+-- row of its own in pg_db_role_setting, beside the database-wide one.
+DO $$
+BEGIN
+  EXECUTE format('ALTER ROLE app_owner IN DATABASE %I SET search_path = app, public',
+                 current_database());
+END
+$$;
 
 CREATE SCHEMA app AUTHORIZATION app_owner;

@@ -20,7 +20,7 @@
 //! script `e2e/postgres_introspect.sh` (Docker) — it cannot run in a DB-less CI.
 //! The pure pieces (`build_plan`, `now_rfc3339`) have unit tests that always run.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
@@ -44,7 +44,7 @@ pub async fn introspect_cluster(pool: &SourcePool) -> Result<PgPlanPayload> {
     let (server_version, server_major, roles, memberships, tablespaces, names) = {
         let boot = pool.get(None).await?;
         let roles = gather_roles(&boot.client).await?;
-        let memberships = gather_memberships(&boot.client).await?;
+        let memberships = gather_memberships(&boot.client, boot.server_major).await?;
         let tablespaces = gather_tablespaces(&boot.client).await?;
         let names = target_database_names(params, &boot.client).await?;
         (
@@ -118,17 +118,33 @@ async fn gather_roles(client: &ReadOnlyClient) -> Result<Vec<PgRole>> {
         .collect())
 }
 
-async fn gather_memberships(client: &ReadOnlyClient) -> Result<Vec<PgMembership>> {
+/// PostgreSQL 16 gave each grant its own `INHERIT` and `SET` options. Reading
+/// only `admin_option` restored `GRANT admin TO app WITH INHERIT FALSE` as a
+/// plain grant — which inherits — so the copy held wider privileges than the
+/// source.
+fn membership_options_projection(server_major: u32) -> &'static str {
+    if server_major >= 16 {
+        "am.inherit_option, am.set_option"
+    } else {
+        "NULL::boolean, NULL::boolean"
+    }
+}
+
+async fn gather_memberships(
+    client: &ReadOnlyClient,
+    server_major: u32,
+) -> Result<Vec<PgMembership>> {
+    let sql = format!(
+        "SELECT g.rolname::text, m.rolname::text, am.admin_option, {} \
+         FROM pg_catalog.pg_auth_members am \
+         JOIN pg_catalog.pg_roles g ON g.oid = am.roleid \
+         JOIN pg_catalog.pg_roles m ON m.oid = am.member \
+         WHERE left(g.rolname, 3) <> 'pg_' AND left(m.rolname, 3) <> 'pg_' \
+         ORDER BY 1, 2",
+        membership_options_projection(server_major)
+    );
     let rows = client
-        .query(
-            "SELECT g.rolname::text, m.rolname::text, am.admin_option \
-             FROM pg_catalog.pg_auth_members am \
-             JOIN pg_catalog.pg_roles g ON g.oid = am.roleid \
-             JOIN pg_catalog.pg_roles m ON m.oid = am.member \
-             WHERE left(g.rolname, 3) <> 'pg_' AND left(m.rolname, 3) <> 'pg_' \
-             ORDER BY 1, 2",
-            &[],
-        )
+        .query(&sql, &[])
         .await
         .map_err(|e| analyze_err("memberships", e))?;
     Ok(rows
@@ -137,6 +153,8 @@ async fn gather_memberships(client: &ReadOnlyClient) -> Result<Vec<PgMembership>
             role: r.get(0),
             member: r.get(1),
             admin_option: r.get(2),
+            inherit_option: r.get(3),
+            set_option: r.get(4),
         })
         .collect())
 }
@@ -195,6 +213,39 @@ fn database_locale_projection(server_major: u32) -> &'static str {
     }
 }
 
+/// `ALTER ROLE r IN DATABASE d SET …` rows (`setrole <> 0`), per database and
+/// role. Only the database-wide row (`setrole = 0`) used to be read, so a
+/// per-role setting inside a database — a role's `search_path` in one database
+/// — was dropped without a word.
+async fn gather_database_role_settings(
+    client: &ReadOnlyClient,
+    names: &[String],
+) -> Result<HashMap<String, BTreeMap<String, Vec<String>>>> {
+    let rows = client
+        .query(
+            "SELECT d.datname::text, r.rolname::text, s.setconfig \
+             FROM pg_catalog.pg_db_role_setting s \
+             JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+             JOIN pg_catalog.pg_roles r ON r.oid = s.setrole \
+             WHERE d.datname = ANY($1) AND left(r.rolname, 3) <> 'pg_' \
+             ORDER BY 1, 2",
+            &[&names],
+        )
+        .await
+        .map_err(|e| analyze_err("database role settings", e))?;
+    let mut settings: HashMap<String, BTreeMap<String, Vec<String>>> = HashMap::new();
+    for r in &rows {
+        let config = r.get::<_, Option<Vec<String>>>(2).unwrap_or_default();
+        if !config.is_empty() {
+            settings
+                .entry(r.get(0))
+                .or_default()
+                .insert(r.get(1), config);
+        }
+    }
+    Ok(settings)
+}
+
 fn parse_locale_provider(value: &str) -> Result<PgLocaleProvider> {
     match value {
         "c" => Ok(PgLocaleProvider::Libc),
@@ -232,6 +283,7 @@ async fn gather_databases_meta(
         .query(&sql, &[&names])
         .await
         .map_err(|e| analyze_err("databases", e))?;
+    let mut role_config = gather_database_role_settings(client, names).await?;
     rows.iter()
         .map(|r| {
             let locale_provider = parse_locale_provider(&r.get::<_, String>(5))?;
@@ -250,6 +302,9 @@ async fn gather_databases_meta(
                 is_template: r.get(11),
                 comment: r.get(12),
                 config: r.get::<_, Option<Vec<String>>>(13).unwrap_or_default(),
+                role_config: role_config
+                    .remove(&r.get::<_, String>(0))
+                    .unwrap_or_default(),
                 acl: r.get::<_, Option<Vec<String>>>(14).unwrap_or_default(),
                 extensions: Vec::new(),
                 extension_configs: Vec::new(),
@@ -1043,27 +1098,13 @@ fn unsupported_probes(major: u32) -> Vec<(&'static str, &'static str)> {
     // (which does not actually forbid existing NULLs).
     //
     // The name test is an exact comparison with the name the server would
-    // choose itself (`<table>_<column>_not_null`, truncated to 63 characters),
-    // not a suffix test: `ALTER TABLE t ADD CONSTRAINT other_not_null NOT NULL
-    // id` ends in `_not_null` too and would otherwise be rebuilt under a
-    // different name.
+    // choose itself, not a suffix test: `ALTER TABLE t ADD CONSTRAINT
+    // other_not_null NOT NULL id` ends in `_not_null` too and would otherwise be
+    // rebuilt under a different name.
     if major >= 18 {
         probes.push((
             "NOT NULL constraints that are named or NOT VALID (PostgreSQL 18+)",
-            "SELECT (n.nspname || '.' || c.relname || '.' || co.conname \
-                     || CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END)::text \
-             FROM pg_catalog.pg_constraint co \
-             JOIN pg_catalog.pg_class c ON c.oid = co.conrelid \
-             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE co.contype = 'n' AND co.conislocal \
-               AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
-               AND (NOT co.convalidated \
-                    OR co.conname IS DISTINCT FROM \
-                       left(c.relname || '_' \
-                            || (SELECT a.attname FROM pg_catalog.pg_attribute a \
-                                 WHERE a.attrelid = co.conrelid \
-                                   AND a.attnum = co.conkey[1]) \
-                            || '_not_null', 63))",
+            PG18_NAMED_NOT_NULL_PROBE,
         ));
     }
     // `prokind` is PostgreSQL 11+; on 10 the same split lives in two booleans.
@@ -1385,6 +1426,57 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// PostgreSQL 18 names a NOT NULL constraint with `ChooseConstraintName(table,
+/// column, "not_null")`, i.e. `makeObjectName`: the label `_not_null` is always
+/// kept whole and the table and column names are cut down to the remaining 53
+/// bytes, the longer one first, each then clipped back to a character boundary.
+/// Comparing with `left(table_column_not_null, 63)` cut the label instead, so
+/// every default-named constraint on a long table+column name was refused as
+/// "named". The closed form below is that loop's result: both names fit; or
+/// the shorter one (≤ 26 bytes as name2, ≤ 27 as name1) stays and the other
+/// gets the rest; or 27 + 26 bytes. The clip takes the most characters whose
+/// bytes fit, which is what `pg_mbcliplen` does. A name with a collision
+/// suffix (`_not_null1`) or one left behind by a rename is still refused: a
+/// restore cannot be relied on to reproduce it.
+const PG18_NAMED_NOT_NULL_PROBE: &str = "\
+SELECT (n.nspname || '.' || c.relname || '.' || co.conname \
+        || CASE WHEN co.convalidated THEN '' ELSE ' NOT VALID' END)::text \
+FROM pg_catalog.pg_constraint co \
+JOIN pg_catalog.pg_class c ON c.oid = co.conrelid \
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+WHERE co.contype = 'n' AND co.conislocal \
+  AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' \
+  AND (NOT co.convalidated OR co.conname::text IS DISTINCT FROM ( \
+    SELECT left(c.relname::text, k1.k) || '_' || left(a.attname::text, k2.k) || '_not_null' \
+    FROM pg_catalog.pg_attribute a \
+    CROSS JOIN LATERAL (SELECT octet_length(c.relname::text) AS l1, \
+                               octet_length(a.attname::text) AS l2) l \
+    CROSS JOIN LATERAL (SELECT \
+        CASE WHEN l.l1 + l.l2 <= 53 THEN l.l1 WHEN l.l2 <= 26 THEN 53 - l.l2 \
+             WHEN l.l1 <= 27 THEN l.l1 ELSE 27 END AS n1, \
+        CASE WHEN l.l1 + l.l2 <= 53 THEN l.l2 WHEN l.l2 <= 26 THEN l.l2 \
+             WHEN l.l1 <= 27 THEN 53 - l.l1 ELSE 26 END AS n2) b \
+    CROSS JOIN LATERAL (SELECT max(g) AS k FROM generate_series(0, b.n1) g \
+                        WHERE octet_length(left(c.relname::text, g)) <= b.n1) k1 \
+    CROSS JOIN LATERAL (SELECT max(g) AS k FROM generate_series(0, b.n2) g \
+                        WHERE octet_length(left(a.attname::text, g)) <= b.n2) k2 \
+    WHERE a.attrelid = co.conrelid AND a.attnum = co.conkey[1]))";
+
+/// The `makeObjectName` loop itself, as PostgreSQL writes it: the reference the
+/// probe's closed form is tested against.
+#[cfg(test)]
+fn make_object_name_lengths(mut name1: usize, mut name2: usize) -> (usize, usize) {
+    const AVAILABLE: usize = 63 - 1 - ("not_null".len() + 1);
+    while name1 + name2 > AVAILABLE {
+        if name1 > name2 {
+            name1 -= 1;
+        } else {
+            name2 -= 1;
+        }
+    }
+    (name1, name2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1428,6 +1520,44 @@ mod tests {
             PgLocaleProvider::Builtin
         );
         assert!(parse_locale_provider("future-provider").is_err());
+    }
+
+    /// The probe's closed form agrees with PostgreSQL's truncation loop for
+    /// every pair of name lengths an identifier can have.
+    #[test]
+    fn pg18_not_null_name_lengths_match_make_object_name() {
+        let closed_form = |l1: usize, l2: usize| {
+            if l1 + l2 <= 53 {
+                (l1, l2)
+            } else if l2 <= 26 {
+                (53 - l2, l2)
+            } else if l1 <= 27 {
+                (l1, 53 - l1)
+            } else {
+                (27, 26)
+            }
+        };
+        for l1 in 0..=63 {
+            for l2 in 0..=63 {
+                assert_eq!(
+                    closed_form(l1, l2),
+                    make_object_name_lengths(l1, l2),
+                    "table name {l1} bytes, column name {l2} bytes"
+                );
+            }
+        }
+        for clause in [
+            "WHEN l.l1 + l.l2 <= 53 THEN l.l1 WHEN l.l2 <= 26 THEN 53 - l.l2",
+            "WHEN l.l1 <= 27 THEN l.l1 ELSE 27 END AS n1",
+            "WHEN l.l1 + l.l2 <= 53 THEN l.l2 WHEN l.l2 <= 26 THEN l.l2",
+            "WHEN l.l1 <= 27 THEN 53 - l.l1 ELSE 26 END AS n2",
+            "|| '_not_null'",
+        ] {
+            assert!(
+                PG18_NAMED_NOT_NULL_PROBE.contains(clause),
+                "the probe must carry the tested closed form: {clause}"
+            );
+        }
     }
 
     #[test]
