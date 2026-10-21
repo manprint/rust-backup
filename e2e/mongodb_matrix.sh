@@ -58,11 +58,10 @@ cargo build --release --all-features
 image_for() { # major -> docker image tag
   case "$1" in
     4) echo "mongo:4.4" ;;
-    # Every published MongoDB 8 image refuses to start on Linux >= 6.19
-    # (SERVER-121912) — `mongo:8` included, as of 2026-09-09. The tag still
-    # tracks the maintained 8 release line, so it is the right image; a host on
-    # a newer kernel simply cannot run this major, which `start_mongo` reports
-    # as a skip rather than as a fault in this tool.
+    # Every published MongoDB 8 image refuses to start on Linux 6.19 and newer
+    # (SERVER-121912) — `mongo:8` included. The tag still tracks the maintained
+    # 8 release line, so it is the right image; `start_mongo` works around the
+    # refusal and reports a skip only when even that fails.
     8) echo "mongo:8" ;;
     *) echo "mongo:$1.0" ;;
   esac
@@ -93,26 +92,45 @@ mongo_eval() { # container db js
 # failure would hide real ones, and reporting it as a pass would be a lie.
 # RB_MONGO_RUN_ARGS (docker) and RB_MONGO_MONGOD_ARGS (mongod) let a caller add
 # authentication and command logging without a second copy of this function.
+#
+# MongoDB 8 refuses Linux 6.19 and newer (SERVER-121912): its vendored TCMalloc
+# registers rseq for per-CPU caches, which those kernels break, and the image
+# sets GLIBC_TUNABLES=glibc.pthread.rseq=0 to hand rseq to TCMalloc. On a
+# refusal the container is started once more with glibc keeping rseq instead;
+# TCMalloc then runs without per-CPU caches (slower allocation, same server),
+# and mongod's own startup guard accepts that. Only if this second start also
+# fails is the major reported as a skip.
 start_mongo() { # name port image -> start container, wait ready
   local name="$1" port="$2" image="$3"
+  local -a rseq=()
   CONTAINERS+=("$name")
-  docker run -d --name "$name" -p "${port}:27017" \
-    ${RB_MONGO_RUN_ARGS[@]+"${RB_MONGO_RUN_ARGS[@]}"} "$image" \
-    ${RB_MONGO_MONGOD_ARGS[@]+"${RB_MONGO_MONGOD_ARGS[@]}"} >/dev/null
-  # First startup of a newly pulled Mongo image can exceed 40 seconds on CI.
-  for _ in $(seq 1 90); do
-    if mongo_eval "$name" admin 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
-      return 0
+  while :; do
+    docker run -d --name "$name" -p "${port}:27017" ${rseq[@]+"${rseq[@]}"} \
+      ${RB_MONGO_RUN_ARGS[@]+"${RB_MONGO_RUN_ARGS[@]}"} "$image" \
+      ${RB_MONGO_MONGOD_ARGS[@]+"${RB_MONGO_MONGOD_ARGS[@]}"} >/dev/null
+    # First startup of a newly pulled Mongo image can exceed 40 seconds on CI.
+    for _ in $(seq 1 90); do
+      if mongo_eval "$name" admin 'db.adminCommand({ ping: 1 })' >/dev/null 2>&1; then
+        return 0
+      fi
+      # A mongod that refused to start has taken its container down with it.
+      [[ $(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) == true ]] || break
+      sleep 1
+    done
+    if ! docker logs "$name" 2>&1 | grep -q 'SERVER-121912'; then
+      echo "FAIL: $name not ready"; return 1
     fi
-    sleep 1
-  done
-  if docker logs "$name" 2>&1 | grep -q 'SERVER-121912'; then
-    printf 'SKIP: %s refuses to start on Linux %s (SERVER-121912); run this major on a kernel < 6.19\n' \
+    if (( ${#rseq[@]} > 0 )); then
+      printf 'SKIP: %s refuses to start on Linux %s (SERVER-121912), even with glibc.pthread.rseq=1\n' \
+        "$image" "$(uname -r)"
+      SKIPPED=$((SKIPPED + 1))
+      return 2
+    fi
+    printf 'NOTE: %s refuses Linux %s (SERVER-121912); restarting it with GLIBC_TUNABLES=glibc.pthread.rseq=1\n' \
       "$image" "$(uname -r)"
-    SKIPPED=$((SKIPPED + 1))
-    return 2
-  fi
-  echo "FAIL: $name not ready"; return 1
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rseq=(-e "GLIBC_TUNABLES=glibc.pthread.rseq=1")
+  done
 }
 
 seed_source() { # container

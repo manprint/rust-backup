@@ -196,6 +196,14 @@ symlink-following read.
   `RUST_BACKUP_MINIO_IMAGE`), which ships `mc` too.
 - The MinIO test now runs both servers with SSE-S3 enabled and checks that an
   encrypted source object is restored encrypted.
+- **MongoDB 8 runs again on Linux 6.19 and newer.** GitHub's `ubuntu-24.04`
+  runners moved to Linux 7.0, where every MongoDB 8 image refuses to start
+  (SERVER-121912), so the `8` and `4:8` jobs had stopped exercising MongoDB 8.
+  `e2e/mongodb_matrix.sh` now restarts a refused container once with
+  `GLIBC_TUNABLES=glibc.pthread.rseq=1`: glibc keeps rseq, the server's
+  allocator runs without per-CPU caches, and mongod's own startup guard accepts
+  that. It prints a `NOTE` when it does, and still reports a `SKIP` if that
+  second start fails too.
 
 ### Dependencies and toolchain
 

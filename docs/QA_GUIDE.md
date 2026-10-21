@@ -246,12 +246,14 @@ bash e2e/postgres_hot_backup.sh 16
 
 In CI this is the job `postgres-hot-backup` (`timeout-minutes: 40`).
 
-MongoDB 8 needs a host kernel older than 6.19: every published MongoDB 8 image
-refuses to start above that (SERVER-121912). On a newer kernel
-`e2e/mongodb_matrix.sh 8` prints a `SKIP` naming the kernel and exits 77, which
-`e2e/full_matrix.sh` renders as a `SKIP` row rather than a pass or a failure —
-that major has to be exercised on an older kernel or in CI. Nothing else in the
-suite depends on it.
+Every published MongoDB 8 image refuses to start on Linux 6.19 and newer
+(SERVER-121912). On such a kernel `e2e/mongodb_matrix.sh` prints a `NOTE` and
+restarts the container once with `GLIBC_TUNABLES=glibc.pthread.rseq=1`: glibc
+then keeps rseq, the server's TCMalloc runs without per-CPU caches (slower
+allocation, the same server), and mongod's own startup guard accepts it. Only if
+that second start also fails does the script print a `SKIP` naming the kernel
+and exit 77 when nothing ran, which `e2e/full_matrix.sh` renders as a `SKIP` row
+rather than a pass or a failure. Nothing else in the suite depends on MongoDB 8.
 
 The fault matrix is also runnable on its own, and takes a group name so a failed
 group can be re-run alone (Docker is needed only for the backend groups):
