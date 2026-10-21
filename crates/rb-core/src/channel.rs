@@ -306,7 +306,7 @@ impl<S: DuplexStream> ChunkSource for StreamChunkSource<S> {
                 if !self.item_hashers.contains_key(&item_id) {
                     let too_many = if let Some(session_hashers) = &self.session_hashers {
                         session_hashers
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                                 (count < MAX_IN_FLIGHT_ITEM_HASHERS).then_some(count + 1)
                             })
                             .is_err()

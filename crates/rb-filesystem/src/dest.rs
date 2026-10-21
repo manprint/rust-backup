@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use nix::fcntl::{AtFlags, OFlag};
+use nix::fcntl::{AtFlags, OFlag, AT_FDCWD};
 use nix::sys::stat::{fchmodat, mknod, utimensat, FchmodatFlags, Mode, SFlag, UtimensatFlags};
 use nix::sys::time::TimeSpec;
 use nix::unistd::{fchownat, mkfifo, Gid, Uid};
@@ -529,7 +530,7 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
         let path = at_root(root, &entry.path, Phase::Apply)?;
         if chown {
             fchownat(
-                None,
+                AT_FDCWD,
                 &path,
                 Some(Uid::from_raw(entry.uid)),
                 Some(Gid::from_raw(entry.gid)),
@@ -556,7 +557,7 @@ fn apply_metadata(root: &Path, plan: &FilesystemPlan, chown: bool) -> Result<()>
         }
         let mtime = TimeSpec::new(entry.mtime, entry.mtime_nsec as i64);
         utimensat(
-            None,
+            AT_FDCWD,
             &path,
             &TimeSpec::UTIME_OMIT,
             &mtime,
@@ -742,16 +743,15 @@ fn chmod_node_no_follow(path: &Path, mode: u32) -> Result<()> {
         Mode::empty(),
     )
     .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())))?;
-    let by_fd = format!("/proc/self/fd/{fd}");
-    let result = fchmodat(
-        None,
+    // `fd` stays open (and the inode pinned) until the chmod below returns.
+    let by_fd = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    fchmodat(
+        AT_FDCWD,
         by_fd.as_str(),
         Mode::from_bits_truncate(mode & 0o7777),
         FchmodatFlags::FollowSymlink,
     )
-    .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())));
-    let _ = nix::unistd::close(fd);
-    result
+    .map_err(|e| BackupError::phase(Phase::Apply, format!("{}: {e}", path.display())))
 }
 
 fn libc_o_nofollow() -> i32 {

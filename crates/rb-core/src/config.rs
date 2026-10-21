@@ -199,7 +199,7 @@ fn default_parallel_targets() -> usize {
 impl SessionConfig {
     /// Parse a session config from YAML text.
     pub fn from_yaml(text: &str) -> Result<Self> {
-        serde_yaml::from_str(text).map_err(|e| BackupError::Config(format!("YAML parse: {e}")))
+        serde_norway::from_str(text).map_err(|e| BackupError::Config(format!("YAML parse: {e}")))
     }
 
     /// Load a session config from a YAML file path.

@@ -112,8 +112,14 @@ module cap brings it back to one.
 Current peers also negotiate `separate_data_streams=true`: the plan, abort and
 completion exchange stays on a dedicated control stream even when the negotiated
 carrier count is one. This avoids concurrently polling split halves of one yamux
-stream, which can stall a payload writer. The field defaults to false when absent,
-so either side can still interoperate with the legacy multiplexed layout.
+stream, which could stall a payload writer. The root cause was in yamux 0.13: the
+read half sent its window updates through the same command-channel handle the
+write half was parked on, and that handle keeps one waker, so the wake-up of the
+half polled first was lost (libp2p/rust-yamux#232). yamux 0.14.1, which the
+workspace requires, gives each half its own handle; the control stream, whose
+read and write halves live in two tasks, relies on that. The field defaults to
+false when absent, so either side can still interoperate with the legacy
+multiplexed layout.
 
 On that control stream the destination also reports its progress to the waiting
 source. The source offers `peer_progress=true` in `Plan`, the destination echoes

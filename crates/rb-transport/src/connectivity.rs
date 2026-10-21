@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::net::UdpSocket;
 

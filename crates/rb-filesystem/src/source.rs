@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
-use nix::unistd::{close, read};
+use nix::unistd::read;
 use rb_core::channel::ChunkSink;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
@@ -155,7 +155,8 @@ static ATIME_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub(crate) struct NoAtimeReader {
-    fd: std::os::fd::RawFd,
+    /// Owned: dropping the reader closes the descriptor.
+    fd: std::os::fd::OwnedFd,
 }
 
 impl NoAtimeReader {
@@ -172,7 +173,7 @@ impl NoAtimeReader {
         path: &Path,
         allow_atime_updates: bool,
         phase: Phase,
-        mut opener: impl FnMut(&Path, OFlag) -> nix::Result<std::os::fd::RawFd>,
+        mut opener: impl FnMut(&Path, OFlag) -> nix::Result<std::os::fd::OwnedFd>,
     ) -> Result<Self> {
         let flags = OFlag::O_RDONLY | OFlag::O_NOATIME;
         let fd = match opener(path, flags) {
@@ -213,7 +214,7 @@ impl NoAtimeReader {
     fn read_chunk(&mut self) -> Result<Vec<u8>> {
         let mut buf = vec![0_u8; 64 * 1024];
         loop {
-            match read(self.fd, &mut buf) {
+            match read(&self.fd, &mut buf) {
                 Ok(used) => {
                     buf.truncate(used);
                     return Ok(buf);
@@ -231,12 +232,6 @@ impl NoAtimeReader {
                 }
             }
         }
-    }
-}
-
-impl Drop for NoAtimeReader {
-    fn drop(&mut self) {
-        let _ = close(self.fd);
     }
 }
 

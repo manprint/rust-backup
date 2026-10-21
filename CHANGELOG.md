@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Dependencies and toolchain
+
+- **yamux 0.14.1** (from 0.13.10). 0.13 parked both halves of a split stream
+  on one command-channel handle with a single waker slot, so the half polled
+  last could swallow the other's wake-up and stall a writer
+  (libp2p/rust-yamux#232). The control stream is split across two tasks; 0.14.1
+  gives each half its own handle.
+- **serde_norway 0.9.42 replaces serde_yaml 0.9** for `run --config`. serde_yaml
+  is deprecated and pulls the unmaintained `unsafe-libyaml`
+  (RUSTSEC-2024-0449), which failed `cargo audit --deny warnings`. serde_norway
+  is the maintained fork with the same YAML semantics: every shipped example,
+  every YAML block in the docs and 37 scalar edge cases (`yes`/`no`, `017`,
+  `1_000`, `.inf`, merge keys, duplicate keys, multi-document input) parse to
+  the same values as before.
+- nix 0.31 (owned file descriptors: a reader closes its descriptor on drop
+  instead of by hand), hmac 0.13, sha2 0.11, thiserror 2, dashmap 6,
+  tokio-postgres-rustls 0.14, and a lockfile refresh that clears the open
+  quinn-proto, rustls, rustls-webpki and webpki-roots advisories.
+- Builds clean on Rust 1.99 (`AtomicUsize::fetch_update` → `try_update`).
+
 ## 0.1.0 — release (2026-09-23)
 
 The first official release, and the first one staged on real hosts. It

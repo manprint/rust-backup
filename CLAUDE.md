@@ -79,12 +79,16 @@ against an in-memory channel.
     registry entry whose control substream has been silent for
     `SECRET_CTRL_TIMEOUT` (60 s). Without this, a wedged/abandoned provider
     zombies its channel id (`secret.rs`).
-  - **`tokio::io::split` on a `mux::Stream` — read/write only.** yamux 0.13's
-    `Shared` keeps separate `reader`/`writer` waker slots, so a read half in one
-    task and a write half in another is safe and is what the session does. What
-    is NOT safe is two tasks on the *same* direction: they overwrite each
-    other's waker in the one slot for that direction and one of them is lost.
-    One direction = one task.
+  - **`tokio::io::split` on a `mux::Stream` — read/write only, yamux ≥ 0.14.1.**
+    yamux's `Shared` keeps separate `reader`/`writer` waker slots, and since
+    0.14 the read half sends its window updates through its own command-channel
+    handle (libp2p/rust-yamux#232). Before that (0.13) both halves parked on ONE
+    `mpsc::Sender`, whose single waker slot the half polled last overwrote — a
+    lost wake-up that stalled a split stream's writer. So a read half in one
+    task and a write half in another is safe and is what the session does on
+    the control stream; never pin yamux below 0.14.1. What is NOT safe is two
+    tasks on the *same* direction: they overwrite each other's waker in the one
+    slot for that direction and one of them is lost. One direction = one task.
   - **UDP hole-punch socket bind — never `SO_REUSEADDR`.** Bind the fixed/preferred
     punch port plainly; on `EADDRINUSE` fall back to an ephemeral port. Two
     wildcard UDP sockets that both set `SO_REUSEADDR` co-bind the same port and

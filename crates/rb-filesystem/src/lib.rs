@@ -1133,7 +1133,7 @@ mod tests {
         let file = root.join("old");
         fs::write(&file, b"x").unwrap();
         nix::sys::stat::utimensat(
-            None,
+            nix::fcntl::AT_FDCWD,
             &file,
             &nix::sys::time::TimeSpec::new(-86_400, 0),
             &nix::sys::time::TimeSpec::new(-86_400, 0),
