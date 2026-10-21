@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### S3
+
+- **Fixed: an S3 plan of ~150 000 objects failed in the handshake.** Every plan
+  item carried a second full copy of its object's catalog entry, which nothing
+  read; at the 200 000-object ceiling the plan encoded to ~179 MB, past the
+  128 MiB plan frame. Items now only name and size the object (~104 MB at the
+  ceiling, held under the frame by a test). Older destinations never read the
+  item copy, so mixed-version runs are unaffected.
+- **Fixed: analysis allocated over a gigabyte for a large bucket.** One
+  unstarted ~6 KiB probe future was built per object before 16 of them ran.
+  Probes (and the new concurrent read-back) are now created lazily.
+- **SSE-S3 is preserved instead of refused.** AWS has encrypted every new
+  object with SSE-S3 (`AES256`) since January 2023, so analysis refused every
+  modern AWS bucket. The destination now requests `AES256` for each such
+  object, and read-back fails a copy that comes back unencrypted. SSE-KMS and
+  SSE-C stay refused: their keys are not portable.
+- **Fixed: a transient `GetBucketPolicy` failure read as "no policy".** The
+  plan then silently lost the policy, or the post-run audit reported a source
+  mutation that never happened. Only `NoSuchBucketPolicy` means no policy; a
+  403 or a provider without policies still yields none, now with a `WARN`; any
+  other failure fails the run.
+- **Fixed: a 403 or network error on `HeadBucket` read as "bucket missing".**
+  Preflight then promised `create_bucket` a bucket it could never create. Only a
+  404 is "missing" now; anything else fails the `bucket` check with its cause.
+- **S3 errors name their cause.** The SDK's `Display` prints only `service
+  error` / `dispatch failure`; every S3 failure now carries the provider's code
+  and message.
+- **`GetObject` carries `If-Match` with the planned ETag**, so an object
+  replaced after analysis fails at once with `SourceMutated` (exit 6), naming
+  the key, instead of after the whole transfer.
+- **Faster restores of small objects.** An object of up to 5 MiB is one
+  `PutObject` (after its digest matched) instead of a three-request multipart
+  upload, and keeps the plain MD5 ETag the source had. Larger objects are cut
+  into parts of exactly the part size, without reallocating the part buffer.
+- **Faster read-back.** One `GetObject` per object instead of `HeadObject` +
+  `GetObject`, 16 objects at a time, at most 16 MiB in flight.
+- The source sends full 1 MiB chunks (it forwarded each few-KiB HTTP read as its
+  own wire chunk), and the analysis reuses the pre-run fingerprint's listing
+  instead of listing and HEAD-ing the bucket a second time.
+- `--overwrite` removes stale keys 16 at a time; preflight and read-back list
+  at most a few keys plus a count instead of dumping whole key sets.
+- `S3Params` no longer prints the secret key in debug output.
+
+### Logging
+
+- **Fixed: module log lines never reached the operator.** The default filter
+  listed only `rust_backup`, `rb_core` and `rb_transport`, so every warning and
+  error a module logged was dropped — a PostgreSQL or MongoDB cleanup that
+  failed after a broken restore, an S3 multipart upload that could not be
+  aborted and keeps billed parts behind. Every workspace crate is now in the
+  default filter; dependencies stay quiet unless `RUST_LOG` asks.
+
+### End-to-end suite
+
+- **MinIO image moved again.** quay.io now answers `401 UNAUTHORIZED` for
+  `minio/minio` and `minio/mc`; the suite uses
+  `ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z` pinned by digest
+  (`RB_MINIO_IMAGE` in `e2e/lib.sh`, overridable with
+  `RUST_BACKUP_MINIO_IMAGE`), which ships `mc` too.
+- The MinIO test now runs both servers with SSE-S3 enabled and checks that an
+  encrypted source object is restored encrypted.
+
 ### Dependencies and toolchain
 
 - **yamux 0.14.1** (from 0.13.10). 0.13 parked both halves of a split stream

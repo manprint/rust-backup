@@ -49,12 +49,16 @@ printf 'rust-backup S3 smoke\n' > "$work/seed/nested/hello.txt"
 # More than two 5 MiB parts: required to exercise a failure between uploads.
 dd if=/dev/urandom of="$work/seed/large.bin" bs=1M count=12 status=none
 touch "$work/seed/empty"
+mkdir -p "$work/seed/sse"
+printf 'stored with SSE-S3\n' > "$work/seed/sse/secret.txt"
+# A per-run static key gives both servers SSE-S3 (`AES256`), so the copy of an
+# encrypted object can be checked for staying encrypted.
+kms_key="rb-e2e-key:$(head -c 32 /dev/urandom | base64)"
 
 start_minio() { # name host-port
-  # Docker Hub's `minio/minio` was withdrawn (`pull access denied ...
-  # repository does not exist`); quay.io is MinIO's own registry, and the
-  # release is pinned so the suite cannot decay under us again.
-  docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
+  # The image is pinned in lib.sh (RB_MINIO_IMAGE): MinIO's own registries no
+  # longer serve it anonymously.
+  docker run -d --name "$1" -p "$2:9000" -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin -e MINIO_KMS_SECRET_KEY="$kms_key" "$RB_MINIO_IMAGE" server /data >/dev/null
   containers+=("$1")
 }
 start_minio "$src_name" 19000
@@ -69,7 +73,7 @@ for _ in {1..30}; do
   sleep 1
 done
 (( minio_ready == 1 )) || { echo 'MinIO health checks did not become ready' >&2; exit 1; }
-MC_IMAGE=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+MC_IMAGE=$RB_MINIO_IMAGE
 mc() {
   docker run --rm --network host -v "$work/seed:/seed:ro" --entrypoint /bin/sh "$MC_IMAGE" -c \
     'mc alias set src http://127.0.0.1:19000 minioadmin minioadmin >/dev/null && mc alias set dst http://127.0.0.1:19001 minioadmin minioadmin >/dev/null && mc "$@"' sh "$@"
@@ -87,6 +91,8 @@ mc mb src/source >/dev/null
 mc cp --recursive /seed/ src/source/in/ >/dev/null
 mc cp --attr 'Content-Type=text/x-rust-backup-e2e;origin=rust-backup-e2e' \
   /seed/nested/hello.txt src/source/in/nested/hello.txt >/dev/null
+mc cp --enc-s3 src/source/in/sse/ /seed/sse/secret.txt src/source/in/sse/secret.txt >/dev/null
+mc stat --json src/source/in/sse/secret.txt | grep -Eq '"X-Amz-Server-Side-Encryption": ?"AES256"'
 mc anonymous set download src/source >/dev/null
 before=$(mc ls --recursive --json src/source | sort)
 printf 'MinIO seeded\n' >&2
@@ -116,6 +122,8 @@ after=$(mc ls --recursive --json src/source | sort)
 mc diff --quiet src/source/in/ dst/destination/out/
 mc anonymous get dst/destination | grep -q 'download'
 mc stat --json dst/destination/out/nested/hello.txt | grep -q 'rust-backup-e2e'
+# SSE-S3 survives the copy; the read-back would have refused a decrypted one.
+mc stat --json dst/destination/out/sse/secret.txt | grep -Eq '"X-Amz-Server-Side-Encryption": ?"AES256"'
 
 # A retry with --overwrite must replace existing keys and remove stale keys
 # inside the declared destination prefix before it can be formally verified.
@@ -201,4 +209,4 @@ after_lp=$(mc ls --recursive --json src/source | sort)
 [[ "$before" == "$after_lp" ]]
 printf 'PASS T-IMMUT-S3-LP\n'
 
-printf 'S3 MinIO e2e passed (metadata/policy/key-set read-back, overwrite cleanup, multipart abort cleanup, source immutability, least-privilege run with server-side trace)\n'
+printf 'S3 MinIO e2e passed (metadata/policy/key-set read-back, SSE-S3 preserved, overwrite cleanup, multipart abort cleanup, source immutability, least-privilege run with server-side trace)\n'

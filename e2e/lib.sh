@@ -5,6 +5,14 @@ set -u
 
 RB_E2E_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RB_E2E_BIN=${RUST_BACKUP_BIN:-"$RB_E2E_ROOT/target/release/rust-backup"}
+# MinIO server AND client (`mc` ships in the same image). MinIO withdrew its
+# public images twice: Docker Hub's `minio/minio` (`pull access denied`) and
+# then quay.io (`401 UNAUTHORIZED` on every tag, October 2026). This is
+# Coolify's rebuild of the last community release, pinned by digest so the
+# suite cannot silently pick up a different binary; override it to test
+# another build.
+# shellcheck disable=SC2034  # read by the scripts that source this file
+RB_MINIO_IMAGE=${RUST_BACKUP_MINIO_IMAGE:-ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9}
 
 rb_build_release() {
   if [[ ! -x "$RB_E2E_BIN" ]] || find "$RB_E2E_ROOT/Cargo.toml" "$RB_E2E_ROOT/crates" \
