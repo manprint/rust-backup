@@ -10,17 +10,21 @@
 //! multipart parts, never a staging file or a whole-object buffer.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
 use aws_sdk_s3::Client;
 use aws_types::region::Region;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc;
 
 use rb_core::channel::{ChunkEvent, ChunkSink, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
@@ -40,8 +44,24 @@ const PART_SIZE: usize = 5 * 1024 * 1024;
 const INITIAL_PART_RESERVE: usize = 16 * CHUNK_SIZE;
 const MAX_MULTIPART_PARTS: u64 = 10_000;
 const MAX_S3_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+/// The one server-side encryption mode a copy can reproduce: SSE-S3, whose
+/// keys the provider owns. SSE-KMS names a key that exists in one account and
+/// SSE-C needs the caller's key, so neither is portable.
+const SSE_S3: &str = "AES256";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How many independent S3 requests the module keeps in flight at once: the
+/// source's per-object probes, the destination's stale-key removal and its
+/// read-back.
+///
+/// Every one of them is a network round-trip, and a bucket has as many objects
+/// as it has. Issued one after another, a 1 000 000-object bucket cost roughly
+/// five million *sequential* round-trips across the pre-run fingerprint,
+/// analysis and the post-run fingerprint — days of wall clock spent almost
+/// entirely waiting. The bound keeps that concurrency well inside any provider's
+/// per-connection limits (and MinIO's).
+pub(crate) const REQUEST_CONCURRENCY: usize = 16;
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3Params {
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -66,6 +86,25 @@ pub struct S3Params {
     /// Permit replacement of an existing destination object.
     #[serde(default)]
     pub overwrite: bool,
+}
+
+impl fmt::Debug for S3Params {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Params")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key", &self.access_key)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("path_style", &self.path_style)
+            .field("create_bucket", &self.create_bucket)
+            .field("overwrite", &self.overwrite)
+            .finish()
+    }
 }
 
 /// Self-contained object catalog carried in [`BackupPlan::payload`].
@@ -180,6 +219,30 @@ fn validate_params(params: &S3Params) -> Result<()> {
     Ok(())
 }
 
+/// An AWS SDK failure as a phase-tagged error that says what went wrong.
+///
+/// The SDK's own `Display` names only the error's variant — `service error`,
+/// `dispatch failure` — so `get S3 object "a/b": service error` was all an
+/// operator ever saw of a missing key, a denied request or a refused
+/// connection. [`DisplayErrorContext`] walks the source chain down to the
+/// provider's code and message.
+pub(crate) fn sdk_error<E: std::error::Error>(
+    phase: Phase,
+    context: impl fmt::Display,
+    error: E,
+) -> BackupError {
+    BackupError::phase(phase, format!("{context}: {}", DisplayErrorContext(error)))
+}
+
+/// The HTTP status of a failed request, when a response came back at all.
+pub(crate) fn http_status<E>(
+    error: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
+) -> Option<u16> {
+    error
+        .raw_response()
+        .map(|response| response.status().as_u16())
+}
+
 /// Render at most a few entries of a fault list plus the total, so a preflight
 /// line stays readable for a 200 000-object plan.
 fn summarize(entries: &[String]) -> String {
@@ -211,11 +274,39 @@ async fn create_destination_bucket(client: &Client, params: &S3Params) -> Result
             );
         }
     }
-    request
-        .send()
-        .await
-        .map_err(|e| BackupError::phase(Phase::Apply, format!("create S3 bucket: {e}")))?;
+    request.send().await.map_err(|e| {
+        sdk_error(
+            Phase::Apply,
+            format!("create S3 bucket {:?}", params.bucket),
+            e,
+        )
+    })?;
     Ok(())
+}
+
+/// Whether the destination bucket exists.
+///
+/// Only a 404 means "missing". Any other failure — a 403 from a credential
+/// that may not `HeadBucket`, a refused connection — used to read as missing
+/// too: preflight then promised `create_bucket` a bucket it could never
+/// create, and the run failed at `CreateBucket` after the plan was accepted.
+async fn bucket_exists(client: &Client, bucket: &str, phase: Phase) -> Result<bool> {
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|service| service.is_not_found())
+                || http_status(&error) == Some(404) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(sdk_error(
+            phase,
+            format!("check destination S3 bucket {bucket:?}"),
+            error,
+        )),
+    }
 }
 
 pub(crate) fn unsupported_object_features(object: &S3Object) -> Vec<String> {
@@ -229,7 +320,11 @@ pub(crate) fn unsupported_object_features(object: &S3Object) -> Vec<String> {
         }
     }
     if let Some(mode) = &object.server_side_encryption {
-        unsupported.push(format!("server-side encryption {mode} is not preserved"));
+        if mode != SSE_S3 {
+            unsupported.push(format!(
+                "server-side encryption {mode} is not preserved (only {SSE_S3}, SSE-S3, is)"
+            ));
+        }
     }
     if let Some(expires) = &object.expires {
         // S3 exposes `Expires` as an HTTP date on read but takes a timestamp on
@@ -300,9 +395,7 @@ async fn list_keys(
             .set_continuation_token(token)
             .send()
             .await
-            .map_err(|error| {
-                BackupError::phase(phase, format!("list destination S3 scope: {error}"))
-            })?;
+            .map_err(|error| sdk_error(phase, "list destination S3 scope", error))?;
         for object in page.contents() {
             if let Some(key) = object.key() {
                 keys.insert(key.to_string());
@@ -450,23 +543,29 @@ impl Destination for S3Destination {
     async fn validate(&self, plan: &BackupPlan) -> Result<Preflight> {
         let payload = decode_plan(plan, Phase::Validate)?;
         let client = client(&self.params).await;
-        let exists = client
-            .head_bucket()
-            .bucket(&self.params.bucket)
-            .send()
-            .await
-            .is_ok();
-        let result = Preflight::pass().check(
-            "bucket",
-            exists || self.params.create_bucket,
-            if exists {
-                "destination bucket is accessible"
-            } else if self.params.create_bucket {
-                "destination bucket will be created"
-            } else {
-                "destination bucket is missing; set create_bucket=true to permit creation"
-            },
-        );
+        let (exists, result) =
+            match bucket_exists(&client, &self.params.bucket, Phase::Validate).await {
+                Ok(true) => (
+                    true,
+                    Preflight::pass().check("bucket", true, "destination bucket is accessible"),
+                ),
+                Ok(false) if self.params.create_bucket => (
+                    false,
+                    Preflight::pass().check("bucket", true, "destination bucket will be created"),
+                ),
+                Ok(false) => (
+                    false,
+                    Preflight::pass().check(
+                        "bucket",
+                        false,
+                        "destination bucket is missing; set create_bucket=true to permit creation",
+                    ),
+                ),
+                Err(error) => (
+                    false,
+                    Preflight::pass().check("bucket", false, error.to_string()),
+                ),
+            };
         // The destination never trusts the source's own fidelity gate: the plan
         // arrives over the wire, so every bound the restore relies on is
         // re-checked here, before any byte is applied.
@@ -586,7 +685,9 @@ impl Destination for S3Destination {
                     )
                 } else {
                     format!(
-                        "destination prefix contains stale objects not in the source: {unexpected:?}; use --overwrite to replace the scope"
+                        "destination prefix contains {} stale object(s) not in the source: {}; use --overwrite to replace the scope",
+                        unexpected.len(),
+                        summarize(&unexpected)
                     )
                 },
             );
@@ -597,13 +698,7 @@ impl Destination for S3Destination {
     async fn stream_in(&self, plan: &BackupPlan, source: &mut dyn ChunkSource) -> Result<()> {
         let payload = decode_plan(plan, Phase::Apply)?;
         let client = client(&self.params).await;
-        if client
-            .head_bucket()
-            .bucket(&self.params.bucket)
-            .send()
-            .await
-            .is_err()
-        {
+        if !bucket_exists(&client, &self.params.bucket, Phase::Apply).await? {
             if !self.params.create_bucket {
                 return Err(BackupError::phase(
                     Phase::Apply,
@@ -625,19 +720,38 @@ impl Destination for S3Destination {
                 Phase::Apply,
             )
             .await?;
-            for stale in actual_keys.difference(&expected_keys) {
-                client
-                    .delete_object()
-                    .bucket(&self.params.bucket)
-                    .key(stale)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        BackupError::phase(
-                            Phase::Apply,
-                            format!("remove stale S3 object {stale:?}: {error}"),
-                        )
-                    })?;
+            // Independent requests: one at a time, an --overwrite into a
+            // prefix of 100 000 stale keys was 100 000 sequential round-trips
+            // before the first payload byte.
+            let removals: Vec<_> = actual_keys
+                .difference(&expected_keys)
+                .map(|stale| {
+                    let request = client
+                        .delete_object()
+                        .bucket(&self.params.bucket)
+                        .key(stale);
+                    async move {
+                        request.send().await.map(|_| ()).map_err(|error| {
+                            sdk_error(
+                                Phase::Apply,
+                                format!("remove stale S3 object {stale:?}"),
+                                error,
+                            )
+                        })
+                    }
+                })
+                .collect();
+            let removed = removals.len();
+            stream::iter(removals)
+                .buffer_unordered(REQUEST_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
+            if removed > 0 {
+                tracing::info!(
+                    removed,
+                    bucket = %self.params.bucket,
+                    "removed stale destination objects (--overwrite)"
+                );
             }
         }
         for item in &plan.items {
@@ -661,9 +775,7 @@ impl Destination for S3Destination {
                 .policy(policy)
                 .send()
                 .await
-                .map_err(|e| {
-                    BackupError::phase(Phase::Apply, format!("restore bucket policy: {e}"))
-                })?;
+                .map_err(|e| sdk_error(Phase::Apply, "restore bucket policy", e))?;
         }
         match source.next().await? {
             ChunkEvent::End => Ok(()),
@@ -703,110 +815,77 @@ async fn verify_restored_objects(
     )
     .await?;
     if actual_keys != expected_keys {
+        // The differences, not both whole sets: at 200 000 keys the old message
+        // was megabytes long and hid the handful of keys that mattered.
+        let missing: Vec<_> = expected_keys.difference(&actual_keys).cloned().collect();
+        let extra: Vec<_> = actual_keys.difference(&expected_keys).cloned().collect();
         return Err(BackupError::phase(
             Phase::Verify,
             format!(
-                "restored S3 prefix key set differs: source={expected_keys:?} destination={actual_keys:?}"
+                "restored S3 prefix key set differs: {} missing ({}), {} unexpected ({})",
+                missing.len(),
+                summarize(&missing),
+                extra.len(),
+                summarize(&extra)
             ),
         ));
     }
-    let mut verifier = VerificationSink::new(evidence);
+    let mut reads = Vec::with_capacity(plan.items.len());
     for item in &plan.items {
         let object = payload
             .objects
             .get(item.id as usize)
             .ok_or_else(|| BackupError::phase(Phase::Verify, "plan item has no S3 object"))?;
-        let key = target_key(&payload, params.prefix.as_deref(), &object.key)?;
-        let head = client
-            .head_object()
-            .bucket(&params.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|error| {
-                BackupError::phase(
-                    Phase::Verify,
-                    format!("head restored S3 object {key:?}: {error}"),
-                )
-            })?;
-        let size = head.content_length().unwrap_or(-1).max(0) as u64;
-        let metadata: BTreeMap<_, _> = head
-            .metadata()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let restored = S3Object {
-            key: key.clone(),
-            size,
-            etag: None,
-            content_type: head.content_type().map(str::to_owned),
-            storage_class: None,
-            server_side_encryption: None,
-            metadata: metadata.clone(),
-            content_encoding: head.content_encoding().map(str::to_owned),
-            cache_control: head.cache_control().map(str::to_owned),
-            content_disposition: head.content_disposition().map(str::to_owned),
-            content_language: head.content_language().map(str::to_owned),
-            expires: head.expires_string().map(str::to_owned),
-            website_redirect_location: head.website_redirect_location().map(str::to_owned),
-        };
-        let header_faults: Vec<String> = object
-            .entity_headers()
-            .into_iter()
-            .zip(restored.entity_headers())
-            .filter(|((_, source), (_, destination))| source != destination)
-            .map(|((name, source), (_, destination))| {
-                format!("{name}: source={source:?} destination={destination:?}")
-            })
-            .collect();
-        if size != object.size || metadata != object.metadata || !header_faults.is_empty() {
-            return Err(BackupError::phase(
-                Phase::Verify,
-                format!(
-                    "restored S3 metadata mismatch for {key:?}: bytes={size}/{} metadata_equal={} {}",
-                    object.size,
-                    metadata == object.metadata,
-                    header_faults.join("; ")
-                ),
-            ));
-        }
-
-        let response = client
-            .get_object()
-            .bucket(&params.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|error| {
-                BackupError::phase(
-                    Phase::Verify,
-                    format!("read restored S3 object {key:?}: {error}"),
-                )
-            })?;
-        let mut body = response.body.into_async_read();
-        let mut hasher = blake3::Hasher::new();
-        let mut offset = 0_u64;
-        let mut buffer = vec![0_u8; CHUNK_SIZE];
-        loop {
-            let read = body.read(&mut buffer).await.map_err(|error| {
-                BackupError::phase(
-                    Phase::Verify,
-                    format!("stream restored S3 object {key:?}: {error}"),
-                )
-            })?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            verifier
-                .send_chunk(item.id, offset, &buffer[..read])
-                .await?;
-            offset += read as u64;
-        }
-        let digest = hasher.finalize().to_hex().to_string();
-        verifier.finish_item(item.id, offset, &digest).await?;
+        reads.push((
+            item.id,
+            target_key(&payload, params.prefix.as_deref(), &object.key)?,
+        ));
     }
+
+    // Read the objects back REQUEST_CONCURRENCY at a time; one verifier
+    // consumes what they read. Strictly one object after another, read-back
+    // was a round-trip per object for a bucket of small ones (two, with the
+    // HEAD it used to issue first). The verifier tracks each item on its own,
+    // so interleaved chunks are fine; the channel bound keeps the memory
+    // in flight at REQUEST_CONCURRENCY chunks.
+    let mut verifier = VerificationSink::new(evidence);
+    let (events, mut received) = mpsc::channel::<ReadBack>(REQUEST_CONCURRENCY);
+    //
+    // The reads are made lazily: an unstarted read is an ~11 KiB future, so
+    // building all of them up front cost gigabytes at the item ceiling.
+    let (client, objects, bucket) = (&client, &payload.objects, params.bucket.as_str());
+    let readers = async move {
+        let read = stream::iter(reads)
+            .map(move |(item_id, key)| {
+                // Every id was resolved against the catalog above.
+                let object = &objects[item_id as usize];
+                read_back_object(client, bucket, key, object, item_id, events.clone())
+            })
+            .buffer_unordered(REQUEST_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await;
+        // The stream — and the sender its closure owns — is gone by now, so
+        // the consumer below sees the channel close once the last read ends.
+        read.map(drop)
+    };
+    let consumer = async {
+        while let Some(event) = received.recv().await {
+            match event {
+                ReadBack::Chunk {
+                    item_id,
+                    offset,
+                    data,
+                } => verifier.send_chunk(item_id, offset, &data).await?,
+                ReadBack::End {
+                    item_id,
+                    total,
+                    digest,
+                } => verifier.finish_item(item_id, total, &digest).await?,
+            }
+        }
+        Ok::<_, BackupError>(())
+    };
+    tokio::try_join!(readers, consumer)?;
 
     if let Some(expected_policy) = &payload.policy {
         let actual_policy = client
@@ -814,9 +893,7 @@ async fn verify_restored_objects(
             .bucket(&params.bucket)
             .send()
             .await
-            .map_err(|error| {
-                BackupError::phase(Phase::Verify, format!("read restored S3 policy: {error}"))
-            })?
+            .map_err(|error| sdk_error(Phase::Verify, "read restored S3 policy", error))?
             .policy()
             .map(str::to_owned)
             .ok_or_else(|| BackupError::phase(Phase::Verify, "restored S3 policy is missing"))?;
@@ -856,6 +933,176 @@ async fn verify_restored_objects(
 
     verifier.finish().await?;
     verifier.report("S3 object metadata, policy and GET read-back match")
+}
+
+/// What one read-back reader hands the verifier.
+enum ReadBack {
+    Chunk {
+        item_id: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    End {
+        item_id: u32,
+        total: u64,
+        digest: String,
+    },
+}
+
+/// Read one restored object with a single `GetObject`, check the headers that
+/// came with it against the plan, and stream its body to the verifier.
+async fn read_back_object(
+    client: &Client,
+    bucket: &str,
+    key: String,
+    object: &S3Object,
+    item_id: u32,
+    events: mpsc::Sender<ReadBack>,
+) -> Result<()> {
+    let response = client
+        .get_object()
+        .bucket(bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|error| {
+            sdk_error(
+                Phase::Verify,
+                format!("read restored S3 object {key:?}"),
+                error,
+            )
+        })?;
+    let size = response.content_length().unwrap_or(-1).max(0) as u64;
+    let metadata: BTreeMap<_, _> = response
+        .metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let restored = S3Object {
+        key: key.clone(),
+        size,
+        etag: None,
+        content_type: response.content_type().map(str::to_owned),
+        storage_class: None,
+        server_side_encryption: response
+            .server_side_encryption()
+            .map(|mode| mode.as_str().to_owned()),
+        metadata,
+        content_encoding: response.content_encoding().map(str::to_owned),
+        cache_control: response.cache_control().map(str::to_owned),
+        content_disposition: response.content_disposition().map(str::to_owned),
+        content_language: response.content_language().map(str::to_owned),
+        expires: response.expires_string().map(str::to_owned),
+        website_redirect_location: response.website_redirect_location().map(str::to_owned),
+    };
+    let faults = restored_object_faults(object, &restored);
+    if !faults.is_empty() {
+        return Err(BackupError::phase(
+            Phase::Verify,
+            format!(
+                "restored S3 metadata mismatch for {key:?}: {}",
+                faults.join("; ")
+            ),
+        ));
+    }
+
+    let mut body = response.body.into_async_read();
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0_u64;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    loop {
+        let read = read_full(&mut body, &mut buffer).await.map_err(|error| {
+            BackupError::phase(
+                Phase::Verify,
+                format!("stream restored S3 object {key:?}: {error}"),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        let data = buffer[..read].to_vec();
+        events
+            .send(ReadBack::Chunk {
+                item_id,
+                offset,
+                data,
+            })
+            .await
+            .map_err(|_| verifier_gone())?;
+        offset += read as u64;
+    }
+    events
+        .send(ReadBack::End {
+            item_id,
+            total: offset,
+            digest: hasher.finalize().to_hex().to_string(),
+        })
+        .await
+        .map_err(|_| verifier_gone())
+}
+
+/// The verifier stopped consuming, which it only does after failing; that
+/// failure is the one `try_join!` reports.
+fn verifier_gone() -> BackupError {
+    BackupError::phase(Phase::Verify, "S3 read-back verifier stopped")
+}
+
+/// Every way a restored object's stored description differs from the plan's.
+///
+/// Server-side encryption is compared one way: an object that was SSE-S3 at
+/// the source must be SSE-S3 at the destination, never silently decrypted. An
+/// object without SSE may come back encrypted, because a destination bucket
+/// with default encryption (every AWS bucket since January 2023) applies it to
+/// whatever is stored there.
+fn restored_object_faults(source: &S3Object, restored: &S3Object) -> Vec<String> {
+    let mut faults = Vec::new();
+    if restored.size != source.size {
+        faults.push(format!("bytes={}/{}", restored.size, source.size));
+    }
+    if restored.metadata != source.metadata {
+        faults.push("user metadata differs".to_string());
+    }
+    faults.extend(
+        source
+            .entity_headers()
+            .into_iter()
+            .zip(restored.entity_headers())
+            .filter(|((_, source), (_, restored))| source != restored)
+            .map(|((name, source), (_, restored))| {
+                format!("{name}: source={source:?} destination={restored:?}")
+            }),
+    );
+    if source.server_side_encryption.is_some()
+        && restored.server_side_encryption != source.server_side_encryption
+    {
+        faults.push(format!(
+            "server-side encryption: source={:?} destination={:?}",
+            source.server_side_encryption, restored.server_side_encryption
+        ));
+    }
+    faults
+}
+
+/// Fill `buffer` from `reader` until it is full or the reader is exhausted, and
+/// return how many bytes it holds.
+///
+/// One `read` returns whatever the HTTP body has buffered — typically a few
+/// KiB — so forwarding each read as-is cut a 1 MiB object into hundreds of
+/// wire chunks, each with its own frame header and per-chunk digest.
+pub(crate) async fn read_full<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]).await? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
 }
 
 fn compact_json(value: &serde_json::Value) -> String {
@@ -920,40 +1167,14 @@ async fn restore_object(
     source: &mut dyn ChunkSource,
 ) -> Result<()> {
     ensure_declared_size_matches(key, object, item)?;
-    if item.estimated_bytes == 0 {
-        match source.next().await? {
-            ChunkEvent::ItemEnd {
-                item_id,
-                total,
-                blake3,
-            } if item_id == item.id
-                && total == 0
-                && blake3 == blake3::hash(b"").to_hex().to_string() => {}
-            _ => {
-                return Err(BackupError::phase(
-                    Phase::Apply,
-                    "invalid empty S3 object stream",
-                ))
-            }
-        }
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .set_content_type(object.content_type.clone())
-            .set_content_encoding(object.content_encoding.clone())
-            .set_cache_control(object.cache_control.clone())
-            .set_content_disposition(object.content_disposition.clone())
-            .set_content_language(object.content_language.clone())
-            .set_website_redirect_location(object.website_redirect_location.clone())
-            .set_metadata(Some(object.metadata.clone().into_iter().collect()))
-            .body(ByteStream::from(Vec::new()))
-            .send()
-            .await
-            .map_err(|e| {
-                BackupError::phase(Phase::Apply, format!("put empty S3 object {key:?}: {e}"))
-            })?;
-        return Ok(());
+    if item.estimated_bytes <= PART_SIZE as u64 {
+        // An object that fits one part is one `PutObject`, issued only once the
+        // whole item has arrived and its digest matched. A multipart upload of
+        // it took three round-trips instead of one — the dominant cost of a
+        // bucket of small objects — and stored it under a `<md5>-1` ETag where
+        // the source had a plain MD5.
+        let body = receive_whole_object(item, source).await?;
+        return put_whole_object(client, bucket, key, object, body).await;
     }
     let upload = client
         .create_multipart_upload()
@@ -965,24 +1186,23 @@ async fn restore_object(
         .set_content_disposition(object.content_disposition.clone())
         .set_content_language(object.content_language.clone())
         .set_website_redirect_location(object.website_redirect_location.clone())
+        .set_server_side_encryption(server_side_encryption(object))
         .set_metadata(Some(object.metadata.clone().into_iter().collect()))
         .send()
         .await
-        .map_err(|e| {
-            BackupError::phase(Phase::Apply, format!("start multipart upload {key:?}: {e}"))
-        })?;
+        .map_err(|e| sdk_error(Phase::Apply, format!("start multipart upload {key:?}"), e))?;
     let upload_id = upload
         .upload_id()
         .ok_or_else(|| BackupError::phase(Phase::Apply, "S3 did not return multipart upload id"))?
         .to_owned();
     let mut bytes = 0_u64;
-    let mut expected_offset = 0_u64;
     let mut hasher = blake3::Hasher::new();
     let part_size = part_size_for(item.estimated_bytes);
     // Reserve a bounded amount up front and let the buffer grow: `part_size`
     // is derived from a peer-supplied `estimated_bytes`, and a single
     // `with_capacity(part_size)` on a hostile value aborts the process.
-    let mut part = Vec::with_capacity(part_size.min(INITIAL_PART_RESERVE));
+    let part_reserve = part_size.min(INITIAL_PART_RESERVE);
+    let mut part = Vec::with_capacity(part_reserve);
     let mut parts = Vec::new();
     let mut part_number = 1_i32;
     loop {
@@ -1004,7 +1224,7 @@ async fn restore_object(
                 offset,
                 data,
             } => {
-                if item_id != item.id || offset != expected_offset {
+                if item_id != item.id || offset != bytes {
                     return abort_upload(
                         client,
                         bucket,
@@ -1014,18 +1234,21 @@ async fn restore_object(
                     )
                     .await;
                 }
-                expected_offset += data.len() as u64;
                 bytes += data.len() as u64;
                 hasher.update(&data);
-                part.extend_from_slice(&data);
-                if part.len() >= part_size {
+                let mut rest = data.as_slice();
+                while !rest.is_empty() {
+                    if !fill_part(&mut part, part_size, &mut rest) {
+                        continue;
+                    }
+                    let full = std::mem::replace(&mut part, Vec::with_capacity(part_reserve));
                     if let Err(error) = upload_part(
                         client,
                         bucket,
                         key,
                         &upload_id,
                         part_number,
-                        std::mem::take(&mut part),
+                        full,
                         &mut parts,
                     )
                     .await
@@ -1054,7 +1277,7 @@ async fn restore_object(
                 if item_id != item.id
                     || total != bytes
                     || bytes != item.estimated_bytes
-                    || blake3 != hasher.finalize().to_hex().to_string()
+                    || blake3 != hasher.finalize().to_hex().as_str()
                 {
                     return abort_upload(
                         client,
@@ -1121,10 +1344,123 @@ async fn restore_object(
             bucket,
             key,
             &upload_id,
-            &format!("complete multipart upload {key:?}: {error}"),
+            &format!(
+                "complete multipart upload {key:?}: {}",
+                DisplayErrorContext(error)
+            ),
         )
         .await;
     }
+    Ok(())
+}
+
+/// Move bytes from `rest` into `part` until the part holds exactly
+/// `part_size` bytes or `rest` is empty, and say whether the part is full.
+///
+/// Parts are cut at exactly `part_size`: a chunk that straddles the boundary
+/// used to overshoot the part's capacity and make the buffer reallocate (and
+/// copy) to twice its size.
+fn fill_part(part: &mut Vec<u8>, part_size: usize, rest: &mut &[u8]) -> bool {
+    let take = part_size.saturating_sub(part.len()).min(rest.len());
+    part.extend_from_slice(&rest[..take]);
+    *rest = &rest[take..];
+    part.len() >= part_size
+}
+
+/// The SSE mode to request for a restored object: the source's own, which the
+/// fidelity gate has already narrowed to SSE-S3 or none.
+fn server_side_encryption(object: &S3Object) -> Option<ServerSideEncryption> {
+    object
+        .server_side_encryption
+        .as_deref()
+        .map(ServerSideEncryption::from)
+}
+
+/// Collect one item that fits a single part, checking it exactly as the
+/// multipart path does: contiguous chunks of this item only, never more bytes
+/// than declared (the buffer is sized from the declaration, so a peer cannot
+/// grow it), and a total and digest that match before anything is stored.
+async fn receive_whole_object(item: &PlanItem, source: &mut dyn ChunkSource) -> Result<Vec<u8>> {
+    let declared = item.estimated_bytes;
+    let mut body = Vec::with_capacity(usize::try_from(declared).unwrap_or(PART_SIZE));
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        match source.next().await? {
+            ChunkEvent::Chunk {
+                item_id,
+                offset,
+                data,
+            } => {
+                let end = offset.saturating_add(data.len() as u64);
+                if item_id != item.id || offset != body.len() as u64 || end > declared {
+                    return Err(BackupError::phase(
+                        Phase::Apply,
+                        format!(
+                            "non-contiguous S3 item stream: item {item_id} bytes {offset}..{end} \
+                             (expected item {} at {} of {declared})",
+                            item.id,
+                            body.len()
+                        ),
+                    ));
+                }
+                hasher.update(&data);
+                body.extend_from_slice(&data);
+            }
+            ChunkEvent::ItemEnd {
+                item_id,
+                total,
+                blake3,
+            } => {
+                if item_id != item.id
+                    || total != declared
+                    || body.len() as u64 != declared
+                    || blake3 != hasher.finalize().to_hex().as_str()
+                {
+                    return Err(BackupError::phase(
+                        Phase::Apply,
+                        format!(
+                            "S3 item integrity mismatch: item {} received {} of {declared} bytes",
+                            item.id,
+                            body.len()
+                        ),
+                    ));
+                }
+                return Ok(body);
+            }
+            ChunkEvent::End => {
+                return Err(BackupError::phase(
+                    Phase::Apply,
+                    "stream ended before S3 item completion",
+                ))
+            }
+        }
+    }
+}
+
+async fn put_whole_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    object: &S3Object,
+    body: Vec<u8>,
+) -> Result<()> {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .set_content_type(object.content_type.clone())
+        .set_content_encoding(object.content_encoding.clone())
+        .set_cache_control(object.cache_control.clone())
+        .set_content_disposition(object.content_disposition.clone())
+        .set_content_language(object.content_language.clone())
+        .set_website_redirect_location(object.website_redirect_location.clone())
+        .set_server_side_encryption(server_side_encryption(object))
+        .set_metadata(Some(object.metadata.clone().into_iter().collect()))
+        .content_length(body.len() as i64)
+        .body(ByteStream::from(body))
+        .send()
+        .await
+        .map_err(|e| sdk_error(Phase::Apply, format!("put S3 object {key:?}"), e))?;
     Ok(())
 }
 
@@ -1157,9 +1493,7 @@ async fn upload_part(
         .body(ByteStream::from(data))
         .send()
         .await
-        .map_err(|e| {
-            BackupError::phase(Phase::Apply, format!("upload multipart part {number}: {e}"))
-        })?;
+        .map_err(|e| sdk_error(Phase::Apply, format!("upload multipart part {number}"), e))?;
     let etag = output
         .e_tag()
         .ok_or_else(|| BackupError::phase(Phase::Apply, "S3 did not return multipart part ETag"))?;
@@ -1190,7 +1524,7 @@ async fn abort_upload<T>(
         // The primary failure is what the operator must act on, but a failed
         // abort leaves billed parts behind and must not be silent.
         tracing::error!(
-            %error,
+            error = %DisplayErrorContext(error),
             bucket,
             key,
             upload_id,
@@ -1485,5 +1819,299 @@ mod tests {
             .permission(aws_sdk_s3::types::Permission::FullControl)
             .build();
         assert!(acl_is_owner_only_full_control(Some(""), &[minio_default]));
+    }
+
+    /// Replays a fixed list of events, then `End`.
+    struct Scripted(std::collections::VecDeque<ChunkEvent>);
+
+    #[async_trait]
+    impl ChunkSource for Scripted {
+        async fn next(&mut self) -> Result<ChunkEvent> {
+            Ok(self.0.pop_front().unwrap_or(ChunkEvent::End))
+        }
+    }
+
+    fn chunk(item_id: u32, offset: u64, data: &[u8]) -> ChunkEvent {
+        ChunkEvent::Chunk {
+            item_id,
+            offset,
+            data: data.to_vec(),
+        }
+    }
+
+    fn item_end(item_id: u32, data: &[u8]) -> ChunkEvent {
+        ChunkEvent::ItemEnd {
+            item_id,
+            total: data.len() as u64,
+            blake3: blake3::hash(data).to_hex().to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whole_object_is_collected_only_when_its_digest_matches() {
+        let mut source = Scripted(
+            [
+                chunk(3, 0, b"hello "),
+                chunk(3, 6, b"world"),
+                item_end(3, b"hello world"),
+            ]
+            .into(),
+        );
+        let body = receive_whole_object(&plan_item(3, 11), &mut source)
+            .await
+            .expect("a contiguous, matching item is accepted");
+        assert_eq!(body, b"hello world");
+
+        let mut empty = Scripted([item_end(4, b"")].into());
+        assert!(receive_whole_object(&plan_item(4, 0), &mut empty)
+            .await
+            .expect("an empty object is one ItemEnd")
+            .is_empty());
+
+        let mut corrupted =
+            Scripted([chunk(3, 0, b"hello world"), item_end(3, b"HELLO WORLD")].into());
+        let error = receive_whole_object(&plan_item(3, 11), &mut corrupted)
+            .await
+            .expect_err("a digest mismatch must not reach PutObject");
+        assert!(error.to_string().contains("integrity mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_object_never_grows_past_its_declared_size() {
+        let mut oversized = Scripted([chunk(1, 0, b"0123"), chunk(1, 4, b"4567")].into());
+        let error = receive_whole_object(&plan_item(1, 5), &mut oversized)
+            .await
+            .expect_err("bytes beyond the declaration are refused as they arrive");
+        assert!(error.to_string().contains("non-contiguous"), "{error}");
+
+        for script in [
+            vec![chunk(1, 1, b"x")],
+            vec![chunk(2, 0, b"x")],
+            vec![chunk(1, 0, b"x")],
+        ] {
+            let mut source = Scripted(script.into());
+            assert!(
+                receive_whole_object(&plan_item(1, 2), &mut source)
+                    .await
+                    .is_err(),
+                "a gap, a foreign item or an early End is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parts_are_cut_at_exactly_the_part_size() {
+        let part_size = 10;
+        let mut part = Vec::with_capacity(part_size);
+        let mut parts = Vec::new();
+        for chunk in [&[1_u8; 7][..], &[2; 7], &[3; 13], &[4; 1]] {
+            let mut rest = chunk;
+            while !rest.is_empty() {
+                if fill_part(&mut part, part_size, &mut rest) {
+                    assert_eq!(part.capacity(), part_size, "a part never reallocates");
+                    parts.push(std::mem::replace(&mut part, Vec::with_capacity(part_size)));
+                }
+            }
+        }
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.len() == part_size));
+        assert_eq!(part.len(), 8, "the remainder stays for the last part");
+        let joined: Vec<u8> = parts.concat().into_iter().chain(part).collect();
+        let expected: Vec<u8> = [vec![1; 7], vec![2; 7], vec![3; 13], vec![4; 1]].concat();
+        assert_eq!(joined, expected, "no byte is lost or reordered at a cut");
+    }
+
+    #[tokio::test]
+    async fn read_full_fills_the_buffer_across_short_reads() {
+        let data: Vec<u8> = (0..=255).collect();
+        let mut reader = tokio_test_reader(&data, 7);
+        let mut buffer = [0_u8; 100];
+        assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 100);
+        assert_eq!(&buffer[..], &data[..100]);
+        assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 100);
+        assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 56);
+        assert_eq!(&buffer[..56], &data[200..]);
+        assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 0);
+    }
+
+    /// A reader that returns at most `step` bytes per read, as an HTTP body does.
+    fn tokio_test_reader(data: &[u8], step: usize) -> impl AsyncRead + Unpin {
+        struct Trickle {
+            data: Vec<u8>,
+            position: usize,
+            step: usize,
+        }
+        impl AsyncRead for Trickle {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let n = self
+                    .step
+                    .min(self.data.len() - self.position)
+                    .min(buf.remaining());
+                let start = self.position;
+                buf.put_slice(&self.data[start..start + n]);
+                self.position += n;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        Trickle {
+            data: data.to_vec(),
+            position: 0,
+            step,
+        }
+    }
+
+    #[test]
+    fn sse_s3_is_restorable_and_other_modes_are_not() {
+        let encrypted = S3Object {
+            server_side_encryption: Some("AES256".into()),
+            ..object("k", 1)
+        };
+        assert!(unsupported_object_features(&encrypted).is_empty());
+        for mode in ["aws:kms", "aws:kms:dsse"] {
+            let kms = S3Object {
+                server_side_encryption: Some(mode.into()),
+                ..object("k", 1)
+            };
+            let faults = unsupported_object_features(&kms).join(" ");
+            assert!(
+                faults.contains(mode) && faults.contains("not preserved"),
+                "{faults}"
+            );
+        }
+        assert_eq!(
+            server_side_encryption(&encrypted),
+            Some(ServerSideEncryption::Aes256)
+        );
+        assert_eq!(server_side_encryption(&object("k", 1)), None);
+    }
+
+    #[test]
+    fn read_back_never_accepts_a_decrypted_copy() {
+        let plain = object("k", 3);
+        let encrypted = S3Object {
+            server_side_encryption: Some("AES256".into()),
+            ..plain.clone()
+        };
+        assert!(restored_object_faults(&encrypted, &encrypted).is_empty());
+        let faults = restored_object_faults(&encrypted, &plain).join(" ");
+        assert!(faults.contains("server-side encryption"), "{faults}");
+        // A destination bucket that encrypts by default may encrypt a copy of
+        // a plain object: that is not a loss.
+        assert!(restored_object_faults(&plain, &encrypted).is_empty());
+    }
+
+    #[test]
+    fn read_back_names_every_differing_field() {
+        let source = S3Object {
+            content_type: Some("text/plain".into()),
+            metadata: BTreeMap::from([("origin".into(), "e2e".into())]),
+            ..object("k", 3)
+        };
+        let restored = S3Object {
+            size: 2,
+            content_type: Some("binary/octet-stream".into()),
+            ..object("k", 3)
+        };
+        let faults = restored_object_faults(&source, &restored).join("; ");
+        assert!(faults.contains("bytes=2/3"), "{faults}");
+        assert!(faults.contains("user metadata differs"), "{faults}");
+        assert!(faults.contains("content-type"), "{faults}");
+    }
+
+    #[test]
+    fn s3_params_debug_never_prints_the_secret_key() {
+        let params: S3Params = serde_json::from_value(serde_json::json!({
+            "bucket": "b",
+            "access_key": "AKIAEXAMPLE",
+            "secret_key": "wJalrXUtnFEMI-very-secret",
+        }))
+        .unwrap();
+        let rendered = format!("{params:?}");
+        assert!(!rendered.contains("very-secret"), "{rendered}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+    }
+
+    #[test]
+    fn a_policy_read_fails_unless_the_policy_is_absent_or_unreadable() {
+        use source::{policy_error_kind, PolicyError};
+        assert_eq!(
+            policy_error_kind(Some("NoSuchBucketPolicy"), Some(404)),
+            PolicyError::Absent
+        );
+        assert!(matches!(
+            policy_error_kind(Some("AccessDenied"), Some(403)),
+            PolicyError::Unreadable(_)
+        ));
+        assert!(matches!(
+            policy_error_kind(None, Some(501)),
+            PolicyError::Unreadable(_)
+        ));
+        // Transient and unknown failures must never read as "no policy": that
+        // dropped the policy from the plan, or faked a source mutation.
+        for (code, status) in [
+            (Some("SlowDown"), Some(503)),
+            (Some("InternalError"), Some(500)),
+            (Some("NoSuchBucket"), Some(404)),
+            (None, None),
+        ] {
+            assert_eq!(policy_error_kind(code, status), PolicyError::Failed);
+        }
+    }
+
+    #[test]
+    fn plan_items_carry_no_second_copy_of_the_catalog() {
+        let params: S3Params = serde_json::from_value(serde_json::json!({"bucket": "b"})).unwrap();
+        let plan = source::build_plan(
+            &params,
+            vec![object("a", 1), object("b", 2)],
+            None,
+            "2026-10-21T00:00:00Z".into(),
+        )
+        .unwrap();
+        assert_eq!(plan.estimated_bytes, 3);
+        for (index, item) in plan.items.iter().enumerate() {
+            assert_eq!(item.id as usize, index, "an item id indexes the catalog");
+            assert!(item.meta.is_null());
+            assert!(item.expects_data());
+        }
+        let payload = decode_plan(&plan, Phase::Validate).unwrap();
+        assert_eq!(payload.objects[1].key, "b");
+    }
+
+    /// The S3 plan is the fattest plan shape; at the item ceiling, with keys
+    /// and headers as a real bucket has them, it must still fit the plan frame.
+    #[test]
+    fn an_s3_plan_at_the_item_ceiling_fits_the_plan_frame() {
+        let params: S3Params = serde_json::from_value(serde_json::json!({
+            "bucket": "warehouse-events",
+            "prefix": "warehouse/events/"
+        }))
+        .unwrap();
+        let objects: Vec<S3Object> = (0..rb_core::channel::MAX_PLAN_ITEMS)
+            .map(|i| S3Object {
+                etag: Some("\"9bb58f26192e4ba00f01e2e7b136bbd8\"".into()),
+                content_type: Some("application/octet-stream".into()),
+                storage_class: Some("STANDARD".into()),
+                server_side_encryption: Some("AES256".into()),
+                ..object(
+                    &format!("warehouse/events/2026/09/22/part-{i:06}.parquet"),
+                    1_234_567,
+                )
+            })
+            .collect();
+        let plan =
+            source::build_plan(&params, objects, None, "2026-10-21T00:00:00Z".into()).unwrap();
+        rb_core::channel::validate_plan_bounds(&plan).unwrap();
+        let encoded = serde_json::to_vec(&plan).unwrap().len();
+        assert!(
+            encoded <= rb_core::wire::PLAN_FRAME_LIMIT,
+            "an S3 plan of {} objects encodes to {encoded} bytes, past PLAN_FRAME_LIMIT {}",
+            rb_core::channel::MAX_PLAN_ITEMS,
+            rb_core::wire::PLAN_FRAME_LIMIT
+        );
     }
 }

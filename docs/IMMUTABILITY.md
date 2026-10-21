@@ -138,7 +138,7 @@ backend:
 |--------|----------------|----------------------|----------|
 | PostgreSQL | the structural catalog (planner estimates normalized out) plus, per data-bearing table, the row count and an order-independent 128-bit commitment (the wrapping sum of `md5(row)`); prefix `rust-backup/pg-fingerprint/v2` | one full read of every table, streamed and folded client-side — no server sort, no temporary file | `SourceMutated`, exit `6`; a destination that already applied the payload drops the databases it created |
 | MongoDB | per collection: `count_documents` and an `_id`-ordered content checksum, plus the catalog; prefix `rust-backup/mongo-fingerprint/v1` | one full read of every collection | `SourceMutated`, exit `6` |
-| S3 | the object listing (key, size, etag, metadata) and the bucket policy; prefix `rust-backup/s3-fingerprint/v2` | one listing; object bodies are not re-read | `SourceMutated`, exit `6` |
+| S3 | the object listing (key, size, etag, metadata) and the bucket policy; prefix `rust-backup/s3-fingerprint/v2` | one listing (the analysis reuses the pre-run one); object bodies are not re-read, but every `GetObject` carries `If-Match` with the planned ETag | `SourceMutated`, exit `6` |
 | Filesystem | per entry: path, kind, size, mode, uid, gid, mtime (with nanoseconds), link target, hardlink target, device number, and the file's contents | one full read of the tree — so a run reads the source three times in total (baseline, stream, audit), which is the dominant cost on large trees | `SourceMutated`, exit `6` |
 
 Two properties matter as much as the content:
@@ -248,8 +248,11 @@ unsupported action and authorizes `GetObjectAcl` under `s3:GetObject`; that
 5-action policy is what `rb_minio_readonly_policy` in `e2e/lib.sh` installs for
 T-IMMUT-S3-LP, which then reads MinIO's own API trace back and checks that the
 same credential is refused a write. Losing `s3:GetBucketPolicy` is tolerated by
-the tool — the plan simply records no policy — which makes it a silent fidelity
-loss, so it belongs in the recipe. Pass the keys through
+the tool — the plan records no policy and a `WARN` line says why — which makes
+it a fidelity loss, so it belongs in the recipe. Only a 403 (or a provider that
+does not implement policies) is tolerated: any other failure to read the policy
+fails the run, so neither the plan nor the post-run fingerprint ever reads a
+transient error as "no policy". Pass the keys through
 `RUST_BACKUP_ACCESS_KEY` / `RUST_BACKUP_SECRET_KEY`, never as flags.
 
 ### Filesystem
