@@ -157,6 +157,38 @@ over paths, metadata, link targets and contents. The vector list, the
 fingerprint contract and the access-time rule are in
 [docs/IMMUTABILITY.md](../IMMUTABILITY.md).
 
+### Reading a tree that changes under the run
+
+The plan is the walk's record of the tree, and the tree can change before a
+file is read. The source therefore opens every planned file **below the root
+without following a symlink anywhere on its path**: each directory is opened
+from the one before it with `O_NOFOLLOW`, and the file itself with
+`O_NOFOLLOW | O_NONBLOCK`, then checked to still be a regular file. Opening
+`root/path` by name would follow a directory swapped for a link
+(`a -> /root`) and stream a file from outside the declared root — and the
+closing fingerprint only notices after the bytes have left. Such a swap, a
+symlink or FIFO put in place of a file (a FIFO would otherwise block the open
+forever, waiting for a writer), and a file that vanished all fail the run,
+naming the path:
+
+```text
+[Transfer] /srv/data/a/f is no longer a regular file below the root (it, or a
+directory on its path, changed type since the tree was walked)
+```
+
+A file that grows is refused at the first byte past its planned size —
+`source file grew while streaming: <path>` — instead of after streaming however
+much it grew; one that shrinks fails with `source file changed size while
+streaming`. The fingerprint reads through the same opener, so the audit reads
+exactly the objects the transfer reads. The root itself is resolved normally: a
+symlinked source root is followed, as the operator named it.
+
+Files are read by one blocking thread in full 1 MiB wire chunks, at most four
+chunks ahead of the sink, and hashed there; a slow source filesystem stalls the
+item, never a runtime worker (and with it the transport heartbeats). A sink
+waiting on a full transport window fills that queue and stops the reader, so
+backpressure still reaches the disk.
+
 **What that costs.** The fingerprint hashes every file's full contents, and it
 runs twice — before the transfer and after it. A backup therefore reads the
 source tree **three times**: once for the baseline, once to stream it, once to
@@ -197,6 +229,14 @@ certify a tree whose contents had been rewritten in place.
   and I-IMMUT requires it on both sides of the run — including a run that
   failed. Budget roughly three times the tree's size in source reads, and note
   that the destination read-back adds a fourth full read on its own side.
+- **The walk itself reads by path.** File contents are opened without
+  following any symlink below the root (see "Reading a tree that changes under
+  the run"), but the directory listing and `lstat` metadata of the walk are
+  path-based: a directory swapped for a link *during the walk* is listed through
+  that link, so the plan can carry names and metadata (never contents) from
+  outside the root. The read of any such file then fails the run, and the
+  closing fingerprint reports the drift. Back up trees whose directories
+  untrusted users cannot rename while the run is in progress.
 - Unix sockets are refused while analyzing (see "What is preserved"). FIFOs and
   device nodes round-trip, devices only where the destination has root or
   `CAP_MKNOD`.
@@ -210,8 +250,8 @@ certify a tree whose contents had been rewritten in place.
 
 - **I-IMMUT**: the source tree is opened read-only; the module computes a tree
   fingerprint (path + metadata + content hash) before and after and asserts equality.
-- **I-NOTEMP**: files stream in 64 KiB reads straight into the channel; nothing is
-  copied to a staging directory.
+- **I-NOTEMP**: files stream in full 1 MiB chunks straight into the channel, at
+  most four chunks read ahead; nothing is copied to a staging directory.
 - An item is published directly at its final path, but its active file is removed
   on EOF, Abort, integrity failure, write error, or ENOSPC; a truncated active
   file is never left looking committed.

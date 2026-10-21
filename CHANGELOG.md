@@ -14,6 +14,33 @@
   each catalog collection is fed by exactly one item, and nothing else is in the
   plan; apply and verify re-check it before acting. Source-built plans of every
   version satisfy it.
+- **Fixed: a filesystem source could stream a file from outside its root.** The
+  source opened each planned file as `root/path`, which follows every symlink
+  on the path. A directory swapped for a link (`a -> /root`) between the walk
+  and the read — by anyone able to rename inside the source tree — streamed the
+  link's target to the destination, and the closing fingerprint only reported
+  the drift after the bytes had left. Every component below the root is now
+  opened with `O_NOFOLLOW` from the one before it, and the file must still be a
+  regular file; a swapped-in symlink or directory link fails the run naming the
+  path. The fingerprint reads through the same opener.
+
+### Filesystem
+
+- **Fixed: a FIFO put in place of a planned file hung the source forever.** A
+  plain `open` of a FIFO waits for a writer. Files are now opened with
+  `O_NONBLOCK` and refused unless they are still regular files.
+- **Fixed: a file that grew while streaming was read to its new end before the
+  run failed.** It is now refused at the first byte past its planned size
+  (`source file grew while streaming`).
+- **Faster, and off the runtime.** Files stream in full 1 MiB wire chunks
+  instead of one chunk per 64 KiB read (16x fewer frames, chunk hashes and
+  destination writes), read and hashed by one blocking thread that runs at most
+  four chunks ahead of the sink with recycled buffers. A slow source filesystem
+  no longer stalls a runtime worker, and the transport heartbeats with it.
+  Backpressure is unchanged: a full transport window stops the reader. The
+  fingerprint reuses one 1 MiB buffer instead of allocating per read, and the
+  plan payload is no longer cloned before it is decoded.
+- Read errors name the file and the caller's phase.
 
 ### MongoDB
 

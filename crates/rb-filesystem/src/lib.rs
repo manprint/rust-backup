@@ -353,7 +353,8 @@ mod tests {
         let source = FilesystemSource {
             params: params(&root),
         };
-        for pass in ["fingerprint", "analyze"] {
+        let plan = source.analyze().await.unwrap();
+        for pass in ["fingerprint", "analyze", "stream_out"] {
             let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = Arc::clone(&ran);
             let other = tokio::spawn(async move {
@@ -362,6 +363,12 @@ mod tests {
             match pass {
                 "fingerprint" => {
                     source.fingerprint().await.unwrap();
+                }
+                "stream_out" => {
+                    source
+                        .stream_out(&plan, &mut RecordingSink::default())
+                        .await
+                        .unwrap();
                 }
                 _ => {
                     source.analyze().await.unwrap();
@@ -383,25 +390,41 @@ mod tests {
         // The test process owns the file it just created, so `O_NOATIME` is
         // permitted and nothing falls back.
         let root = tempdir("noatime-owner");
-        let file = root.join("f");
-        fs::write(&file, b"x").unwrap();
-        let reader = crate::source::NoAtimeReader::open(&file, false, Phase::Analyze);
-        assert!(reader.is_ok(), "owner open must succeed");
+        fs::write(root.join("f"), b"x").unwrap();
+        let mut tree = crate::source::Tree::open(&root, false, Phase::Analyze).unwrap();
+        assert!(tree.open_file("f").is_ok(), "owner open must succeed");
         fs::remove_dir_all(&root).ok();
+    }
+
+    fn root_fd(root: &Path) -> std::os::fd::OwnedFd {
+        nix::fcntl::open(
+            root,
+            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap()
     }
 
     #[test]
     fn noatime_eperm_is_refused_without_flag() {
+        use std::os::fd::AsFd;
         let root = tempdir("noatime-eperm");
         let file = root.join("f");
         fs::write(&file, b"x").unwrap();
+        let dir = root_fd(&root);
         let mut attempts = 0;
-        let error =
-            crate::source::NoAtimeReader::open_with(&file, false, Phase::Analyze, |_, _| {
+        let error = crate::source::NoAtimeReader::open_at_with(
+            dir.as_fd(),
+            std::ffi::OsStr::new("f"),
+            &file,
+            false,
+            Phase::Analyze,
+            |_, _, _| {
                 attempts += 1;
                 Err(nix::errno::Errno::EPERM)
-            })
-            .expect_err("EPERM without the flag must fail the run");
+            },
+        )
+        .expect_err("EPERM without the flag must fail the run");
         assert_eq!(attempts, 1, "the refusal must not retry without O_NOATIME");
         let text = error.to_string();
         assert!(text.contains("without updating its access time"), "{text}");
@@ -412,21 +435,35 @@ mod tests {
 
     #[test]
     fn noatime_eperm_falls_back_with_flag() {
+        use std::os::fd::AsFd;
         let root = tempdir("noatime-accepted");
         let file = root.join("f");
         fs::write(&file, b"payload").unwrap();
+        let dir = root_fd(&root);
         let mut flags_seen = Vec::new();
-        let reader =
-            crate::source::NoAtimeReader::open_with(&file, true, Phase::Transfer, |path, flags| {
+        let reader = crate::source::NoAtimeReader::open_at_with(
+            dir.as_fd(),
+            std::ffi::OsStr::new("f"),
+            &file,
+            true,
+            Phase::Transfer,
+            |dir, name, flags| {
                 flags_seen.push(flags);
                 if flags.contains(nix::fcntl::OFlag::O_NOATIME) {
                     return Err(nix::errno::Errno::EPERM);
                 }
-                nix::fcntl::open(path, flags, nix::sys::stat::Mode::empty())
-            });
-        assert!(reader.is_ok(), "the flag must allow the plain open");
+                nix::fcntl::openat(dir, name, flags, nix::sys::stat::Mode::empty())
+            },
+        );
+        let mut reader = reader.expect("the flag must allow the plain open");
         assert_eq!(flags_seen.len(), 2, "one O_NOATIME attempt, one fallback");
         assert!(!flags_seen[1].contains(nix::fcntl::OFlag::O_NOATIME));
+        assert!(
+            flags_seen[1].contains(nix::fcntl::OFlag::O_NOFOLLOW),
+            "the fallback must keep refusing symlinks"
+        );
+        let mut buf = [0_u8; 16];
+        assert_eq!(reader.fill(&mut buf).unwrap(), 7, "and the file reads");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -474,10 +511,9 @@ mod tests {
         assert_eq!(plan.items.len(), 2, "only unique regular files carry bytes");
         let mut sink = RecordingSink::default();
         source.stream_out(&plan, &mut sink).await.unwrap();
-        assert!(sink
-            .chunks
-            .iter()
-            .all(|(_, _, bytes)| bytes.len() <= 64 * 1024));
+        // 64 KiB + 19 bytes travels as one chunk: the reader fills whole wire
+        // chunks instead of sending each read.
+        assert_eq!(sink.chunks.len(), 1, "one non-empty file, one chunk");
         assert_eq!(sink.completed.len(), 2);
         assert_eq!(
             sink.completed
@@ -487,6 +523,216 @@ mod tests {
             64 * 1024 + 19
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- source reads: chunking and the tree changing under them ------------
+
+    async fn plan_of(root: &Path) -> (FilesystemSource, BackupPlan) {
+        let source = FilesystemSource {
+            params: params(root),
+        };
+        let plan = source.analyze().await.unwrap();
+        (source, plan)
+    }
+
+    /// Stream with a deadline: a regression that blocks (a FIFO open waiting
+    /// for a writer) must fail the test, not hang it.
+    async fn stream(source: &FilesystemSource, plan: &BackupPlan) -> (RecordingSink, Result<()>) {
+        let mut sink = RecordingSink::default();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.stream_out(plan, &mut sink),
+        )
+        .await
+        .expect("stream_out must not block");
+        (sink, result)
+    }
+
+    fn streamed_bytes(sink: &RecordingSink) -> Vec<u8> {
+        sink.chunks
+            .iter()
+            .flat_map(|(_, _, bytes)| bytes.iter().copied())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_large_file_streams_in_full_wire_chunks() {
+        use rb_core::wire::CHUNK_SIZE;
+        let root = tempdir("full-chunks");
+        let data: Vec<u8> = (0..(2 * CHUNK_SIZE + CHUNK_SIZE / 2))
+            .map(|n| (n % 253) as u8)
+            .collect();
+        fs::write(root.join("big"), &data).unwrap();
+        let (source, plan) = plan_of(&root).await;
+        let (sink, result) = stream(&source, &plan).await;
+        result.unwrap();
+        let shape: Vec<(u64, usize)> = sink
+            .chunks
+            .iter()
+            .map(|(_, offset, bytes)| (*offset, bytes.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, CHUNK_SIZE),
+                (CHUNK_SIZE as u64, CHUNK_SIZE),
+                (2 * CHUNK_SIZE as u64, CHUNK_SIZE / 2)
+            ]
+        );
+        assert_eq!(streamed_bytes(&sink), data);
+        assert_eq!(
+            sink.completed,
+            [(
+                1,
+                data.len() as u64,
+                blake3::hash(&data).to_hex().to_string()
+            )]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A file that grows after the walk (a live log) is refused at the first
+    /// byte past its planned size, not after streaming however much it grew.
+    #[tokio::test]
+    async fn a_growing_file_is_refused_before_its_extra_bytes_are_sent() {
+        let root = tempdir("grows");
+        fs::write(root.join("log"), b"0123456789").unwrap();
+        let (source, plan) = plan_of(&root).await;
+        fs::write(root.join("log"), vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let (sink, result) = stream(&source, &plan).await;
+        let error = result.expect_err("a grown file must be refused");
+        assert!(
+            error.to_string().contains("grew while streaming"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("[Transfer]"), "{error}");
+        assert!(
+            streamed_bytes(&sink).len() <= 10,
+            "nothing past the planned size may be sent"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The walk records a regular file; a symlink swapped in before the read
+    /// must not stream its target — a file outside the declared root.
+    #[tokio::test]
+    async fn a_file_swapped_for_a_symlink_is_never_followed() {
+        let root = tempdir("swap-file");
+        let outside = tempdir("swap-file-outside");
+        fs::write(outside.join("secret"), b"SECRET").unwrap();
+        fs::write(root.join("f"), b"public").unwrap();
+        let (source, plan) = plan_of(&root).await;
+        fs::remove_file(root.join("f")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("f")).unwrap();
+        let (sink, result) = stream(&source, &plan).await;
+        let error = result.expect_err("a swapped-in symlink must be refused");
+        assert!(
+            error.to_string().contains("no longer a regular file"),
+            "{error}"
+        );
+        assert!(sink.chunks.is_empty(), "the link target must not be read");
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    /// The same through a directory on the path: `root.join(path)` would
+    /// follow `a -> /outside` and stream `/outside/f`.
+    #[tokio::test]
+    async fn a_directory_swapped_for_a_symlink_is_never_followed() {
+        let root = tempdir("swap-dir");
+        let outside = tempdir("swap-dir-outside");
+        fs::write(outside.join("f"), b"SECRET").unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::write(root.join("a/f"), b"public").unwrap();
+        let (source, plan) = plan_of(&root).await;
+        fs::rename(root.join("a"), root.join("a.orig")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a")).unwrap();
+        let (sink, result) = stream(&source, &plan).await;
+        let error = result.expect_err("a swapped-in directory link must be refused");
+        assert!(
+            error.to_string().contains("no longer a regular file"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("a/f"), "the path: {error}");
+        assert!(
+            sink.chunks.is_empty(),
+            "nothing outside the root may be read"
+        );
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(outside).ok();
+    }
+
+    /// A FIFO swapped in for a file would block a plain `open` until some
+    /// writer appeared — forever, holding the run.
+    #[tokio::test]
+    async fn a_file_swapped_for_a_fifo_is_refused_without_blocking() {
+        let root = tempdir("swap-fifo");
+        fs::write(root.join("f"), b"data").unwrap();
+        let (source, plan) = plan_of(&root).await;
+        fs::remove_file(root.join("f")).unwrap();
+        nix::unistd::mkfifo(
+            &root.join("f"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let (sink, result) = stream(&source, &plan).await;
+        let error = result.expect_err("a FIFO in place of a file must be refused");
+        assert!(
+            error.to_string().contains("no longer a regular file"),
+            "{error}"
+        );
+        assert!(sink.chunks.is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_vanished_file_names_its_path_and_phase() {
+        let root = tempdir("vanished");
+        fs::create_dir(root.join("d")).unwrap();
+        fs::write(root.join("d/gone"), b"data").unwrap();
+        let (source, plan) = plan_of(&root).await;
+        fs::remove_file(root.join("d/gone")).unwrap();
+        let (_, result) = stream(&source, &plan).await;
+        let error = result
+            .expect_err("a vanished file must fail the run")
+            .to_string();
+        assert!(error.contains("d/gone"), "{error}");
+        assert!(error.contains("[Transfer]"), "{error}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The sink's failure is the run's error, and the reader thread — which
+    /// may be blocked on the full channel — is stopped and joined before
+    /// `stream_out` returns.
+    #[tokio::test]
+    async fn a_failed_sink_stops_the_reader_and_reports_its_own_error() {
+        struct FailingSink;
+        #[async_trait]
+        impl ChunkSink for FailingSink {
+            async fn send_chunk(&mut self, _: u32, _: u64, _: &[u8]) -> Result<()> {
+                Err(BackupError::phase(Phase::Transfer, "sink is gone"))
+            }
+            async fn finish_item(&mut self, _: u32, _: u64, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let root = tempdir("failing-sink");
+        for index in 0..32 {
+            fs::write(root.join(format!("f{index:02}")), vec![1_u8; 300 * 1024]).unwrap();
+        }
+        let (source, plan) = plan_of(&root).await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            source.stream_out(&plan, &mut FailingSink),
+        )
+        .await
+        .expect("a failed sink must stop the reader, not wait on it")
+        .expect_err("the sink's failure must fail the stream");
+        assert!(error.to_string().contains("sink is gone"), "{error}");
+        fs::remove_dir_all(root).ok();
     }
 
     // --- destination TOCTOU (§ 5.4) -----------------------------------------
