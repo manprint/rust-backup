@@ -24,6 +24,28 @@
   re-introspection outright. Only the planned collections are read back now,
   and a mismatch names each collection and what differs (missing, options,
   indexes) instead of `catalog mismatch for database …`.
+- **Documents travel as raw BSON.** The source forwarded each document by
+  decoding it into a map and re-encoding it, and the destination did the same
+  again before inserting — the dominant CPU cost of a run, and a silent loss
+  for a document with duplicate field names (the map merged them, and
+  verification agreed because both sides merged them the same way). Bytes now
+  pass through untouched. Every ordinary document encodes identically to what
+  0.1.0 re-encodes (pinned by a test over every BSON type), so mixed-version
+  pairs still verify; a duplicate-field document with an older peer now fails
+  verification instead of losing a value.
+- **Fixed: restore batches were bounded by count only** — up to 1000
+  documents of up to 16 MiB each, about 16 GiB of destination memory. A batch
+  now closes at 10 000 documents or 8 MiB.
+- **Faster restore.** The next batch is received and cut while the previous one
+  is inserted, one insert in flight and one batch waiting, so the network and
+  the server work at the same time. A failed transfer still waits for the
+  insert in flight before cleaning up, and a failed insert stops the reader at
+  once.
+- **The fingerprint scans each collection once.** It ran `count_documents` and
+  then a full scan per collection, twice per run; the count now comes from the
+  scan, and each audit opens one connection instead of two.
+- The source sends one reused 1 MiB buffer per item instead of allocating a
+  chunk per send.
 
 ### S3
 

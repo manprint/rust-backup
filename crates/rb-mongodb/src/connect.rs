@@ -8,7 +8,7 @@
 //! source code paths issuing only `find`/`count`/`list*` (never a write).
 
 use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{doc, Document, RawDocumentBuf};
 use mongodb::options::{
     ClientOptions, Credential, FindOptions, ReadConcern, ReadPreference, SelectionCriteria,
     ServerAddress,
@@ -192,24 +192,20 @@ impl ReadOnlyDatabase {
             .map_err(driver_error)
     }
 
+    /// A cursor over the documents exactly as the server stores them. Raw
+    /// rather than decoded: decoding into a `Document` and re-encoding cost the
+    /// most CPU of a run and silently merged a document's duplicate field names
+    /// (a `Document` is a map), so the copy — and its digest — lost one value.
     pub(crate) async fn find(
         &self,
         collection: &str,
         filter: Document,
         options: Option<FindOptions>,
-    ) -> Result<Cursor<Document>> {
+    ) -> Result<Cursor<RawDocumentBuf>> {
         self.inner
-            .collection::<Document>(collection)
+            .collection::<RawDocumentBuf>(collection)
             .find(filter)
             .with_options(options)
-            .await
-            .map_err(driver_error)
-    }
-
-    pub(crate) async fn count_documents(&self, collection: &str, filter: Document) -> Result<u64> {
-        self.inner
-            .collection::<Document>(collection)
-            .count_documents(filter)
             .await
             .map_err(driver_error)
     }

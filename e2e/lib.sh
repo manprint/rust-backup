@@ -814,8 +814,9 @@ rb_mongo_assert_readonly_log() { # container [since] [app_name]
 import json, sys
 
 # `aggregate` is classified by its pipeline, not by its name: the Rust driver
-# implements `count_documents` as an `aggregate` with `$match`/`$group`, so
-# read-only aggregates are expected traffic from this tool. Only `$out` and
+# implements `count_documents` as an `aggregate` with `$match`/`$group` (the
+# fingerprint used it up to 0.1.0), and a read-only aggregate must never be
+# reported as a write. Only `$out` and
 # `$merge` write, and a record whose pipeline the server truncated is treated as
 # a write so that unreadable evidence fails loudly instead of passing quietly.
 WRITES = {

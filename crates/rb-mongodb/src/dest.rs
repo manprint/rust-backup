@@ -3,8 +3,8 @@
 //! [`validate`] gathers a [`DestProbe`] over a live connection then folds it into
 //! a [`rb_core::plan::Preflight`] with the pure [`assess`] (unit-tested without a
 //! server). [`stream_in`] applies the plan to reach 1:1: create collections
-//! (+options) → bulk `insert_many` (unordered, batched) the streamed BSON →
-//! build indexes. No temp files (I-NOTEMP).
+//! (+options) → bulk `insert_many` (ordered, batched, pipelined) the streamed
+//! raw BSON → build indexes. No temp files (I-NOTEMP).
 //!
 //! Users/roles are intentionally NOT recreated: `usersInfo` does not expose
 //! password credentials, so faithful user restore is impossible from a logical
@@ -12,9 +12,13 @@
 //! in the plan for visibility only.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use mongodb::bson::{doc, Document};
+use async_trait::async_trait;
+use mongodb::bson::{doc, Document, RawDocumentBuf};
 use mongodb::IndexModel;
+use tokio::sync::mpsc;
 
 use rb_core::channel::{ChunkEvent, ChunkSource};
 use rb_core::error::{BackupError, Phase, Result};
@@ -25,8 +29,15 @@ use crate::model::{MongoCollection, MongoPlanPayload};
 use crate::source::ItemMeta;
 use crate::{MongoConnection, MongoDbParams};
 
-/// Documents per `insert_many` call during restore.
-const INSERT_BATCH: usize = 1000;
+/// Upper bound on the documents of one `insert_many` call.
+const INSERT_BATCH_DOCS: usize = 10_000;
+
+/// Upper bound on the BSON bytes of one `insert_many` call; a batch always takes
+/// at least one document, which may reach [`MAX_BSON_DOCUMENT_BYTES`] alone. It
+/// is a memory bound, not a protocol one — the driver already splits a call at
+/// the server's message limit. A count alone held up to 1000 documents of up to
+/// 16 MiB each, about 16 GiB, in destination memory.
+const INSERT_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// MongoDB's own BSON document limit. A length prefix beyond it is a protocol
 /// violation, never something to wait for more bytes on.
@@ -334,7 +345,7 @@ async fn restore_namespaces(
     }
 
     // 2. Bulk data: one linear pass over the chunk stream, routed by item id.
-    apply_data(conn, targets, src).await?;
+    apply_data(&InsertMany(&conn.client), targets, src).await?;
 
     // 3. Indexes (after data load, so building is cheaper).
     for db in &payload.databases {
@@ -637,37 +648,138 @@ async fn build_indexes(db: &mongodb::Database, coll: &crate::model::MongoCollect
     Ok(())
 }
 
-/// Drain the chunk stream, reassemble documents, and `insert_many` them in
-/// batches into the routed collection.
+/// One `insert_many` call: documents bound for one collection, in stream order.
+struct Batch {
+    target: Arc<ItemMeta>,
+    docs: Vec<RawDocumentBuf>,
+}
+
+/// Where restored batches go. The live writer is [`InsertMany`]; the tests
+/// substitute a recorder to pin the pipeline's ordering and failure rules
+/// without a server.
+#[async_trait]
+trait BatchWriter: Sync {
+    async fn write(&self, batch: Batch) -> Result<()>;
+}
+
+/// The live [`BatchWriter`].
+struct InsertMany<'a>(&'a mongodb::Client);
+
+#[async_trait]
+impl BatchWriter for InsertMany<'_> {
+    async fn write(&self, batch: Batch) -> Result<()> {
+        let Batch { target, docs } = batch;
+        let collection = self
+            .0
+            .database(&target.database)
+            .collection::<RawDocumentBuf>(&target.collection);
+        // Ordered inserts: for a capped collection the insertion (natural)
+        // order IS state — `find()` with no sort, `$natural` and tailable
+        // cursors all read it, and it decides eviction order. An unordered bulk
+        // write may reorder freely. Ordering also gives precise duplicate-key
+        // attribution, which is worth more than the throughput it costs.
+        collection
+            .insert_many(docs)
+            .ordered(true)
+            .await
+            .map(drop)
+            .map_err(|e| {
+                BackupError::phase_src(
+                    Phase::Apply,
+                    format!("insert_many {}.{}", target.database, target.collection),
+                    e,
+                )
+            })
+    }
+}
+
+/// Restore the chunk stream. A reader reassembles documents and cuts them into
+/// batches while the writer inserts the previous batch, so receiving batch N+1
+/// overlaps the server's work on batch N; one batch waits in between. Batches
+/// stay in stream order — one writer, one insert in flight — which is what
+/// keeps a capped collection's natural order.
+///
+/// Neither side is ever dropped mid-operation: `join!`, not `try_join!`. A
+/// dropped driver future does not stop the server, and an insert that landed
+/// after the cleanup's `drop` would silently re-create the collection with part
+/// of its documents. So a failing reader raises `stop` and waits for the insert
+/// in flight; a failing writer closes its end, which stops the reader at once
+/// even while it waits on the network.
 async fn apply_data(
-    conn: &MongoConnection,
-    metas: &HashMap<u32, ItemMeta>,
+    writer: &dyn BatchWriter,
+    targets: &HashMap<u32, ItemMeta>,
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
-    let mut current: Option<CurrentItem> = None;
+    let (tx, mut rx) = mpsc::channel::<Batch>(1);
+    let stop = AtomicBool::new(false);
+    let stop = &stop;
+    let read = async move {
+        let outcome = read_batches(targets, src, &tx).await;
+        if outcome.is_err() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        outcome
+    };
+    let write = async move {
+        while let Some(batch) = rx.recv().await {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            writer.write(batch).await?;
+        }
+        Ok(())
+    };
+    match tokio::join!(read, write) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(read_error), Err(write_error)) => {
+            tracing::warn!(
+                error = %read_error,
+                "the restore stream failed as well as the insert reported below"
+            );
+            Err(write_error)
+        }
+    }
+}
 
+/// The reader half of [`apply_data`]: reassemble documents per item and hand
+/// every completed batch to the writer, in stream order. Returns `Ok` early once
+/// the writer has stopped: the writer's error is the outcome.
+async fn read_batches(
+    targets: &HashMap<u32, ItemMeta>,
+    src: &mut dyn ChunkSource,
+    tx: &mpsc::Sender<Batch>,
+) -> Result<()> {
+    let mut current: Option<CurrentItem> = None;
     loop {
-        match src.next().await? {
+        let event = tokio::select! {
+            biased;
+            () = tx.closed() => return Ok(()),
+            event = src.next() => event?,
+        };
+        let ready = match event {
             ChunkEvent::Chunk { item_id, data, .. } => {
-                let reopen = current
-                    .as_ref()
-                    .map(|c| c.item_id != item_id)
-                    .unwrap_or(true);
-                if reopen {
-                    if let Some(c) = current.take() {
-                        c.finish(conn).await?;
+                let mut ready = Vec::new();
+                let open = match current.take() {
+                    Some(open) if open.item_id == item_id => open,
+                    previous => {
+                        if let Some(previous) = previous {
+                            ready.extend(previous.finish()?);
+                        }
+                        CurrentItem::new(item_id, target_for(targets, item_id)?)
                     }
-                    let meta = metas.get(&item_id).ok_or_else(|| {
-                        BackupError::phase(Phase::Apply, format!("data for unknown item {item_id}"))
-                    })?;
-                    current = Some(CurrentItem::new(item_id, meta));
-                }
-                if let Some(c) = &mut current {
-                    c.feed(conn, &data).await?;
-                }
+                };
+                let open = current.insert(open);
+                ready.extend(open.feed(&data)?);
+                ready
             }
             ChunkEvent::ItemEnd { item_id, total, .. } => {
-                let open = current_for_item_end(current.take(), metas, item_id)?;
+                // An empty collection legitimately has ItemEnd without a
+                // preceding Chunk.
+                let open = match current.take() {
+                    Some(open) => open,
+                    None => CurrentItem::new(item_id, target_for(targets, item_id)?),
+                };
                 if open.item_id != item_id || open.bytes != total {
                     return Err(BackupError::phase(
                         Phase::Verify,
@@ -677,121 +789,119 @@ async fn apply_data(
                         ),
                     ));
                 }
-                open.finish(conn).await?;
+                open.finish()?.into_iter().collect()
             }
             ChunkEvent::End => {
-                if let Some(c) = current.take() {
-                    c.finish(conn).await?;
+                if let Some(open) = current.take() {
+                    forward(tx, open.finish()?).await;
                 }
-                break;
+                return Ok(());
             }
+        };
+        if !forward(tx, ready).await {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
-fn current_for_item_end(
-    current: Option<CurrentItem>,
-    metas: &HashMap<u32, ItemMeta>,
-    item_id: u32,
-) -> Result<CurrentItem> {
-    if let Some(current) = current {
-        return Ok(current);
+/// Hand `batches` to the writer in order; `false` once the writer has stopped.
+async fn forward(tx: &mpsc::Sender<Batch>, batches: impl IntoIterator<Item = Batch>) -> bool {
+    for batch in batches {
+        if tx.send(batch).await.is_err() {
+            return false;
+        }
     }
-    let meta = metas.get(&item_id).ok_or_else(|| {
-        BackupError::phase(
-            Phase::Apply,
-            format!("ItemEnd for unknown collection item={item_id}"),
-        )
-    })?;
-    // An empty collection legitimately has ItemEnd without a preceding Chunk.
-    Ok(CurrentItem::new(item_id, meta))
+    true
 }
 
-/// Per-item restore state: a byte accumulator for partial BSON across chunk
-/// boundaries plus a pending insert batch destined for one collection.
+fn target_for(targets: &HashMap<u32, ItemMeta>, item_id: u32) -> Result<&ItemMeta> {
+    targets
+        .get(&item_id)
+        .ok_or_else(|| BackupError::phase(Phase::Apply, format!("data for unknown item {item_id}")))
+}
+
+/// Per-item restore state: a byte accumulator for a document split across
+/// chunk boundaries plus the batch being filled for one collection.
 struct CurrentItem {
     item_id: u32,
-    database: String,
-    collection: String,
+    target: Arc<ItemMeta>,
     buf: Vec<u8>,
-    batch: Vec<Document>,
+    batch: Vec<RawDocumentBuf>,
+    batch_bytes: usize,
     bytes: u64,
 }
 
 impl CurrentItem {
-    fn new(item_id: u32, meta: &ItemMeta) -> Self {
+    fn new(item_id: u32, target: &ItemMeta) -> Self {
         Self {
             item_id,
-            database: meta.database.clone(),
-            collection: meta.collection.clone(),
+            target: Arc::new(target.clone()),
             buf: Vec::new(),
             batch: Vec::new(),
+            batch_bytes: 0,
             bytes: 0,
         }
     }
 
-    /// Append bytes, parse any whole documents, and flush full batches.
-    async fn feed(&mut self, conn: &MongoConnection, data: &[u8]) -> Result<()> {
+    /// Append stream bytes and return the batches the documents they completed
+    /// filled.
+    fn feed(&mut self, data: &[u8]) -> Result<Vec<Batch>> {
         self.bytes += data.len() as u64;
         self.buf.extend_from_slice(data);
-        take_documents(&mut self.buf, &mut self.batch)?;
-        while self.batch.len() >= INSERT_BATCH {
-            let chunk: Vec<Document> = self.batch.drain(..INSERT_BATCH).collect();
-            self.insert(conn, chunk).await?;
+        let mut ready = Vec::new();
+        for doc in take_documents(&mut self.buf)? {
+            ready.extend(self.push(doc));
         }
-        Ok(())
+        Ok(ready)
     }
 
-    /// Flush the trailing batch and assert the byte accumulator is fully consumed.
-    async fn finish(mut self, conn: &MongoConnection) -> Result<()> {
-        take_documents(&mut self.buf, &mut self.batch)?;
+    /// Add one document, first closing the batch when the document would take
+    /// it past either bound. A batch always holds at least one document, so a
+    /// single document of up to `MAX_BSON_DOCUMENT_BYTES` still restores.
+    fn push(&mut self, doc: RawDocumentBuf) -> Option<Batch> {
+        let len = doc.as_bytes().len();
+        let full = !self.batch.is_empty()
+            && (self.batch.len() >= INSERT_BATCH_DOCS
+                || self.batch_bytes + len > INSERT_BATCH_BYTES);
+        let closed = full.then(|| self.take_batch());
+        self.batch_bytes += len;
+        self.batch.push(doc);
+        closed
+    }
+
+    fn take_batch(&mut self) -> Batch {
+        self.batch_bytes = 0;
+        Batch {
+            target: Arc::clone(&self.target),
+            docs: std::mem::take(&mut self.batch),
+        }
+    }
+
+    /// Close the item: its trailing batch, if any, once every byte it received
+    /// formed a whole document. `feed` already took every complete one, so any
+    /// byte left is a truncated document.
+    fn finish(mut self) -> Result<Option<Batch>> {
         if !self.buf.is_empty() {
             return Err(BackupError::phase(
                 Phase::Apply,
                 format!(
                     "trailing {} bytes after last document in {}.{}",
                     self.buf.len(),
-                    self.database,
-                    self.collection
+                    self.target.database,
+                    self.target.collection
                 ),
             ));
         }
-        if !self.batch.is_empty() {
-            let docs = std::mem::take(&mut self.batch);
-            self.insert(conn, docs).await?;
-        }
-        Ok(())
-    }
-
-    async fn insert(&self, conn: &MongoConnection, docs: Vec<Document>) -> Result<()> {
-        if docs.is_empty() {
-            return Ok(());
-        }
-        let coll = conn
-            .client
-            .database(&self.database)
-            .collection::<Document>(&self.collection);
-        // Ordered inserts: for a capped collection the insertion (natural)
-        // order IS state — `find()` with no sort, `$natural` and tailable
-        // cursors all read it, and it decides eviction order. An unordered bulk
-        // write may reorder freely. Ordering also gives precise duplicate-key
-        // attribution, which is worth more than the throughput it costs.
-        coll.insert_many(docs).ordered(true).await.map_err(|e| {
-            BackupError::phase_src(
-                Phase::Apply,
-                format!("insert_many {}.{}", self.database, self.collection),
-                e,
-            )
-        })?;
-        Ok(())
+        Ok((!self.batch.is_empty()).then(|| self.take_batch()))
     }
 }
 
-/// Drain every complete BSON document from the front of `buf` into `out`,
-/// leaving any partial trailing document in `buf`. BSON documents are
-/// length-prefixed (first 4 bytes, little-endian), so they are self-delimiting.
-fn take_documents(buf: &mut Vec<u8>, out: &mut Vec<Document>) -> Result<()> {
+/// Take every complete BSON document from the front of `buf`, leaving any
+/// partial trailing document in it. BSON documents are length-prefixed (first 4
+/// bytes, little-endian), so they are self-delimiting. Documents stay raw: they
+/// are inserted byte for byte as the source server stored them.
+fn take_documents(buf: &mut Vec<u8>) -> Result<Vec<RawDocumentBuf>> {
+    let mut docs = Vec::new();
     let mut pos = 0usize;
     while buf.len() - pos >= 4 {
         let declared = i32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
@@ -809,36 +919,304 @@ fn take_documents(buf: &mut Vec<u8>, out: &mut Vec<Document>) -> Result<()> {
         if buf.len() - pos < len {
             break; // partial document; wait for more bytes.
         }
-        let doc: Document = mongodb::bson::from_slice(&buf[pos..pos + len])
+        let doc = RawDocumentBuf::from_bytes(buf[pos..pos + len].to_vec())
             .map_err(|e| BackupError::phase_src(Phase::Apply, "decode bson document", e))?;
-        out.push(doc);
+        docs.push(doc);
         pos += len;
     }
     if pos > 0 {
         buf.drain(..pos);
     }
-    Ok(())
+    Ok(docs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
-    #[test]
-    fn empty_collection_item_end_opens_zero_byte_restore_state() {
-        let metas = HashMap::from([(
-            7,
-            ItemMeta {
-                database: "appdb".into(),
-                collection: "empty".into(),
-            },
-        )]);
-        let current = current_for_item_end(None, &metas, 7).expect("empty collection state");
-        assert_eq!(current.item_id, 7);
-        assert_eq!(current.bytes, 0);
-        assert!(current.buf.is_empty());
-        assert!(current.batch.is_empty());
+    use rb_core::wire::CHUNK_SIZE;
+
+    // --- the restore pipeline ------------------------------------------------
+
+    /// One scripted step of a test chunk stream.
+    enum Step {
+        Event(ChunkEvent),
+        /// Fail after a delay, as a transfer that breaks mid-run.
+        Fail(Duration),
+        /// Never answer, as a peer that went quiet.
+        Hang,
     }
+
+    struct Script(VecDeque<Step>);
+
+    #[async_trait]
+    impl ChunkSource for Script {
+        async fn next(&mut self) -> Result<ChunkEvent> {
+            match self.0.pop_front() {
+                Some(Step::Event(event)) => Ok(event),
+                Some(Step::Fail(delay)) => {
+                    tokio::time::sleep(delay).await;
+                    Err(BackupError::phase(
+                        Phase::Transfer,
+                        "scripted transfer failure",
+                    ))
+                }
+                Some(Step::Hang) => std::future::pending().await,
+                None => Ok(ChunkEvent::End),
+            }
+        }
+    }
+
+    /// Records every batch it is handed, optionally slowly or failing.
+    #[derive(Default)]
+    struct Recorder {
+        batches: std::sync::Mutex<Vec<(String, Vec<Vec<u8>>)>>,
+        delay: Duration,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl BatchWriter for Recorder {
+        async fn write(&self, batch: Batch) -> Result<()> {
+            tokio::time::sleep(self.delay).await;
+            if self.fail {
+                return Err(BackupError::phase(Phase::Apply, "scripted insert failure"));
+            }
+            let namespace = format!("{}.{}", batch.target.database, batch.target.collection);
+            let docs = batch.docs.into_iter().map(|doc| doc.into_bytes()).collect();
+            self.batches.lock().unwrap().push((namespace, docs));
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn batches(&self) -> Vec<(String, Vec<Vec<u8>>)> {
+            self.batches.lock().unwrap().clone()
+        }
+    }
+
+    fn targets() -> HashMap<u32, ItemMeta> {
+        HashMap::from([
+            (
+                0,
+                ItemMeta {
+                    database: "appdb".into(),
+                    collection: "blobs".into(),
+                },
+            ),
+            (
+                1,
+                ItemMeta {
+                    database: "appdb".into(),
+                    collection: "tiny".into(),
+                },
+            ),
+            (
+                7,
+                ItemMeta {
+                    database: "appdb".into(),
+                    collection: "empty".into(),
+                },
+            ),
+        ])
+    }
+
+    fn encoded(docs: &[Document]) -> Vec<u8> {
+        docs.iter()
+            .flat_map(|doc| mongodb::bson::to_vec(doc).unwrap())
+            .collect()
+    }
+
+    /// The stream of one item cut into full wire chunks, as the source sends it.
+    fn item_steps(item_id: u32, bytes: &[u8]) -> Vec<Step> {
+        let mut steps: Vec<Step> = bytes
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(index, chunk)| {
+                Step::Event(ChunkEvent::Chunk {
+                    item_id,
+                    offset: (index * CHUNK_SIZE) as u64,
+                    data: chunk.to_vec(),
+                })
+            })
+            .collect();
+        steps.push(Step::Event(ChunkEvent::ItemEnd {
+            item_id,
+            total: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+        }));
+        steps
+    }
+
+    fn tiny_docs(count: i32) -> Vec<Document> {
+        (0..count).map(|i| doc! { "_id": i }).collect()
+    }
+
+    #[tokio::test]
+    async fn documents_reach_the_writer_in_order_in_bounded_batches() {
+        let blob = "x".repeat(1024 * 1024);
+        let blobs: Vec<Document> = (0..20).map(|i| doc! { "_id": i, "b": &blob }).collect();
+        let tiny = tiny_docs(25_000);
+        let (blob_bytes, tiny_bytes) = (encoded(&blobs), encoded(&tiny));
+        let mut steps = item_steps(0, &blob_bytes);
+        steps.extend(item_steps(7, b""));
+        steps.extend(item_steps(1, &tiny_bytes));
+        let recorder = Recorder::default();
+
+        apply_data(&recorder, &targets(), &mut Script(steps.into()))
+            .await
+            .expect("a clean stream restores");
+
+        let batches = recorder.batches();
+        let shape: Vec<(&str, usize)> = batches
+            .iter()
+            .map(|(namespace, docs)| (namespace.as_str(), docs.len()))
+            .collect();
+        // Seven 1 MiB documents fit 8 MiB and an eighth does not; the tiny
+        // documents are bounded by count instead. The empty collection sends
+        // nothing.
+        assert_eq!(
+            shape,
+            vec![
+                ("appdb.blobs", 7),
+                ("appdb.blobs", 7),
+                ("appdb.blobs", 6),
+                ("appdb.tiny", INSERT_BATCH_DOCS),
+                ("appdb.tiny", INSERT_BATCH_DOCS),
+                ("appdb.tiny", 5_000),
+            ]
+        );
+        for (_, docs) in &batches {
+            let bytes: usize = docs.iter().map(Vec::len).sum();
+            assert!(bytes <= INSERT_BATCH_BYTES, "a batch of {bytes} bytes");
+        }
+        let restored = |namespace: &str| -> Vec<u8> {
+            batches
+                .iter()
+                .filter(|(n, _)| n == namespace)
+                .flat_map(|(_, docs)| docs.concat())
+                .collect()
+        };
+        assert_eq!(
+            restored("appdb.blobs"),
+            blob_bytes,
+            "byte for byte, in order"
+        );
+        assert_eq!(
+            restored("appdb.tiny"),
+            tiny_bytes,
+            "byte for byte, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_document_larger_than_the_batch_bound_still_restores() {
+        let big = doc! { "_id": 1, "b": "y".repeat(INSERT_BATCH_BYTES + 1) };
+        let bytes = encoded(&[big]);
+        let recorder = Recorder::default();
+        apply_data(
+            &recorder,
+            &targets(),
+            &mut Script(item_steps(0, &bytes).into()),
+        )
+        .await
+        .expect("one oversized document is a batch of its own");
+        let batches = recorder.batches();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].1, vec![bytes]);
+    }
+
+    /// A failed insert must end the run at once, even while the reader waits
+    /// on a peer that has nothing more to send.
+    #[tokio::test]
+    async fn a_failed_insert_stops_the_reader_even_while_it_waits() {
+        let tiny = encoded(&tiny_docs(INSERT_BATCH_DOCS as i32 + 1));
+        let mut steps: Vec<Step> = item_steps(1, &tiny);
+        steps.pop(); // no ItemEnd: the peer goes quiet instead
+        steps.push(Step::Hang);
+        let recorder = Recorder {
+            fail: true,
+            ..Recorder::default()
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            apply_data(&recorder, &targets(), &mut Script(steps.into())),
+        )
+        .await
+        .expect("the reader must not outlive the writer");
+        let error = outcome.expect_err("the insert failure is the outcome");
+        assert!(
+            format!("{error}").contains("scripted insert failure"),
+            "{error}"
+        );
+    }
+
+    /// A transfer that fails mid-run must wait for the insert in flight: the
+    /// cleanup that follows drops the collection, and an insert landing after
+    /// it would re-create the collection with part of its documents.
+    #[tokio::test]
+    async fn a_failed_stream_waits_for_the_insert_in_flight() {
+        let tiny = encoded(&tiny_docs(INSERT_BATCH_DOCS as i32 + 1));
+        let mut steps: Vec<Step> = item_steps(1, &tiny);
+        steps.pop();
+        steps.push(Step::Fail(Duration::from_millis(50)));
+        let recorder = Recorder {
+            delay: Duration::from_millis(300),
+            ..Recorder::default()
+        };
+        let error = apply_data(&recorder, &targets(), &mut Script(steps.into()))
+            .await
+            .expect_err("the transfer failure is the outcome");
+        assert!(
+            format!("{error}").contains("scripted transfer failure"),
+            "{error}"
+        );
+        let batches = recorder.batches();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the insert in flight completed before the return"
+        );
+        assert_eq!(batches[0].1.len(), INSERT_BATCH_DOCS);
+    }
+
+    #[tokio::test]
+    async fn an_item_end_that_disagrees_with_the_stream_is_refused() {
+        let bytes = encoded(&tiny_docs(3));
+        let mut steps = item_steps(1, &bytes);
+        if let Some(Step::Event(ChunkEvent::ItemEnd { total, .. })) = steps.last_mut() {
+            *total += 1;
+        }
+        let error = apply_data(&Recorder::default(), &targets(), &mut Script(steps.into()))
+            .await
+            .expect_err("a short item must be refused");
+        assert!(
+            format!("{error}").contains("does not match open item"),
+            "{error}"
+        );
+
+        let truncated = &bytes[..bytes.len() - 1];
+        let error = apply_data(
+            &Recorder::default(),
+            &targets(),
+            &mut Script(item_steps(1, truncated).into()),
+        )
+        .await
+        .expect_err("a truncated document must be refused");
+        assert!(format!("{error}").contains("trailing"), "{error}");
+
+        let error = apply_data(
+            &Recorder::default(),
+            &targets(),
+            &mut Script(item_steps(9, &bytes).into()),
+        )
+        .await
+        .expect_err("data for an unresolved item must be refused");
+        assert!(format!("{error}").contains("unknown item 9"), "{error}");
+    }
+
     use mongodb::bson::doc;
 
     fn probe(major: u32, existing: &[&str]) -> DestProbe {
@@ -1081,9 +1459,16 @@ mod tests {
         let mut out = Vec::new();
         for b in &bytes {
             buf.push(*b);
-            take_documents(&mut buf, &mut out).unwrap();
+            out.extend(take_documents(&mut buf).unwrap());
         }
-        assert_eq!(out, docs, "all documents reassembled in order");
+        let out: Vec<u8> = out
+            .into_iter()
+            .flat_map(RawDocumentBuf::into_bytes)
+            .collect();
+        assert_eq!(
+            out, bytes,
+            "all documents reassembled in order, byte for byte"
+        );
         assert!(buf.is_empty(), "no trailing bytes once the stream is whole");
     }
 
@@ -1092,8 +1477,7 @@ mod tests {
         let d = doc! { "_id": 1, "v": "x" };
         let bytes = mongodb::bson::to_vec(&d).unwrap();
         let mut buf = bytes[..bytes.len() - 1].to_vec(); // one byte short
-        let mut out = Vec::new();
-        take_documents(&mut buf, &mut out).unwrap();
+        let out = take_documents(&mut buf).unwrap();
         assert!(out.is_empty(), "incomplete document must not be parsed");
         assert_eq!(buf.len(), bytes.len() - 1, "partial bytes retained");
     }
@@ -1115,14 +1499,12 @@ mod tests {
             let mut buf = prefix.clone();
             // Trailing bytes make sure the failure is not merely "too short".
             buf.extend_from_slice(&[0u8; 8]);
-            let mut out = Vec::new();
-            let error = take_documents(&mut buf, &mut out)
-                .expect_err(&format!("prefix {prefix:?} must be refused"));
+            let error =
+                take_documents(&mut buf).expect_err(&format!("prefix {prefix:?} must be refused"));
             assert!(
                 format!("{error}").contains("invalid BSON document length"),
                 "{error}"
             );
-            assert!(out.is_empty());
         }
     }
 

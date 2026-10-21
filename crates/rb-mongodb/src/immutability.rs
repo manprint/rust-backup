@@ -2,15 +2,15 @@
 //!
 //! [`fingerprint`] produces a stable digest of the source: a structural hash of
 //! the introspected catalog (volatile size/count estimates normalized out, since
-//! they drift without any user mutation) plus, per collection, an exact
-//! `count_documents` and a complete deterministic `_id`-ordered content checksum. The
-//! session captures it before and after every run and raises
-//! `BackupError::SourceMutated` on any drift (I-IMMUT). All queries are reads.
+//! they drift without any user mutation) plus, per collection, the document
+//! count and a complete deterministic checksum of the raw BSON in `_id` order,
+//! both from one scan. The session captures it before and after every run and
+//! raises `BackupError::SourceMutated` on any drift (I-IMMUT). All queries are
+//! reads.
 //!
 //! The digest COMPOSITION is pure and unit-tested; the live count/checksum
 //! queries are exercised by the mongodb e2e (incl. the mid-transfer-abort case).
 
-use futures_util::StreamExt;
 use mongodb::bson::doc;
 
 use rb_core::error::{BackupError, Phase, Result};
@@ -40,15 +40,15 @@ pub struct CollStat {
     pub checksum: String,
 }
 
-/// Compute the source fingerprint (read-only).
+/// Compute the source fingerprint (read-only), over one connection.
 pub async fn fingerprint(params: &MongoDbParams) -> Result<String> {
-    let payload = introspect::introspect_cluster(params).await?;
+    let conn = ReadOnlyConnection::connect(params).await?;
+    let payload = introspect::introspect_with(&conn, params).await?;
 
     let mut normalized = payload.clone();
     normalize(&mut normalized);
     let catalog_hash = hash_catalog(&normalized);
 
-    let conn = ReadOnlyConnection::connect(params).await?;
     let mut collections = Vec::new();
     for db in &payload.databases {
         for coll in &db.collections {
@@ -104,30 +104,29 @@ fn hash_catalog(p: &MongoPlanPayload) -> String {
     blake3_hex(&bytes)
 }
 
-/// Exact `count_documents` plus a complete deterministic content checksum.
+/// Document count plus a complete deterministic content checksum, from one
+/// `_id`-ordered scan. A separate `count_documents` used to scan every
+/// collection a second time per audit, and added nothing: the checksum already
+/// changes when a document appears or disappears.
 async fn coll_stat(conn: &ReadOnlyConnection, db: &str, coll: &str) -> Result<CollStat> {
-    let database = conn.client.database(db);
-
-    let docs = database
-        .count_documents(coll, doc! {})
-        .await
-        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {db}.{coll}"), e))?
-        as i64;
-
     // `_id` is unique and indexed, so hashing every document in this order is
     // stable and cannot miss a mutation in a collection larger than a sample.
-    let mut cursor = database
+    let mut cursor = conn
+        .client
+        .database(db)
         .find(coll, doc! {}, Some(sort_by_id()))
         .await
-        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("sample {db}.{coll}"), e))?;
+        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("scan {db}.{coll}"), e))?;
 
     let mut hasher = blake3::Hasher::new();
-    while let Some(item) = cursor.next().await {
-        let d = item
-            .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("read {db}.{coll}"), e))?;
-        let bytes = mongodb::bson::to_vec(&d)
-            .map_err(|e| BackupError::phase_src(Phase::Analyze, "encode bson", e))?;
-        hasher.update(&bytes);
+    let mut docs: i64 = 0;
+    while cursor
+        .advance()
+        .await
+        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("read {db}.{coll}"), e))?
+    {
+        hasher.update(cursor.current().as_bytes());
+        docs += 1;
     }
 
     Ok(CollStat {

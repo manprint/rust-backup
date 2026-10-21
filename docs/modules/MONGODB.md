@@ -10,6 +10,26 @@ definitions, document/size estimates, and user/role metadata for visibility and
 immutability checks. Restore creates collections, streams BSON documents in
 bounded batches, then creates indexes.
 
+Documents travel **raw**: the source forwards each one exactly as the server
+returned it and the destination inserts those bytes, so nothing is decoded and
+re-encoded on either side. Besides the CPU it saves, this keeps a document with
+duplicate field names intact — decoding into a map merged them and silently
+dropped a value, and verification agreed because both sides dropped it the same
+way. For every ordinary document the bytes are identical to what older peers
+re-encode (a unit test pins this for every BSON type), so a mixed-version pair
+still verifies; a duplicate-field document with an older peer fails
+verification instead of losing data.
+
+A batch closes at 10 000 documents or 8 MiB, whichever comes first (a single
+larger document is a batch of its own). While one batch is being inserted the
+next is received and cut, and at most one waits in between, so receiving and
+inserting overlap and the destination holds at most three batches plus the
+driver's copy of the one in flight — about 32 MiB, or up to 64 MiB with
+documents near the 16 MiB limit. A count alone
+used to allow 1000 documents of up to 16 MiB each in memory. The insert in
+flight always completes or fails before a failed run's cleanup starts: an insert
+landing after the cleanup's `drop` would re-create the collection.
+
 ## Completion proof
 
 After apply, the destination re-lists the options and indexes of every planned
@@ -86,10 +106,10 @@ corruption. Such a spec fails analysis, naming the offending field path.
 
 The source only reads, and the type says so: source-side code holds a
 `ReadOnlyClient` and its `ReadOnlyDatabase`, which expose `list_collections`,
-`list_collection_names`, `find`, `count_documents`,
-`estimated_document_count`, `list_indexes` and `run_command` — and nothing
-else. There is no accessor returning a `Collection` or a raw `Database`, so a
-write on the source path does not compile.
+`list_collection_names`, `find`, `estimated_document_count`, `list_indexes`
+and `run_command` — and nothing else. There is no accessor returning a
+`Collection` or a raw `Database`, so a write on the source path does not
+compile.
 
 `run_command` is the one call that takes the operation as data, so it is also
 guarded: the command's first key must be one of `collStats`,
@@ -130,10 +150,11 @@ fresh collection name and switch over if they must survive a failed attempt.
   The source raises it itself, naming the ceiling, before the plan is sent.
 - **Every document is read three times per run**: the fingerprint before, the
   transfer, and the fingerprint after. The fingerprint hashes the full
-  `_id`-ordered content of every collection — a sample could not catch a
-  mutation outside it — and I-IMMUT requires it on both sides of the run,
-  including a failed one. The destination read-back adds a fourth full read on
-  its own side.
+  `_id`-ordered content of every collection in one scan — a sample could not
+  catch a mutation outside it — and I-IMMUT requires it on both sides of the
+  run, including a failed one. (It used to add a `count_documents` per
+  collection, a second scan that told it nothing the checksum did not.) The
+  destination read-back adds a fourth full read on its own side.
 - Source cursors are opened with `noCursorTimeout`, because backpressure is
   supposed to stall them: the cursor advances only when the destination has
   taken the previous chunk, and a `--max-rate` cap stalls it further. Without

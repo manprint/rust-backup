@@ -137,7 +137,7 @@ backend:
 | Module | What is hashed | Cost per measurement | On drift |
 |--------|----------------|----------------------|----------|
 | PostgreSQL | the structural catalog (planner estimates normalized out) plus, per data-bearing table, the row count and an order-independent 128-bit commitment (the wrapping sum of `md5(row)`); prefix `rust-backup/pg-fingerprint/v2` | one full read of every table, streamed and folded client-side — no server sort, no temporary file | `SourceMutated`, exit `6`; a destination that already applied the payload drops the databases it created |
-| MongoDB | per collection: `count_documents` and an `_id`-ordered content checksum, plus the catalog; prefix `rust-backup/mongo-fingerprint/v1` | one full read of every collection | `SourceMutated`, exit `6` |
+| MongoDB | per collection: the document count and a checksum of the raw BSON in `_id` order, both from one scan, plus the catalog; prefix `rust-backup/mongo-fingerprint/v1` | one full read of every collection | `SourceMutated`, exit `6` |
 | S3 | the object listing (key, size, etag, metadata) and the bucket policy; prefix `rust-backup/s3-fingerprint/v2` | one listing (the analysis reuses the pre-run one); object bodies are not re-read, but every `GetObject` carries `If-Match` with the planned ETag | `SourceMutated`, exit `6` |
 | Filesystem | per entry: path, kind, size, mode, uid, gid, mtime (with nanoseconds), link target, hardlink target, device number, and the file's contents | one full read of the tree — so a run reads the source three times in total (baseline, stream, audit), which is the dominant cost on large trees | `SourceMutated`, exit `6` |
 
@@ -292,7 +292,8 @@ invariant:
    `rb_minio_assert_readonly_trace` over `mc admin trace --json`. Each
    assertion also fails when its window is empty, because silence is not
    evidence; the MongoDB one classifies `aggregate` by its pipeline, since the
-   driver implements `count_documents` as a read-only aggregate.
+   driver implements `count_documents` as a read-only aggregate and such a read
+   must not be reported as a write.
 
 Test IDs: `T-PG-IMMUT`, `T-MONGO-IMMUT`, `T-S3-IMMUT`, `T-FS-IMMUT`,
 `T-FS-OWN`, `T-PG-FP2`, `T-PG-TIMEOUT`, `T-FS-ATIME`, `T-IMMUT-PG-LP`,
