@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — release
+
+Dependency refresh: `mongodb` 3.9.1 → 3.10.0 and the lockfile brought up to
+date (transitive crates only, no code changes). No plan or wire changes.
+
 ## 0.1.1 — release (2026-10-21)
 
 A full review of every module, S3 and MongoDB first. It closes two ways a
