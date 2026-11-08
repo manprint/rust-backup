@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — release
+
+Test-harness fix: `e2e/postgres_matrix.sh` no longer starts a transfer's
+coordination server while the previous one may still hold the fixed control
+port, and waits until the new server is listening. Removes an intermittent
+`unexpected registration response: None` in the PostgreSQL matrix. No code
+changes to the binary.
+
 ## 0.1.2 — release
 
 Dependency refresh: `mongodb` 3.9.1 → 3.10.0 and the lockfile brought up to

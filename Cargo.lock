@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "rb-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "rb-filesystem"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2588,7 +2588,7 @@ dependencies = [
 
 [[package]]
 name = "rb-mongodb"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "rb-postgres"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2624,7 +2624,7 @@ dependencies = [
 
 [[package]]
 name = "rb-s3"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "rb-transport"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "rust-backup"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",

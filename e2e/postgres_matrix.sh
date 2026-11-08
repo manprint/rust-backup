@@ -331,9 +331,29 @@ create_readonly_role() { # container major database
 
 run_transfer() { # src_port dst_port channel [abort|overwrite|source-only] [database]
   local src_port="$1" dst_port="$2" channel="$3" mode="${4:-}" database="${5:-$DATABASE}"
+  # The control port is fixed for the whole matrix: a server left over from the
+  # previous transfer must be gone before this one binds it, or the source can
+  # reach the dying server, which closes the stream without a reply
+  # ("unexpected registration response: None").
+  if [[ -n "${LAST_SERVER_PID:-}" ]]; then
+    wait "$LAST_SERVER_PID" 2>/dev/null || true
+    LAST_SERVER_PID=""
+  fi
   "$BIN" server --bind-addr 127.0.0.1 --control-port "$CTRL_PORT" >"$WORK/server.log" 2>&1 &
   local server_pid=$!; PIDS+=("$server_pid")
-  sleep 1
+  LAST_SERVER_PID=$server_pid
+  local ready=0 ready_wait=0
+  while (( ready_wait < 60 )); do
+    kill -0 "$server_pid" 2>/dev/null || break
+    if grep -q 'listening' "$WORK/server.log" 2>/dev/null; then ready=1; break; fi
+    sleep 0.1
+    ready_wait=$((ready_wait + 1))
+  done
+  if (( ready == 0 )); then
+    echo "FAIL: coordination server did not start on port ${CTRL_PORT}" >&2
+    cat "$WORK/server.log" >&2 || true
+    return 1
+  fi
 
   # Source registers as provider first, then destination consumes.
   "$BIN" postgres source --to "127.0.0.1:${CTRL_PORT}" --channel "$channel" \
