@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — release (2026-11-20)
+
+Minor release because the direct-path authentication changed on the wire: a
+0.2.0 peer and an older one no longer authenticate each other's direct QUIC
+connection and run over the relay with each other. The plan format is
+unchanged. Upgrade both peers (and the coordination server, for the patient
+direct setup) together.
 
 ### Fixed
 
