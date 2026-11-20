@@ -344,8 +344,22 @@ mod tests {
     /// runtime a task spawned before the pass can only run while the pass is
     /// in flight if the pass yields; run inline, it finished first and every
     /// other task — the transport heartbeat among them — waited behind it.
-    #[tokio::test(flavor = "current_thread")]
-    async fn tree_passes_leave_the_runtime_free() {
+    ///
+    /// The one blocking thread is held until that other task has run, so the
+    /// outcome does not depend on how fast the pass is: a pass on the pool
+    /// cannot start before the task releases it, and a pass run inline finishes
+    /// before the task gets its turn.
+    #[test]
+    fn tree_passes_leave_the_runtime_free() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tree_passes_yield_to_other_tasks());
+    }
+
+    async fn tree_passes_yield_to_other_tasks() {
         let root = tempdir("off-runtime");
         for index in 0..64 {
             fs::write(root.join(format!("f{index}")), vec![7_u8; 64 * 1024]).unwrap();
@@ -357,8 +371,13 @@ mod tests {
         for pass in ["fingerprint", "analyze", "stream_out"] {
             let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = Arc::clone(&ran);
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let pool = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
             let other = tokio::spawn(async move {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = release.send(());
             });
             match pass {
                 "fingerprint" => {
@@ -379,6 +398,7 @@ mod tests {
                 "{pass} held the runtime thread for its whole run"
             );
             other.await.unwrap();
+            pool.await.unwrap();
         }
         fs::remove_dir_all(root).unwrap();
     }

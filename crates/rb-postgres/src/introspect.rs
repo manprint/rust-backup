@@ -1088,11 +1088,10 @@ const UNMODELLED_PROBES: &[(u32, &str, &str)] = &[
          d.objid = w.oid AND d.deptype = 'e') UNION ALL SELECT ('server ' || s.srvname)::text \
          FROM pg_catalog.pg_foreign_server s WHERE NOT EXISTS (SELECT 1 FROM \
          pg_catalog.pg_depend d WHERE d.classid = 'pg_foreign_server'::regclass AND d.objid = \
-         s.oid AND d.deptype = 'e') UNION ALL SELECT ('user mapping on ' || s.srvname)::text \
-         FROM pg_catalog.pg_user_mapping um JOIN pg_catalog.pg_foreign_server s ON s.oid = \
-         um.umserver WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
-         'pg_foreign_server'::regclass AND d.objid = s.oid AND d.deptype = 'e')) AS \
-         foreign_data",
+         s.oid AND d.deptype = 'e') UNION ALL SELECT ('user mapping on ' || um.srvname)::text \
+         FROM pg_catalog.pg_user_mappings um WHERE NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_foreign_server'::regclass AND d.objid = \
+         um.srvid AND d.deptype = 'e')) AS foreign_data",
     ),
     (
         0,

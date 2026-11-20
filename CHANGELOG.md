@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **postgres:** the foreign-data probe reads the `pg_user_mappings` view
+  instead of the `pg_user_mapping` table, which a non-superuser cannot read
+  before PostgreSQL 14: a least-privilege source on 10..=13 failed at Analyze.
+- **deps:** `mongodb` 3.10.2.
+- **tests:** `tree_passes_leave_the_runtime_free` no longer depends on how fast
+  the pass runs.
+
 ## 0.2.0 — release (2026-11-20)
 
 Minor release because the direct-path authentication changed on the wire: a
