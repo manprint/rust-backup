@@ -22,8 +22,9 @@ use aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder;
 use aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder;
 use aws_sdk_s3::Client;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
+use tokio::io::AsyncRead;
 
-use rb_core::channel::ChunkSink;
+use rb_core::channel::{ChunkSink, MAX_PLAN_ITEMS};
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::module::Source;
 use rb_core::plan::{BackupMode, BackupPlan, IntegritySpec, PlanItem, PLAN_FORMAT_VERSION};
@@ -31,7 +32,7 @@ use rb_core::wire::CHUNK_SIZE;
 
 use crate::{
     acl_is_owner_only_full_control, canonical_policy_bytes, client, decode_plan, http_status,
-    now_rfc3339, read_full, sdk_error, unsupported_object_features, S3Object, S3Params, S3Plan,
+    now_rfc3339, read_resuming, sdk_error, unsupported_object_features, S3Object, S3Params, S3Plan,
     REQUEST_CONCURRENCY,
 };
 
@@ -174,6 +175,41 @@ impl S3Source {
             )),
         }
     }
+
+    /// Open the body of `object` from byte `at`.
+    ///
+    /// `If-Match` pins the read to the object the plan describes. An object
+    /// replaced since analysis used to stream its new bytes under the old
+    /// catalog entry, and only the post-run audit, after the whole transfer,
+    /// said the source had changed. A resumed read (`at > 0`) carries the same
+    /// condition, so it can only continue the object it started.
+    async fn open_body(&self, object: &S3Object, at: u64) -> Result<impl AsyncRead + Unpin> {
+        let response = self
+            .s3
+            .get_object()
+            .bucket(&self.params.bucket)
+            .key(&object.key)
+            .set_if_match(object.etag.clone())
+            .set_range((at > 0).then(|| format!("bytes={at}-")))
+            .send()
+            .await
+            .map_err(|error| {
+                if http_status(&error) == Some(412) {
+                    BackupError::SourceMutated(format!(
+                        "S3 object {:?} changed after the plan was made (ETag no longer {})",
+                        object.key,
+                        object.etag.as_deref().unwrap_or("?")
+                    ))
+                } else {
+                    sdk_error(
+                        Phase::Transfer,
+                        format!("get S3 object {:?}", object.key),
+                        error,
+                    )
+                }
+            })?;
+        Ok(response.body.into_async_read())
+    }
 }
 
 /// How a failed `GetBucketPolicy` is taken.
@@ -226,43 +262,33 @@ impl Source for S3Source {
                 .objects
                 .get(item.id as usize)
                 .ok_or_else(|| BackupError::phase(Phase::Transfer, "plan item has no S3 object"))?;
-            // `If-Match` pins the read to the object the plan describes. An
-            // object replaced since analysis used to stream its new bytes
-            // under the old catalog entry, and only the post-run audit,
-            // after the whole transfer, said the source had changed.
-            let response = self
-                .s3
-                .get_object()
-                .bucket(&self.params.bucket)
-                .key(&object.key)
-                .set_if_match(object.etag.clone())
-                .send()
-                .await
-                .map_err(|error| {
-                    if http_status(&error) == Some(412) {
-                        BackupError::SourceMutated(format!(
-                            "S3 object {:?} changed after the plan was made (ETag no longer {})",
-                            object.key,
-                            object.etag.as_deref().unwrap_or("?")
-                        ))
-                    } else {
-                        sdk_error(
-                            Phase::Transfer,
-                            format!("get S3 object {:?}", object.key),
-                            error,
-                        )
-                    }
-                })?;
-            let mut body = response.body.into_async_read();
+            let mut body = self.open_body(object, 0).await?;
             let mut hasher = blake3::Hasher::new();
             let mut offset = 0_u64;
+            let mut resumes = 0_u32;
             loop {
-                let read = read_full(&mut body, &mut buffer).await.map_err(|e| {
-                    BackupError::phase(
-                        Phase::Transfer,
-                        format!("read S3 object {:?}: {e}", object.key),
-                    )
-                })?;
+                let read = read_resuming(
+                    &mut body,
+                    &mut buffer,
+                    offset,
+                    item.estimated_bytes,
+                    &mut resumes,
+                    |at| async move {
+                        // Without an ETag nothing pins the resumed range to
+                        // the object the first bytes came from.
+                        if object.etag.is_none() {
+                            return Ok(None);
+                        }
+                        self.open_body(object, at).await.map(Some)
+                    },
+                    |e| {
+                        BackupError::phase(
+                            Phase::Transfer,
+                            format!("read S3 object {:?}: {e}", object.key),
+                        )
+                    },
+                )
+                .await?;
                 if read == 0 {
                     break;
                 }
@@ -463,6 +489,20 @@ async fn list_objects(s3: &ReadOnlyS3, params: &S3Params, phase: Phase) -> Resul
                     .ok_or_else(|| BackupError::phase(phase, "S3 object without key"))
             })
             .collect::<Result<Vec<_>>>()?;
+        // Refused here, before this page's HEADs: the session only checks the
+        // ceiling once the plan exists, by which time an oversized bucket has
+        // already cost one HEAD per key for nothing.
+        if objects.len() + keys.len() > MAX_PLAN_ITEMS {
+            return Err(BackupError::phase(
+                phase,
+                format!(
+                    "S3 bucket {:?} holds more than {MAX_PLAN_ITEMS} objects under the selected \
+                     prefix, the most one run can carry; narrow --prefix and back the bucket up \
+                     in several runs",
+                    params.bucket
+                ),
+            ));
+        }
         // The HEAD per key is not avoidable — `ListObjectsV2` carries neither
         // the user metadata nor the entity headers a 1:1 copy has to reproduce
         // — but serialising it made the listing one round-trip deep per object.

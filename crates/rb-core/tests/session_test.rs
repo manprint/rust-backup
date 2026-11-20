@@ -885,6 +885,54 @@ async fn failed_preflight_aborts_before_apply() {
     assert!(s.await.unwrap().is_err(), "source must see the refusal");
 }
 
+struct UnrunnablePreflightDest;
+#[async_trait]
+impl Destination for UnrunnablePreflightDest {
+    async fn validate(&self, _plan: &BackupPlan) -> Result<Preflight> {
+        Err(rb_core::error::BackupError::phase(
+            rb_core::error::Phase::Validate,
+            "backend unreachable",
+        ))
+    }
+    async fn stream_in(&self, _plan: &BackupPlan, _src: &mut dyn ChunkSource) -> Result<()> {
+        panic!("must never apply: preflight could not run")
+    }
+    async fn verify(
+        &self,
+        _plan: &BackupPlan,
+        _evidence: &RestoreEvidence,
+    ) -> Result<VerificationReport> {
+        panic!("must never verify: preflight could not run")
+    }
+}
+
+/// A preflight that returns an error, rather than a failed check, must still
+/// tell the source why it stops: the source reports a plan rejection carrying
+/// the reason, not a closed stream.
+#[tokio::test]
+async fn a_preflight_that_cannot_run_reaches_the_source_as_a_rejection() {
+    let ch = TestChannel::pair();
+    let src = MockSource {
+        fp: "stable".into(),
+        payload: vec![1u8; 32],
+    };
+    let (p1, p2) = (Progress::default(), Progress::default());
+    let ch2 = ch.clone();
+    let s = tokio::spawn(async move { session::run_source(&src, &*ch, &p1).await });
+    let d = tokio::spawn(async move {
+        let mut yes = |_: &BackupPlan| true;
+        session::run_destination(&UnrunnablePreflightDest, &*ch2, &p2, &mut yes).await
+    });
+    let derr = d.await.unwrap().expect_err("preflight must fail");
+    assert!(derr.to_string().contains("backend unreachable"), "{derr}");
+    let serr = s.await.unwrap().expect_err("source must see the refusal");
+    assert!(
+        matches!(serr, rb_core::error::BackupError::PlanRejected(_)),
+        "got: {serr}"
+    );
+    assert!(serr.to_string().contains("backend unreachable"), "{serr}");
+}
+
 /// T-SESS8: `--max-rate` paces the payload without buffering ahead — a 4 KiB
 /// payload at 4 KiB/s takes at least ~1 s of wall clock.
 #[tokio::test]

@@ -61,6 +61,13 @@ const SSE_S3: &str = "AES256";
 /// per-connection limits (and MinIO's).
 pub(crate) const REQUEST_CONCURRENCY: usize = 16;
 
+/// How many times one object's interrupted body is reopened before the run
+/// fails.
+const MAX_BODY_RESUMES: u32 = 3;
+
+/// The longest key S3 accepts, in UTF-8 bytes.
+const MAX_KEY_BYTES: usize = 1024;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct S3Params {
     #[serde(default)]
@@ -438,6 +445,117 @@ fn target_key(payload: &S3Plan, target_prefix: Option<&str>, source_key: &str) -
     Ok(format!("{}{}", target_prefix.unwrap_or(""), relative))
 }
 
+/// The target keys S3 would refuse, each with the source key it comes from.
+fn unstorable_target_keys(payload: &S3Plan, target_keys: &[String]) -> Vec<String> {
+    payload
+        .objects
+        .iter()
+        .zip(target_keys)
+        .filter_map(|(object, key)| {
+            if key.is_empty() {
+                Some(format!(
+                    "{:?} maps to an empty key (it equals the source prefix; set a destination prefix)",
+                    object.key
+                ))
+            } else if key.len() > MAX_KEY_BYTES {
+                Some(format!(
+                    "{:?} maps to a {}-byte key, over the {MAX_KEY_BYTES}-byte limit",
+                    object.key,
+                    key.len()
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The bucket policy an existing destination bucket carries before the restore.
+#[derive(Debug)]
+enum DestinationPolicy {
+    Absent,
+    Present(String),
+    /// Not readable or not supported; the restore would fail on it at the end.
+    Unusable(String),
+}
+
+async fn read_destination_policy(client: &Client, bucket: &str) -> Result<DestinationPolicy> {
+    let error = match client.get_bucket_policy().bucket(bucket).send().await {
+        Ok(response) => {
+            return Ok(match response.policy() {
+                Some(policy) => DestinationPolicy::Present(policy.to_owned()),
+                None => DestinationPolicy::Absent,
+            })
+        }
+        Err(error) => error,
+    };
+    let code = error
+        .as_service_error()
+        .and_then(|service| service.meta().code());
+    match source::policy_error_kind(code, http_status(&error)) {
+        source::PolicyError::Absent => Ok(DestinationPolicy::Absent),
+        source::PolicyError::Unreadable(_) => Ok(DestinationPolicy::Unusable(
+            sdk_error(Phase::Validate, "read destination bucket policy", error).to_string(),
+        )),
+        source::PolicyError::Failed => Err(sdk_error(
+            Phase::Validate,
+            "read destination bucket policy",
+            error,
+        )),
+    }
+}
+
+/// Whether the source's bucket policy (`wanted`, canonical bytes) may be put
+/// on a destination bucket that already exists.
+///
+/// The policy governs the whole bucket, not the restored prefix: replacing a
+/// different one is as destructive as replacing an object, so it takes the same
+/// `overwrite` consent. A destination that cannot read or hold a policy is
+/// refused here rather than after the last object, where the restore used to
+/// fail on `PutBucketPolicy` or on the policy read-back.
+fn policy_replacement(
+    wanted: &[u8],
+    current: &DestinationPolicy,
+    overwrite: bool,
+) -> (bool, String) {
+    match current {
+        DestinationPolicy::Absent => (
+            true,
+            "destination bucket has no policy; the source's will be applied".to_string(),
+        ),
+        DestinationPolicy::Unusable(why) => (
+            false,
+            format!("the source bucket policy cannot be restored and verified here: {why}"),
+        ),
+        DestinationPolicy::Present(policy) => {
+            // A policy the destination already holds but that is not valid
+            // JSON can only differ from the source's.
+            let same = canonical_policy_bytes(Some(policy), Phase::Validate)
+                .map(|bytes| bytes == wanted)
+                .unwrap_or(false);
+            if same {
+                (
+                    true,
+                    "destination bucket policy already matches the source's".to_string(),
+                )
+            } else if overwrite {
+                (
+                    true,
+                    "destination bucket policy will be replaced by the source's (--overwrite)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    false,
+                    "destination bucket has a different policy, which governs the whole bucket; \
+                     set overwrite=true to permit replacing it with the source's"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
 /// Preserve bucket-policy semantics when source and destination bucket names
 /// differ. S3 policies address the bucket by ARN, so copying the source JSON
 /// verbatim would produce a policy that no longer governs the restored bucket.
@@ -630,7 +748,38 @@ impl Destination for S3Destination {
             },
         );
 
+        // A key S3 cannot store was only discovered by the `PutObject` that
+        // carried it, after the plan had been accepted and earlier objects
+        // written.
+        let unstorable = unstorable_target_keys(&payload, &target_keys);
+        result = result.check(
+            "target-key-names",
+            unstorable.is_empty(),
+            if unstorable.is_empty() {
+                format!("every destination key is 1..={MAX_KEY_BYTES} bytes long")
+            } else {
+                format!(
+                    "destination key(s) S3 cannot store: {}",
+                    summarize(&unstorable)
+                )
+            },
+        );
+
         if exists {
+            if let Some(policy) = &payload.policy {
+                let wanted = canonical_policy_bytes(
+                    Some(&translated_policy(
+                        policy,
+                        &payload.source_bucket,
+                        &self.params.bucket,
+                        Phase::Validate,
+                    )?),
+                    Phase::Validate,
+                )?;
+                let current = read_destination_policy(&client, &self.params.bucket).await?;
+                let (ok, detail) = policy_replacement(&wanted, &current, self.params.overwrite);
+                result = result.check("bucket-policy", ok, detail);
+            }
             let expected: BTreeSet<_> = target_keys.iter().cloned().collect();
             let actual = list_keys(
                 &client,
@@ -993,17 +1142,51 @@ async fn read_back_object(
         ));
     }
 
+    let etag = response.e_tag().map(str::to_owned);
     let mut body = response.body.into_async_read();
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0_u64;
+    let mut resumes = 0_u32;
     let mut buffer = vec![0_u8; CHUNK_SIZE];
     loop {
-        let read = read_full(&mut body, &mut buffer).await.map_err(|error| {
-            BackupError::phase(
-                Phase::Verify,
-                format!("stream restored S3 object {key:?}: {error}"),
-            )
-        })?;
+        let read = read_resuming(
+            &mut body,
+            &mut buffer,
+            offset,
+            object.size,
+            &mut resumes,
+            |at| {
+                let (key, etag) = (&key, etag.as_deref());
+                async move {
+                    let Some(etag) = etag else {
+                        return Ok(None);
+                    };
+                    let resumed = client
+                        .get_object()
+                        .bucket(bucket)
+                        .key(key)
+                        .if_match(etag)
+                        .range(format!("bytes={at}-"))
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            sdk_error(
+                                Phase::Verify,
+                                format!("resume reading restored S3 object {key:?}"),
+                                error,
+                            )
+                        })?;
+                    Ok(Some(resumed.body.into_async_read()))
+                }
+            },
+            |error| {
+                BackupError::phase(
+                    Phase::Verify,
+                    format!("stream restored S3 object {key:?}: {error}"),
+                )
+            },
+        )
+        .await?;
         if read == 0 {
             break;
         }
@@ -1077,18 +1260,73 @@ fn restored_object_faults(source: &S3Object, restored: &S3Object) -> Vec<String>
 /// One `read` returns whatever the HTTP body has buffered — typically a few
 /// KiB — so forwarding each read as-is cut a 1 MiB object into hundreds of
 /// wire chunks, each with its own frame header and per-chunk digest.
-pub(crate) async fn read_full<R: AsyncRead + Unpin>(
+///
+/// `filled` lives with the caller so that a failed read keeps the bytes it
+/// already delivered: a resumed body continues from them.
+async fn read_more<R: AsyncRead + Unpin>(
     reader: &mut R,
     buffer: &mut [u8],
-) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match reader.read(&mut buffer[filled..]).await? {
+    filled: &mut usize,
+) -> std::io::Result<()> {
+    while *filled < buffer.len() {
+        match reader.read(&mut buffer[*filled..]).await? {
             0 => break,
-            read => filled += read,
+            read => *filled += read,
         }
     }
-    Ok(filled)
+    Ok(())
+}
+
+/// Fill `buffer` from an object body that starts at byte `offset` of an object
+/// `total` bytes long, reopening the body where it broke.
+///
+/// The SDK retries a request until its response headers arrive, but not the
+/// body that follows: one reset connection in the middle of a multi-gigabyte
+/// object used to fail the whole run. `reopen` is asked for a body starting at
+/// the first byte not yet read and answers `None` when it cannot guarantee
+/// that body belongs to the same object; `resumes` counts the reopenings of
+/// one object and is bounded by `MAX_BODY_RESUMES`.
+pub(crate) async fn read_resuming<R, F, Fut>(
+    body: &mut R,
+    buffer: &mut [u8],
+    offset: u64,
+    total: u64,
+    resumes: &mut u32,
+    mut reopen: F,
+    fail: impl Fn(std::io::Error) -> BackupError,
+) -> Result<usize>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<R>>>,
+{
+    let mut filled = 0;
+    loop {
+        let error = match read_more(body, buffer, &mut filled).await {
+            Ok(()) => return Ok(filled),
+            Err(error) => error,
+        };
+        let at = offset.saturating_add(filled as u64);
+        if at >= total {
+            // Every declared byte arrived before the connection broke.
+            return Ok(filled);
+        }
+        if *resumes >= MAX_BODY_RESUMES {
+            return Err(fail(error));
+        }
+        match reopen(at).await? {
+            Some(fresh) => {
+                *resumes += 1;
+                tracing::warn!(
+                    at,
+                    attempt = *resumes,
+                    "S3 object body interrupted ({error}); resuming from the byte reached"
+                );
+                *body = fresh;
+            }
+            None => return Err(fail(error)),
+        }
+    }
 }
 
 fn compact_json(value: &serde_json::Value) -> String {
@@ -1210,13 +1448,16 @@ async fn restore_object(
                 offset,
                 data,
             } => {
-                if item_id != item.id || offset != bytes {
+                if item_id != item.id
+                    || offset != bytes
+                    || bytes.saturating_add(data.len() as u64) > item.estimated_bytes
+                {
                     return abort_upload(
                         client,
                         bucket,
                         key,
                         &upload_id,
-                        "non-contiguous S3 item stream",
+                        "S3 item stream is not contiguous or exceeds its declared size",
                     )
                     .await;
                 }
@@ -1731,6 +1972,55 @@ mod tests {
         );
         assert!(target_key(&plan, None, "outside").is_err());
     }
+    #[test]
+    fn keys_s3_cannot_store_are_named_before_the_restore() {
+        let mut plan = S3Plan {
+            source_endpoint: None,
+            source_bucket: "a".into(),
+            source_prefix: Some("in/".into()),
+            objects: vec![object("in/", 0), object("in/a.txt", 1)],
+            policy: None,
+        };
+        let keys = |plan: &S3Plan, prefix: Option<&str>| -> Vec<String> {
+            plan.objects
+                .iter()
+                .map(|object| target_key(plan, prefix, &object.key).unwrap())
+                .collect()
+        };
+        // The folder marker that equals the source prefix has no key left.
+        let faults = unstorable_target_keys(&plan, &keys(&plan, None));
+        assert_eq!(faults.len(), 1);
+        assert!(faults[0].contains("empty key"), "{faults:?}");
+        assert!(unstorable_target_keys(&plan, &keys(&plan, Some("out/"))).is_empty());
+
+        // A longer destination prefix pushes a legal source key over the limit.
+        plan.objects = vec![object(&format!("in/{}", "k".repeat(1020)), 1)];
+        assert!(unstorable_target_keys(&plan, &keys(&plan, None)).is_empty());
+        let faults = unstorable_target_keys(&plan, &keys(&plan, Some("restored/")));
+        assert!(faults[0].contains("1029-byte key"), "{faults:?}");
+    }
+
+    #[test]
+    fn a_different_destination_policy_is_replaced_only_with_overwrite() {
+        let policy = |sid: &str| {
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}}]}}"#
+            )
+        };
+        let wanted = canonical_policy_bytes(Some(&policy("a")), Phase::Validate).unwrap();
+        let check = |current: DestinationPolicy, overwrite| {
+            policy_replacement(&wanted, &current, overwrite).0
+        };
+        assert!(check(DestinationPolicy::Absent, false));
+        assert!(check(DestinationPolicy::Present(policy("a")), false));
+        assert!(!check(DestinationPolicy::Present(policy("b")), false));
+        assert!(check(DestinationPolicy::Present(policy("b")), true));
+        assert!(!check(DestinationPolicy::Present("not json".into()), false));
+        // A bucket that cannot hold or show a policy fails even with overwrite:
+        // the restore would end on it.
+        assert!(!check(DestinationPolicy::Unusable("501".into()), true));
+    }
+
     #[tokio::test]
     async fn parameters_open_without_network() {
         let params = TargetParams::from_value(
@@ -1909,6 +2199,110 @@ mod tests {
         assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 56);
         assert_eq!(&buffer[..56], &data[200..]);
         assert_eq!(read_full(&mut reader, &mut buffer).await.unwrap(), 0);
+    }
+
+    async fn read_full<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        buffer: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let mut filled = 0;
+        read_more(reader, buffer, &mut filled)
+            .await
+            .map(|()| filled)
+    }
+
+    /// A body that delivers `data[at..]` and breaks once it has yielded
+    /// `fail_after` bytes.
+    struct Breaking {
+        data: Vec<u8>,
+        position: usize,
+        left: usize,
+    }
+
+    impl Breaking {
+        fn new(data: &[u8], at: usize, fail_after: usize) -> Self {
+            Self {
+                data: data.to_vec(),
+                position: at,
+                left: fail_after,
+            }
+        }
+    }
+
+    impl AsyncRead for Breaking {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.left == 0 {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            let n = 7
+                .min(self.left)
+                .min(self.data.len() - self.position)
+                .min(buf.remaining());
+            let start = self.position;
+            buf.put_slice(&self.data[start..start + n]);
+            self.position += n;
+            self.left -= n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn drain(data: &[u8], fail_after: usize, resumable: bool) -> (Result<Vec<u8>>, Vec<u64>) {
+        let mut body = Breaking::new(data, 0, fail_after);
+        let mut buffer = [0_u8; 64];
+        let (mut out, mut reopened, mut resumes) = (Vec::new(), Vec::new(), 0_u32);
+        loop {
+            let read = read_resuming(
+                &mut body,
+                &mut buffer,
+                out.len() as u64,
+                data.len() as u64,
+                &mut resumes,
+                |at| {
+                    reopened.push(at);
+                    let fresh = resumable.then(|| Breaking::new(data, at as usize, fail_after));
+                    async move { Ok(fresh) }
+                },
+                |error| BackupError::phase(Phase::Transfer, error.to_string()),
+            )
+            .await;
+            match read {
+                Ok(0) => return (Ok(out), reopened),
+                Ok(read) => out.extend_from_slice(&buffer[..read]),
+                Err(error) => return (Err(error), reopened),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_body_resumes_from_the_byte_it_reached() {
+        let data: Vec<u8> = (0..=255).collect();
+        // Breaks every 100 bytes: two resumes, at the exact bytes reached.
+        let (out, reopened) = drain(&data, 100, true).await;
+        assert_eq!(out.unwrap(), data);
+        assert_eq!(reopened, vec![100, 200]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_body_fails_once_resumes_are_spent_or_refused() {
+        let data: Vec<u8> = (0..=255).collect();
+        let (out, reopened) = drain(&data, 50, true).await;
+        assert!(out.is_err(), "a body that keeps breaking must fail the run");
+        assert_eq!(reopened.len(), MAX_BODY_RESUMES as usize);
+        let (out, reopened) = drain(&data, 100, false).await;
+        assert!(out.is_err(), "no ETag, no resume");
+        assert_eq!(reopened, vec![100]);
+    }
+
+    #[tokio::test]
+    async fn a_break_after_the_last_declared_byte_is_not_an_error() {
+        let data: Vec<u8> = (0..=255).collect();
+        let (out, reopened) = drain(&data, 256, true).await;
+        assert_eq!(out.unwrap(), data);
+        assert!(reopened.is_empty());
     }
 
     /// A reader that returns at most `step` bytes per read, as an HTTP body does.

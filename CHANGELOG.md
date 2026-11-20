@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **session:** a destination preflight that cannot run (backend unreachable,
+  listing denied…) now reaches the source as a plan rejection carrying the
+  reason. The destination used to drop the stream, and the source reported a
+  bare transport failure.
+- **s3:** a bucket over the 200 000-object ceiling is refused while it is
+  listed, not after one `HeadObject` per key of the whole bucket.
+- **s3:** an object body interrupted mid-stream (source read or destination
+  read-back) is resumed with `Range` + `If-Match`, up to three times per
+  object, instead of failing the run.
+- **s3:** preflight refuses target keys S3 cannot store (`target-key-names`:
+  empty, or over 1024 bytes) instead of failing on them mid-restore.
+- **s3:** a multipart item that sends more bytes than it declared is aborted at
+  the first excess chunk, not at the end of the item.
+
+### Changed
+
+- **s3:** on an existing destination bucket, a bucket policy that differs from
+  the source's is replaced only with `--overwrite` (preflight `bucket-policy`);
+  it used to be replaced unconditionally, even by a prefix-scoped restore. A
+  destination that cannot read or hold a policy is refused at preflight.
+
 ## 0.1.3 — release
 
 Test-harness fix: `e2e/postgres_matrix.sh` no longer starts a transfer's

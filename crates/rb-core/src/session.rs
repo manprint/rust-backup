@@ -1026,7 +1026,25 @@ where
 
     // 2. Preflight (disk space, accessibility, version compat, privileges).
     progress.set_stage(Stage::Preflight);
-    let preflight = hot_backup_consent(dest.validate(&plan).await?, &plan, dest);
+    // A preflight that cannot run at all (the backend is unreachable, the plan
+    // payload does not decode) is a refusal like any failed check: without a
+    // PlanAck the source only saw the stream close and reported a transport
+    // failure with no reason.
+    let validated = match dest.validate(&plan).await {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            let reason = format!("destination preflight failed: {error}");
+            let _ = channel::send_ack(&mut stream, false, &reason, 1, false, false).await;
+            let _ = tokio::time::timeout(
+                ABORT_ACK_TIMEOUT,
+                wire::recv_frame::<_, ControlFrame>(&mut stream),
+            )
+            .await;
+            let _ = stream.shutdown().await;
+            return Err(error);
+        }
+    };
+    let preflight = hot_backup_consent(validated, &plan, dest);
     for c in &preflight.checks {
         if c.passed {
             info!(check = %c.name, "{}", c.detail);
