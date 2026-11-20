@@ -1237,7 +1237,8 @@ mod tests {
     async fn a_non_empty_destination_is_refused() {
         let destination_root = tempdir("non-empty-destination");
         fs::write(destination_root.join("pre-existing"), b"x").unwrap();
-        let plan = hostile_plan(&destination_root, vec![entry("f", "file", 0o100_644)]);
+        let mut plan = hostile_plan(&destination_root, vec![entry("f", "file", 0o100_644)]);
+        plan.items = vec![item(1, "f", 0)];
         let destination = FilesystemDestination {
             params: params(&destination_root),
         };
@@ -1539,6 +1540,110 @@ mod tests {
         );
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    fn item(id: u32, name: &str, bytes: u64) -> rb_core::plan::PlanItem {
+        rb_core::plan::PlanItem {
+            id,
+            ordinal: id,
+            kind: "file".into(),
+            name: name.into(),
+            estimated_bytes: bytes,
+            meta: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_items_must_be_the_plans_regular_files() {
+        let root = tempdir("items-destination");
+        let destination = FilesystemDestination {
+            params: params(&root),
+        };
+        let cases: Vec<(Vec<FilesystemEntry>, Vec<rb_core::plan::PlanItem>, &str)> = vec![
+            (
+                vec![entry("d", "dir", 0o040_755)],
+                vec![item(1, "d", 0)],
+                "not a distinct regular-file entry",
+            ),
+            (
+                vec![entry("a", "file", 0o100_644)],
+                vec![item(1, "a", 0), item(2, "a", 0)],
+                "not a distinct regular-file entry",
+            ),
+            (
+                vec![entry("a", "file", 0o100_644)],
+                vec![item(1, "a", 0), item(1, "a", 0)],
+                "duplicate filesystem plan item id",
+            ),
+            (
+                vec![entry("a", "file", 0o100_644)],
+                Vec::new(),
+                "carries no stream item",
+            ),
+            (
+                vec![entry("a", "file", 0o100_644)],
+                vec![item(1, "a", 7)],
+                "announces 7 bytes",
+            ),
+        ];
+        for (entries, items, expected) in cases {
+            let mut plan = hostile_plan(&root, entries);
+            plan.items = items;
+            let error = destination
+                .validate(&plan)
+                .await
+                .expect_err("preflight must refuse the plan");
+            assert!(error.to_string().contains(expected), "preflight: {error}");
+            let mut source = EventSource(VecDeque::from([ChunkEvent::End]));
+            let error = destination
+                .stream_in(&plan, &mut source)
+                .await
+                .expect_err("apply must refuse the plan");
+            assert!(error.to_string().contains(expected), "apply: {error}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_size_is_not_part_of_the_restore_contract() {
+        let source_root = tempdir("dirsize-source");
+        let destination_root = tempdir("dirsize-destination");
+        for root in [&source_root, &destination_root] {
+            fs::create_dir(root.join("d")).unwrap();
+            fs::write(root.join("d/f"), b"x").unwrap();
+        }
+        let mtime = fs::metadata(source_root.join("d")).unwrap();
+        for path in ["d/f", "d", ""] {
+            let times = fs::FileTimes::new().set_modified(mtime.modified().unwrap());
+            fs::File::open(destination_root.join(path))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+            fs::File::open(source_root.join(path))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        let mut payload = crate::walk::collect(&source_root).unwrap();
+        for entry in &mut payload.entries {
+            if entry.kind == "dir" {
+                entry.size += 4096;
+            }
+        }
+        let plan = hostile_plan(&source_root, payload.entries.clone());
+        let mut plan = plan;
+        let mut value: FilesystemPlan = serde_json::from_value(plan.payload).unwrap();
+        value.total_bytes = payload.total_bytes;
+        plan.payload = serde_json::to_value(value).unwrap();
+        let mut destination = params(&destination_root);
+        destination.preserve_ownership = false;
+        dest::verify_metadata(&destination, &plan).expect("directory size must be ignored");
+
+        fs::write(destination_root.join("d/f"), b"xy").unwrap();
+        dest::verify_metadata(&destination, &plan)
+            .expect_err("a file size difference must still be caught");
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&destination_root);
     }
 
     #[tokio::test]

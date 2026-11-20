@@ -154,12 +154,27 @@ seed_source() { # container
       { _id: "event-b", kind: "updated", seq: 2, active: false,
         nested: { source: "worker", retry: true }, tags: [], optional: "present" }
     ]);
+    // Capped: insertion order is state, and it is not _id order here.
+    db.createCollection("ring", { capped: true, size: 65536 });
+    db.ring.insertMany([{ _id: 3, n: "first" }, { _id: 1, n: "second" }, { _id: 2, n: "third" }]);
+    // TTL: every document is long past its expiry. The monitor of the source is
+    // switched off (it would mutate the source mid-run); that of the destination
+    // stays on, so a TTL index built before the read-back loses documents.
+    db.adminCommand({ setParameter: 1, ttlMonitorEnabled: false });
+    db.sessions.createIndex({ at: 1 }, { expireAfterSeconds: 60 });
+    db.sessions.insertMany([{ _id: 1, at: new Date(0) }, { _id: 2, at: new Date(1000) }]);
+    // 6.0+: an index option the typed IndexOptions of the driver does not model.
+    db.orders.createIndex({ total: 1 });
+    try {
+      db.runCommand({ collMod: "orders", index: { keyPattern: { total: 1 }, prepareUnique: true } });
+    } catch (e) {}
   ' >/dev/null
 }
 
 # A deterministic textual digest of a database: per collection, its document
 # count + documents ordered by _id + index key/name/unique specs. Identical for
-# two logically-equal databases regardless of insertion order.
+# two logically-equal databases regardless of insertion order — except for a
+# capped collection, whose insertion order is part of the digest.
 cluster_digest() { # container db
   mongo_eval "$1" "$2" '
     var out = "";
@@ -169,8 +184,20 @@ cluster_digest() { # container db
       .forEach(function (c) {
         var coll = db.getCollection(c);
         var docs = coll.find().sort({ _id: 1 }).toArray();
-        out += c + "|count|" + docs.length + "\n";
-        out += c + "|data|" + JSON.stringify(docs) + "\n";
+        // The documents of a TTL collection expire on the destination once the
+        // restore is verified; its catalog is what stays comparable.
+        var expires = coll.getIndexes().some(function (i) {
+          return i.expireAfterSeconds !== undefined;
+        });
+        if (!expires) {
+          out += c + "|count|" + docs.length + "\n";
+          out += c + "|data|" + JSON.stringify(docs) + "\n";
+        }
+        if (coll.isCapped()) {
+          out += c + "|natural|" + JSON.stringify(
+            coll.find().sort({ $natural: 1 }).toArray().map(function (d) { return d._id; })
+          ) + "\n";
+        }
         var idx = coll.getIndexes().map(function (i) {
           var key = {};
           Object.keys(i.key).forEach(function (field) {
@@ -179,7 +206,11 @@ cluster_digest() { # container db
             // version.  Normalise both without hiding semantic differences.
             key[field] = Number(i.key[field].toString());
           });
-          return { key: key, name: i.name, unique: i.unique === true };
+          return {
+            key: key, name: i.name, unique: i.unique === true,
+            ttl: i.expireAfterSeconds === undefined ? null : Number(i.expireAfterSeconds),
+            prepareUnique: i.prepareUnique === true
+          };
         }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
         out += c + "|idx|" + JSON.stringify(idx) + "\n";
       });

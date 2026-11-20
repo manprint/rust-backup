@@ -125,8 +125,9 @@ vuoto.
 ## Interruzione di un'esecuzione
 
 `SIGINT` (Ctrl-C) e `SIGTERM` interrompono in modo pulito: l'elemento in scrittura
-sulla destinazione viene rimosso, nessuna riga `VERIFIED` viene stampata e il
-comando esce con errore. `SIGKILL` non lascia eseguire nessuna pulizia; in quel
+sulla destinazione viene rimosso (per postgres e mongodb: i database e le
+collection creati dal ripristino, con attesa massima di 30 s; un secondo segnale
+esce subito), nessuna riga `VERIFIED` viene stampata e il comando esce con errore. `SIGKILL` non lascia eseguire nessuna pulizia; in quel
 caso la destinazione "sporca" viene rifiutata alla corsa successiva (per il
 filesystem: la root di destinazione deve essere assente o vuota).
 

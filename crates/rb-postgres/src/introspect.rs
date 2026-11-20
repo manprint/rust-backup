@@ -885,6 +885,248 @@ async fn find_unsupported_objects(
     Ok(found)
 }
 
+/// Object classes and per-object properties the model does not carry, found by
+/// diffing `pg_dump` of a source against its certified restore. Each entry is
+/// `(first major the probe applies to, what, SELECT)`; like the probes above,
+/// every one ignores what an extension owns, which `CREATE EXTENSION` rebuilds.
+const UNMODELLED_PROBES: &[(u32, &str, &str)] = &[
+    (
+        0,
+        "extended statistics (CREATE STATISTICS)",
+        "SELECT (n.nspname || '.' || s.stxname)::text FROM pg_catalog.pg_statistic_ext s JOIN \
+         pg_catalog.pg_namespace n ON n.oid = s.stxnamespace WHERE n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_statistic_ext'::regclass AND d.objid = \
+         s.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "columns with a non-default STORAGE",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_type t ON \
+         t.oid = a.atttypid WHERE c.relkind IN ('r', 'p', 'm') AND a.attnum > 0 AND NOT \
+         a.attisdropped AND a.attstorage <> t.typstorage AND n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+         AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "columns with a statistics target (SET STATISTICS)",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', \
+         'm', 'i') AND a.attnum > 0 AND NOT a.attisdropped AND a.attstattarget >= 0 AND \
+         n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS \
+         (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND \
+         d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "columns with per-column options (n_distinct)",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE a.attnum > 0 AND NOT \
+         a.attisdropped AND EXISTS (SELECT 1 FROM pg_catalog.unnest(a.attoptions) AS o(kv) \
+         WHERE o.kv LIKE 'n_distinct%') AND n.nspname <> 'information_schema' AND \
+         left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        14,
+        "columns with an explicit COMPRESSION method",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', \
+         'm') AND a.attnum > 0 AND NOT a.attisdropped AND a.attcompression IN ('p', 'l') AND \
+         n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS \
+         (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND \
+         d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "tables with a non-default REPLICA IDENTITY",
+        "SELECT (n.nspname || '.' || c.relname)::text FROM pg_catalog.pg_class c JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p') \
+         AND c.relreplident <> 'd' AND n.nspname <> 'information_schema' AND left(n.nspname, \
+         3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "tables clustered on an index (CLUSTER ON)",
+        "SELECT (n.nspname || '.' || c.relname)::text FROM pg_catalog.pg_index i JOIN \
+         pg_catalog.pg_class c ON c.oid = i.indrelid JOIN pg_catalog.pg_namespace n ON n.oid \
+         = c.relnamespace WHERE i.indisclustered AND n.nspname <> 'information_schema' AND \
+         left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "tables with TOAST storage parameters (toast.*)",
+        "SELECT (n.nspname || '.' || c.relname)::text FROM pg_catalog.pg_class c JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_class t ON \
+         t.oid = c.reltoastrelid WHERE t.reloptions IS NOT NULL AND n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+         AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "tables using a table access method other than heap",
+        "SELECT (n.nspname || '.' || c.relname || ' USING ' || am.amname)::text FROM \
+         pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN \
+         pg_catalog.pg_am am ON am.oid = c.relam WHERE c.relkind IN ('r', 'p', 'm') AND \
+         am.amname <> 'heap' AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> \
+         'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "view column defaults",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_attrdef ad JOIN pg_catalog.pg_attribute a ON a.attrelid = ad.adrelid \
+         AND a.attnum = ad.adnum JOIN pg_catalog.pg_class c ON c.oid = ad.adrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'v' AND \
+         n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS \
+         (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND \
+         d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "comments on view or materialized-view columns",
+        "SELECT (n.nspname || '.' || c.relname || '.' || a.attname)::text FROM \
+         pg_catalog.pg_description de JOIN pg_catalog.pg_class c ON c.oid = de.objoid JOIN \
+         pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = de.objsubid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE de.classoid = \
+         'pg_class'::regclass AND de.objsubid > 0 AND c.relkind IN ('v', 'm') AND n.nspname \
+         <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 \
+         FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = \
+         c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "disabled or replica-mode constraint triggers (DISABLE TRIGGER ALL)",
+        "SELECT (n.nspname || '.' || c.relname || '.' || t.tgname)::text FROM \
+         pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid JOIN \
+         pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE t.tgisinternal AND \
+         t.tgenabled <> 'O' AND n.nspname <> 'information_schema' AND left(n.nspname, 3) <> \
+         'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "user-defined casts",
+        "SELECT (pg_catalog.format_type(ca.castsource, NULL) || ' AS ' || \
+         pg_catalog.format_type(ca.casttarget, NULL))::text FROM pg_catalog.pg_cast ca WHERE \
+         ca.oid >= 16384 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid \
+         = 'pg_cast'::regclass AND d.objid = ca.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "user-defined operators",
+        "SELECT (n.nspname || '.' || o.oprname)::text FROM pg_catalog.pg_operator o JOIN \
+         pg_catalog.pg_namespace n ON n.oid = o.oprnamespace WHERE n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_operator'::regclass AND d.objid = o.oid \
+         AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "user-defined operator classes or families",
+        "SELECT name FROM (SELECT ('family ' || n.nspname || '.' || f.opfname)::text AS name \
+         FROM pg_catalog.pg_opfamily f JOIN pg_catalog.pg_namespace n ON n.oid = \
+         f.opfnamespace WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> \
+         'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_opfamily'::regclass AND d.objid = f.oid AND d.deptype = 'e') UNION ALL SELECT \
+         ('class ' || n.nspname || '.' || oc.opcname)::text FROM pg_catalog.pg_opclass oc \
+         JOIN pg_catalog.pg_namespace n ON n.oid = oc.opcnamespace WHERE n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_opclass'::regclass AND d.objid = oc.oid \
+         AND d.deptype = 'e')) AS opclasses",
+    ),
+    (
+        0,
+        "text search configurations, dictionaries, parsers or templates",
+        "SELECT name FROM (SELECT ('configuration ' || n.nspname || '.' || x.cfgname)::text \
+         AS name FROM pg_catalog.pg_ts_config x JOIN pg_catalog.pg_namespace n ON n.oid = \
+         x.cfgnamespace WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> \
+         'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_ts_config'::regclass AND d.objid = x.oid AND d.deptype = 'e') UNION ALL SELECT \
+         ('dictionary ' || n.nspname || '.' || x.dictname)::text AS name FROM \
+         pg_catalog.pg_ts_dict x JOIN pg_catalog.pg_namespace n ON n.oid = x.dictnamespace \
+         WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT \
+         EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_ts_dict'::regclass AND d.objid = x.oid AND d.deptype = 'e') UNION ALL SELECT \
+         ('parser ' || n.nspname || '.' || x.prsname)::text AS name FROM \
+         pg_catalog.pg_ts_parser x JOIN pg_catalog.pg_namespace n ON n.oid = x.prsnamespace \
+         WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT \
+         EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_ts_parser'::regclass AND d.objid = x.oid AND d.deptype = 'e') UNION ALL SELECT \
+         ('template ' || n.nspname || '.' || x.tmplname)::text AS name FROM \
+         pg_catalog.pg_ts_template x JOIN pg_catalog.pg_namespace n ON n.oid = \
+         x.tmplnamespace WHERE n.nspname <> 'information_schema' AND left(n.nspname, 3) <> \
+         'pg_' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_ts_template'::regclass AND d.objid = x.oid AND d.deptype = 'e')) AS text_search",
+    ),
+    (
+        0,
+        "user-defined conversions",
+        "SELECT (n.nspname || '.' || cv.conname)::text FROM pg_catalog.pg_conversion cv JOIN \
+         pg_catalog.pg_namespace n ON n.oid = cv.connamespace WHERE n.nspname <> \
+         'information_schema' AND left(n.nspname, 3) <> 'pg_' AND NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_conversion'::regclass AND d.objid = \
+         cv.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "foreign-data wrappers, foreign servers or user mappings",
+        "SELECT name FROM (SELECT ('wrapper ' || w.fdwname)::text AS name FROM \
+         pg_catalog.pg_foreign_data_wrapper w WHERE NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_foreign_data_wrapper'::regclass AND \
+         d.objid = w.oid AND d.deptype = 'e') UNION ALL SELECT ('server ' || s.srvname)::text \
+         FROM pg_catalog.pg_foreign_server s WHERE NOT EXISTS (SELECT 1 FROM \
+         pg_catalog.pg_depend d WHERE d.classid = 'pg_foreign_server'::regclass AND d.objid = \
+         s.oid AND d.deptype = 'e') UNION ALL SELECT ('user mapping on ' || s.srvname)::text \
+         FROM pg_catalog.pg_user_mapping um JOIN pg_catalog.pg_foreign_server s ON s.oid = \
+         um.umserver WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_foreign_server'::regclass AND d.objid = s.oid AND d.deptype = 'e')) AS \
+         foreign_data",
+    ),
+    (
+        0,
+        "procedural languages installed outside an extension",
+        "SELECT l.lanname::text FROM pg_catalog.pg_language l WHERE l.oid >= 16384 AND NOT \
+         EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_language'::regclass AND d.objid = l.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "user-defined access methods",
+        "SELECT am.amname::text FROM pg_catalog.pg_am am WHERE am.oid >= 16384 AND NOT EXISTS \
+         (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_am'::regclass AND \
+         d.objid = am.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "transforms",
+        "SELECT (pg_catalog.format_type(tr.trftype, NULL) || ' LANGUAGE ' || l.lanname)::text \
+         FROM pg_catalog.pg_transform tr JOIN pg_catalog.pg_language l ON l.oid = tr.trflang \
+         WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = \
+         'pg_transform'::regclass AND d.objid = tr.oid AND d.deptype = 'e')",
+    ),
+    (
+        0,
+        "security labels",
+        "SELECT name FROM (SELECT (sl.provider || ' on ' || \
+         sl.classoid::pg_catalog.regclass::text || ' ' || sl.objoid::text)::text AS name FROM \
+         pg_catalog.pg_seclabel sl UNION ALL SELECT (sh.provider || ' on ' || \
+         sh.classoid::pg_catalog.regclass::text || ' ' || sh.objoid::text)::text FROM \
+         pg_catalog.pg_shseclabel sh) AS labels",
+    ),
+];
+
 /// The probe table, pure so its shape is unit-testable without a server.
 fn unsupported_probes(major: u32) -> Vec<(&'static str, &'static str)> {
     // `(what, name expression, from/where clause)`. The name expression is
@@ -1107,6 +1349,12 @@ fn unsupported_probes(major: u32) -> Vec<(&'static str, &'static str)> {
             PG18_NAMED_NOT_NULL_PROBE,
         ));
     }
+    probes.extend(
+        UNMODELLED_PROBES
+            .iter()
+            .filter(|(first_major, _, _)| major >= *first_major)
+            .map(|(_, what, sql)| (*what, *sql)),
+    );
     // `prokind` is PostgreSQL 11+; on 10 the same split lives in two booleans.
     if major < 11 {
         for probe in &mut probes {
@@ -1647,6 +1895,7 @@ mod tests {
             "logical-replication subscriptions",
             "inheritance children whose inherited column is locally NOT NULL",
             "column-level privileges",
+            "security labels",
         ];
         for major in [10, 11, 18] {
             for (what, sql) in unsupported_probes(major) {
@@ -1663,6 +1912,32 @@ mod tests {
                     "probe {what:?} (major {major}) must ignore extension-owned objects"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unmodelled_properties_are_probed_on_the_majors_that_have_them() {
+        let names = |major| -> Vec<&'static str> {
+            unsupported_probes(major).iter().map(|p| p.0).collect()
+        };
+        for major in [10, 13, 14, 18] {
+            let probes = names(major);
+            for what in [
+                "extended statistics (CREATE STATISTICS)",
+                "columns with a non-default STORAGE",
+                "tables with a non-default REPLICA IDENTITY",
+                "user-defined casts",
+                "security labels",
+            ] {
+                assert!(probes.contains(&what), "{what} missing on {major}");
+            }
+            let unique: std::collections::BTreeSet<_> = probes.iter().collect();
+            assert_eq!(unique.len(), probes.len(), "duplicate probe on {major}");
+            assert_eq!(
+                probes.contains(&"columns with an explicit COMPRESSION method"),
+                major >= 14,
+                "attcompression exists from PostgreSQL 14"
+            );
         }
     }
 

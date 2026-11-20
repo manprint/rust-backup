@@ -73,6 +73,39 @@ connections whose QUIC handshake fails; the consumer's losing primary
 candidates arrive that way and are not the sibling.
 `--no-udp` forces the relay, which is the CI baseline.
 
+A source is normally started first and left waiting, so it keeps its side of
+the direct setup standing for as long as the destination takes to arrive: it
+repeats its candidate offer every 4 s (each repeat pushes the coordinator's
+10 s broker deadline, which bounds a side's *silence*, not its wait) and
+gathers the candidates afresh every fifth repeat so the reflexive mapping is
+still true when the destination pairs. The negotiation runs in the task that
+owns the control stream; the first `accept_stream` waits for its outcome, or
+for the destination to open on the relay, whichever comes first — a
+relay-only destination is never kept waiting. Against a coordinator that
+predates this, the offer expires after 10 s and such a source runs over the
+relay, as it always did.
+
+Both ends of a direct connection prove they hold the channel token without
+sending it: each sends an HMAC, keyed by the token, over its role and keying
+material exported from that QUIC session. The certificate of a direct
+connection is not verified, so the token itself must never cross it — an
+on-path host that terminated the handshake would have collected it and could
+then have dialled the other peer. A proof is worthless on any other session and
+cannot be echoed back as the other role's. Peers on either side of this change
+do not authenticate each other's direct connection and fall back to the relay.
+
+STUN answers are accepted only from the server that was asked, with the
+transaction id that was sent, and within a bounded wait; anything else is
+ignored and the peer simply has no reflexive candidate. The default STUN
+servers are public ones (Google, Cloudflare): a host that must not contact them
+runs with `--no-udp` or names its own in `RUST_BACKUP_STUN_SERVERS`
+(comma-separated `host:port`).
+
+The coordination server answers a peer that asks for UDP while it has none (or
+after its matchmaker closed) with `UdpUnavailable` at once, so the peer falls
+back to the relay without waiting out the candidate timeout. Coordinator
+addresses may be IPv6 literals in brackets (`[::1]:7835`).
+
 Current UDP support includes STUN reflexive candidates, authenticated
 connectivity checks, a bounded learned-address cache (128 entries, advisory:
 it reorders probes and never changes candidate membership or relay fallback) and

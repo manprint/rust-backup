@@ -94,30 +94,76 @@ pub struct BackupPlan {
 }
 
 impl BackupPlan {
-    /// Render a human-readable summary for display (CLI + async-accept prompt).
+    /// Render a human-readable summary listing every item (`plan` dry-run).
     pub fn render(&self) -> String {
+        self.render_items(usize::MAX)
+    }
+
+    /// As [`Self::render`], listing at most [`RENDER_SUMMARY_ITEMS`] items.
+    ///
+    /// For the run log and the accept prompt: at the item ceiling the full
+    /// listing is 200 000 lines on each peer, which buries the preflight
+    /// checks and the prompt it is printed above.
+    pub fn render_summary(&self) -> String {
+        self.render_items(RENDER_SUMMARY_ITEMS)
+    }
+
+    fn render_items(&self, limit: usize) -> String {
         let mut out = String::new();
         out.push_str(&format!(
             "Backup plan  module={}  mode={:?}  created={}\n",
-            self.module, self.mode, self.created_at
+            printable(&self.module),
+            self.mode,
+            printable(&self.created_at)
         ));
-        out.push_str(&format!("  {}\n", self.source_summary));
+        out.push_str(&format!("  {}\n", printable(&self.source_summary)));
         out.push_str(&format!(
             "  items: {}   estimated: {}   integrity: {}\n",
             self.items.len(),
             human_bytes(self.estimated_bytes),
-            self.integrity.algorithm,
+            printable(&self.integrity.algorithm),
         ));
-        for it in &self.items {
+        for it in self.items.iter().take(limit) {
             out.push_str(&format!(
                 "    [{:>3}] {:<10} {:<40} {}\n",
                 it.id,
-                it.kind,
-                it.name,
+                printable(&it.kind),
+                printable(&it.name),
                 human_bytes(it.estimated_bytes)
             ));
         }
+        if self.items.len() > limit {
+            out.push_str(&format!(
+                "    … and {} more item(s); `rust-backup plan` lists them all\n",
+                self.items.len() - limit
+            ));
+        }
         out
+    }
+}
+
+/// Items listed by [`BackupPlan::render_summary`].
+pub const RENDER_SUMMARY_ITEMS: usize = 50;
+
+/// `text` with control characters escaped.
+///
+/// Plan text is the peer's, and item names are whatever the source backend
+/// holds: a file called `x\nRESTORE VERIFIED` must not print a line of its own
+/// in the log an operator reads, nor drive the terminal with escape sequences.
+fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        text.chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect::<Vec<_>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
     }
 }
 
@@ -215,6 +261,54 @@ pub fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_of(names: &[String]) -> BackupPlan {
+        BackupPlan {
+            format_version: PLAN_FORMAT_VERSION,
+            module: "filesystem".into(),
+            mode: BackupMode::Copy1to1,
+            created_at: "now".into(),
+            source_summary: "tree".into(),
+            items: names
+                .iter()
+                .enumerate()
+                .map(|(id, name)| PlanItem {
+                    id: id as u32,
+                    ordinal: id as u32,
+                    kind: "file".into(),
+                    name: name.clone(),
+                    estimated_bytes: 1,
+                    meta: serde_json::Value::Null,
+                })
+                .collect(),
+            estimated_bytes: names.len() as u64,
+            integrity: IntegritySpec::default(),
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn the_logged_plan_is_bounded_and_the_dry_run_is_not() {
+        let names: Vec<String> = (0..RENDER_SUMMARY_ITEMS + 7)
+            .map(|i| format!("f{i}"))
+            .collect();
+        let plan = plan_of(&names);
+        let summary = plan.render_summary();
+        assert_eq!(summary.lines().count(), 3 + RENDER_SUMMARY_ITEMS + 1);
+        assert!(summary.contains("and 7 more item(s)"), "{summary}");
+        assert_eq!(plan.render().lines().count(), 3 + names.len());
+    }
+
+    #[test]
+    fn a_plan_name_cannot_forge_a_log_line() {
+        let plan = plan_of(&["x\nRESTORE VERIFIED\u{1b}[2J".to_string()]);
+        let rendered = plan.render();
+        assert_eq!(rendered.lines().count(), 4, "{rendered}");
+        assert!(
+            rendered.contains("x\\nRESTORE VERIFIED\\u{1b}[2J"),
+            "{rendered}"
+        );
+    }
 
     /// Fault lists stay readable for a plan at the item ceiling.
     #[test]

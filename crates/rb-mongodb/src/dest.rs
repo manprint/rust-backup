@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mongodb::bson::{doc, Document, RawDocumentBuf};
-use mongodb::IndexModel;
 use tokio::sync::mpsc;
 
 use rb_core::channel::{ChunkEvent, ChunkSource};
@@ -292,7 +291,7 @@ pub async fn stream_in(
     params: &MongoDbParams,
     plan: &BackupPlan,
     src: &mut dyn ChunkSource,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     let payload: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Apply, format!("bad plan payload: {e}")))?;
     // Re-checked here, before the first write: preflight and apply are two
@@ -321,7 +320,45 @@ pub async fn stream_in(
         remove_partially_restored(&conn, &payload, &preexisting).await;
         return Err(error);
     }
-    Ok(())
+    // What this run brought into existence, so a failure *after* the load — a
+    // read-back that says no, an operator interrupt — can still remove exactly
+    // that and nothing else.
+    Ok(
+        namespaces_to_remove(planned_namespaces(&payload), &preexisting)
+            .into_iter()
+            .map(|(db, coll)| (db.to_string(), coll.to_string()))
+            .collect(),
+    )
+}
+
+/// Drop the collections a failed run created, after the load already
+/// succeeded. Best effort, and loud about what it could not remove.
+pub async fn abandon_created(params: &MongoDbParams, created: &[(String, String)]) {
+    if created.is_empty() {
+        return;
+    }
+    match MongoConnection::connect(params).await {
+        Ok(conn) => {
+            let created: Vec<(&str, &str)> = created
+                .iter()
+                .map(|(db, coll)| (db.as_str(), coll.as_str()))
+                .collect();
+            drop_created(&conn, created, "the restore was not certified").await;
+        }
+        Err(error) => tracing::error!(
+            %error,
+            "the restore was not certified and its collections could not be removed; \
+             they hold an unverified copy — drop them before retrying"
+        ),
+    }
+}
+
+fn planned_namespaces(payload: &MongoPlanPayload) -> impl Iterator<Item = (&str, &str)> {
+    payload.databases.iter().flat_map(|db| {
+        db.collections
+            .iter()
+            .map(move |coll| (db.name.as_str(), coll.name.as_str()))
+    })
 }
 
 /// The restore proper. Split out of [`stream_in`] so every `?` funnels through
@@ -349,11 +386,12 @@ async fn restore_namespaces(
     // 2. Bulk data: one linear pass over the chunk stream, routed by item id.
     apply_data(&InsertMany(&conn.client), targets, src).await?;
 
-    // 3. Indexes (after data load, so building is cheaper).
+    // 3. Indexes (after data load, so building is cheaper). TTL indexes wait
+    //    for the read-back: see `build_ttl_indexes`.
     for db in &payload.databases {
         let database = conn.client.database(&db.name);
         for coll in &db.collections {
-            build_indexes(&database, coll).await?;
+            build_indexes(&database, coll, |spec| !is_ttl(spec)).await?;
         }
     }
     Ok(())
@@ -433,12 +471,16 @@ async fn remove_partially_restored(
     payload: &MongoPlanPayload,
     preexisting: &HashSet<(String, String)>,
 ) {
-    let targets = payload.databases.iter().flat_map(|db| {
-        db.collections
-            .iter()
-            .map(move |coll| (db.name.as_str(), coll.name.as_str()))
-    });
-    for (db_name, coll_name) in namespaces_to_remove(targets, preexisting) {
+    let created = namespaces_to_remove(planned_namespaces(payload), preexisting);
+    drop_created(conn, created, "restore failed").await;
+}
+
+async fn drop_created<'a>(
+    conn: &MongoConnection,
+    created: impl IntoIterator<Item = (&'a str, &'a str)>,
+    why: &str,
+) {
+    for (db_name, coll_name) in created {
         // The namespace guard already ran before this collection was created;
         // re-check it so a cleanup path can never be the one that drops a system
         // namespace.
@@ -452,18 +494,27 @@ async fn remove_partially_restored(
         match collection.drop().await {
             Ok(()) => tracing::warn!(
                 namespace = %format!("{db_name}.{coll_name}"),
-                "restore failed; dropped the partially restored collection this run created"
+                "{why}; dropped the collection this run created"
             ),
             Err(error) if is_namespace_not_found(&error) => {}
             Err(error) => tracing::error!(
                 namespace = %format!("{db_name}.{coll_name}"),
                 %error,
-                "restore failed and the partially restored collection could not be dropped; \
-                 it holds an incomplete copy and no verification evidence — drop it before \
+                "{why} and the collection this run created could not be dropped; \
+                 it holds an uncertified copy and no verification evidence — drop it before \
                  retrying"
             ),
         }
     }
+}
+
+/// Whether the TTL indexes [`stream_in`] holds back exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlIndexes {
+    /// Before the read-back: every planned index but the TTL ones.
+    Pending,
+    /// After [`build_ttl_indexes`]: the whole planned catalog.
+    Built,
 }
 
 /// Re-read the catalog of every restored collection and compare its options
@@ -471,9 +522,22 @@ async fn remove_partially_restored(
 /// destination database may legitimately hold others (preflight only refuses a
 /// collision), and a view among them must not fail the run either. Users and
 /// volatile size/count estimates are outside the restorable contract.
-pub async fn verify_catalog(params: &MongoDbParams, plan: &BackupPlan) -> Result<()> {
-    let expected: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
+pub async fn verify_catalog(
+    params: &MongoDbParams,
+    plan: &BackupPlan,
+    ttl: TtlIndexes,
+) -> Result<()> {
+    let mut expected: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
         .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
+    if ttl == TtlIndexes::Pending {
+        for coll in expected
+            .databases
+            .iter_mut()
+            .flat_map(|db| &mut db.collections)
+        {
+            coll.indexes.retain(|spec| !is_ttl(spec));
+        }
+    }
     // The read-back that follows routes by the same item meta.
     require_items(plan, &expected, Phase::Verify)?;
 
@@ -544,15 +608,33 @@ fn catalog_faults(
             }
             continue;
         };
-        if got.options != want.options {
+        let comparable = |options: &Option<serde_json::Value>| {
+            let mut options = options.clone();
+            if let Some(options) = options.as_mut() {
+                crate::introspect::integral_numbers(options);
+            }
+            options
+        };
+        if comparable(&got.options) != comparable(&want.options) {
             faults.push(format!("{namespace} has different collection options"));
         }
         let (want_indexes, got_indexes) = (index_specs(&want.indexes), index_specs(&got.indexes));
         if want_indexes != got_indexes {
+            let (planned, restored) = (index_names(&want.indexes), index_names(&got.indexes));
+            // Same names: the difference is inside a spec, so show the spec.
+            let differing = (planned == restored)
+                .then(|| {
+                    want_indexes
+                        .iter()
+                        .zip(&got_indexes)
+                        .find(|(want, got)| want != got)
+                })
+                .flatten()
+                .map(|(want, got)| format!(": planned {want} but restored {got}"))
+                .unwrap_or_default();
             faults.push(format!(
-                "{namespace} has different indexes (planned: {}; restored: {})",
-                index_names(&want.indexes),
-                index_names(&got.indexes)
+                "{namespace} has different indexes (planned: {planned}; restored: \
+                 {restored}){differing}"
             ));
         }
     }
@@ -560,11 +642,33 @@ fn catalog_faults(
 }
 
 /// Index specs in a canonical order, so the comparison does not depend on the
-/// order the server lists them in.
+/// order the server lists them in — nor on the order of a spec's own options,
+/// which says nothing about the index. The order *inside* an option does (a
+/// compound `key` is its field order) and is kept.
 fn index_specs(indexes: &[serde_json::Value]) -> Vec<String> {
-    let mut specs: Vec<String> = indexes.iter().map(|spec| spec.to_string()).collect();
+    let canonical = |spec: &serde_json::Value| {
+        let mut spec = spec.clone();
+        crate::introspect::integral_numbers(&mut spec);
+        canonical_options(&spec)
+    };
+    let mut specs: Vec<String> = indexes.iter().map(canonical).collect();
     specs.sort();
     specs
+}
+
+fn canonical_options(spec: &serde_json::Value) -> String {
+    match spec.as_object() {
+        Some(options) => {
+            let mut options: Vec<_> = options.iter().collect();
+            options.sort_by(|a, b| a.0.cmp(b.0));
+            options
+                .iter()
+                .map(|(name, value)| format!("{name:?}:{value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        None => spec.to_string(),
+    }
 }
 
 fn index_names(indexes: &[serde_json::Value]) -> String {
@@ -614,19 +718,62 @@ fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
     )
 }
 
-/// Build the captured (non-`_id_`) indexes for one collection.
-async fn build_indexes(db: &mongodb::Database, coll: &MongoCollection) -> Result<()> {
-    if coll.indexes.is_empty() {
-        return Ok(());
-    }
-    let collection = db.collection::<Document>(&coll.name);
-    for spec in &coll.indexes {
-        let model: IndexModel = serde_json::from_value(spec.clone()).map_err(|e| {
+/// Whether an index spec expires documents.
+fn is_ttl(spec: &serde_json::Value) -> bool {
+    spec.get("expireAfterSeconds").is_some()
+}
+
+/// Build the captured (non-`_id_`) indexes of one collection for which `wanted`
+/// holds.
+///
+/// The spec goes to `createIndexes` as the document the source's server
+/// reported, not through the driver's typed `IndexOptions`, which drops every
+/// key it does not know.
+async fn build_indexes(
+    db: &mongodb::Database,
+    coll: &MongoCollection,
+    wanted: impl Fn(&serde_json::Value) -> bool,
+) -> Result<()> {
+    let mut specs = Vec::new();
+    for spec in coll.indexes.iter().filter(|spec| wanted(spec)) {
+        let spec: Document = serde_json::from_value(spec.clone()).map_err(|e| {
             BackupError::phase(Phase::Apply, format!("decode index of {}: {e}", coll.name))
         })?;
-        collection.create_index(model).await.map_err(|e| {
+        specs.push(spec);
+    }
+    if specs.is_empty() {
+        return Ok(());
+    }
+    db.run_command(doc! { "createIndexes": &coll.name, "indexes": specs })
+        .await
+        .map_err(|e| {
             BackupError::phase_src(Phase::Apply, format!("create index on {}", coll.name), e)
         })?;
+    Ok(())
+}
+
+/// Create the TTL indexes [`stream_in`] held back.
+///
+/// A TTL index built with the load lets the destination's TTL monitor delete
+/// documents that are already past their expiry before the read-back has
+/// compared them, failing a restore that was in fact exact. So the read-back
+/// runs first, against everything the source sent, and expiry starts after.
+pub async fn build_ttl_indexes(params: &MongoDbParams, plan: &BackupPlan) -> Result<()> {
+    let payload: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
+        .map_err(|e| BackupError::phase(Phase::Verify, format!("bad plan payload: {e}")))?;
+    let mut conn = None;
+    for db in &payload.databases {
+        for coll in &db.collections {
+            if !coll.indexes.iter().any(is_ttl) {
+                continue;
+            }
+            check_namespace(&db.name, &coll.name)?;
+            let conn = match &conn {
+                Some(conn) => conn,
+                None => conn.insert(MongoConnection::connect(params).await?),
+            };
+            build_indexes(&conn.client.database(&db.name), coll, is_ttl).await?;
+        }
     }
     Ok(())
 }
@@ -1377,6 +1524,22 @@ mod tests {
             collections: list,
             skipped: skipped.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// The same index reaches the plan with its options in the server's order
+    /// on one side and the driver's on the other.
+    #[test]
+    fn option_order_is_not_a_difference_but_key_order_is() {
+        let spec = |json: &str| vec![serde_json::from_str::<serde_json::Value>(json).unwrap()];
+        let planned = spec(r#"{"key":{"a":1,"b":1},"v":2,"name":"x","expireAfterSeconds":60}"#);
+        let reordered = spec(r#"{"key":{"a":1,"b":1},"name":"x","expireAfterSeconds":60,"v":2}"#);
+        let other_key = spec(r#"{"key":{"b":1,"a":1},"v":2,"name":"x","expireAfterSeconds":60}"#);
+        assert_eq!(index_specs(&planned), index_specs(&reordered));
+        assert_ne!(index_specs(&planned), index_specs(&other_key));
+        // A server may store a legacy shell's double as an integer.
+        let doubles =
+            spec(r#"{"key":{"a":1.0,"b":1.0},"v":2,"name":"x","expireAfterSeconds":60.0}"#);
+        assert_eq!(index_specs(&planned), index_specs(&doubles));
     }
 
     #[test]

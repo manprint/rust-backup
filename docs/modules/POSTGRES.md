@@ -124,6 +124,12 @@ the server the restore was writing to has gone away — an `ERROR` line names th
 database and the `DROP DATABASE` that finishes the job, and the original
 failure, not the cleanup, is what the process reports and exits with.
 
+`SIGINT`/`SIGTERM` take the same path. The signal makes the destination's
+chunk stream fail, the restore unwinds as on any other error and drops what it
+created, and the process waits for that — up to 30 s — before it exits with
+`interrupted by SIGINT/SIGTERM`. A second signal exits at once, and the message
+then says that a partial restore may be left behind.
+
 The live proof is `e2e/fault_matrix.sh postgres`: with the source or the
 coordination server killed mid-load, the target database is gone afterwards;
 with the destination's own backend stopped mid-apply, nothing can clean up and
@@ -329,6 +335,19 @@ number (`_not_null1`, after a name collision) or one whose table or column was
 renamed after it was created no longer carries the name a restore would give it,
 and is refused like a named one.
 
+The same refusal covers what a `pg_dump` diff of a certified restore showed was
+being dropped: **extended statistics** (`CREATE STATISTICS`); per-column
+**`STORAGE`, `STATISTICS` target, `COMPRESSION`** (PostgreSQL 14+) and
+**`n_distinct`** overrides, including a statistics target on an index column;
+a non-default **`REPLICA IDENTITY`**; **`CLUSTER ON`**; **`toast.*` storage
+parameters**; a table using an **access method other than heap**; **view column
+defaults** and **comments on view or materialized-view columns**; **disabled
+constraint triggers** (`DISABLE TRIGGER ALL`); and user-defined **casts,
+operators, operator classes and families, text search objects, conversions,
+foreign-data wrappers, servers and user mappings, languages installed outside
+an extension, access methods, transforms and security labels**. Objects an
+extension owns are exempt throughout — `CREATE EXTENSION` rebuilds them.
+
 The error names every offender. `allow_unsupported_objects=true`
 (`-P allow_unsupported_objects=true`) accepts a knowingly partial copy; the run
 then logs exactly what it leaves behind.
@@ -479,6 +498,15 @@ previous contents must survive a failed attempt.
   applied last, but a source ACL that does not grant `CONNECT` to the restoring
   account would otherwise lock the read-back out of the database.
 - This is logical, not physical/PITR replication.
+- `sslmode` follows libpq's ladder. `prefer` (the default) asks for TLS and
+  continues in plaintext only when the server answers that it has none; `allow`
+  starts in plaintext and retries over TLS when the server refuses that. Both
+  encrypt without authenticating the server, which is all those modes promise;
+  `disable` never encrypts. `prefer` used to be plaintext even against a
+  TLS-capable server.
+- Every connection attempt is bounded (30 s): a host that accepts the TCP
+  connection and never answers the startup packet fails the run with `no answer
+  within 30 s` instead of hanging it.
 - `sslmode=require`, `verify-ca`, and `verify-full` use rustls. Pass a private
   root CA as `-P sslrootcert=/path/to/ca.pem`; TLS modes are never downgraded.
   All three verify the chain *and* the hostname, i.e. they behave as

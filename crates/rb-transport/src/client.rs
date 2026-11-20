@@ -128,26 +128,23 @@ pub async fn connect_source(cfg: &TransportConfig) -> rb_core::error::Result<Pai
         coordinator = %cfg.to,
         "registered as the source of the channel; the destination can connect now"
     );
-    // Negotiate the direct path on the transport control stream BEFORE it is
-    // moved into the channel (best-effort; falls back to relay on any failure).
+    // The direct path is negotiated by the channel itself, for as long as the
+    // destination takes to arrive (best-effort; relay on any failure).
     #[cfg(feature = "udp")]
-    let direct = if cfg.udp {
-        setup_direct(
-            &mut control,
-            DirectRole::Provider,
-            &cfg.channel,
-            cfg.secret.as_deref(),
-        )
-        .await
-    } else {
-        None
-    };
-    let channel = PairedChannel::source_with_carriers(acceptor, control, cfg.carriers);
-    #[cfg(feature = "udp")]
-    if let Some((dc, token)) = direct {
-        channel.set_direct_with_token(dc, token).await;
+    if cfg.udp {
+        return Ok(PairedChannel::source_with_pending_direct(
+            acceptor,
+            control,
+            cfg.carriers,
+            cfg.channel.clone(),
+            cfg.secret.clone(),
+        ));
     }
-    Ok(channel)
+    Ok(PairedChannel::source_with_carriers(
+        acceptor,
+        control,
+        cfg.carriers,
+    ))
 }
 
 pub async fn connect_destination(cfg: &TransportConfig) -> rb_core::error::Result<PairedChannel> {
@@ -256,16 +253,126 @@ async fn setup_direct_inner(
     channel_id: &str,
     secret: Option<&str>,
 ) -> anyhow::Result<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
-    let tuning = UdpDirectTuning::default();
     // One socket is used for both candidate gathering and QUIC, so any STUN
     // reflexive mapping stays valid for the hole-punched connection.
     let socket = bind_socket(0).await?;
-    let mut gathered = gather_candidates(&socket).await?;
+    let gathered = gather_offer(&socket).await?;
+    send_offer(control, &gathered).await?;
+    let peer_addrs = recv_punch(control).await?;
+    finish_direct(socket, peer_addrs, role, channel_id, secret).await
+}
+
+/// How often a waiting source repeats its candidate offer. Each repeat pushes
+/// the coordinator's broker deadline for this side, so it must stay well under
+/// it (10 s), re-gathering included.
+#[cfg(feature = "udp")]
+const PROVIDER_REOFFER: Duration = Duration::from_secs(4);
+
+/// Every how many repeats the candidates are gathered afresh (a STUN exchange,
+/// which also keeps the NAT mapping of the punch socket alive).
+#[cfg(feature = "udp")]
+const PROVIDER_REGATHER_EVERY: u32 = 5;
+
+#[cfg(feature = "udp")]
+const PROVIDER_REGATHER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The source's side of the direct path, for however long its destination takes
+/// to arrive.
+///
+/// The exchange used to be attempted once, right after registration, against
+/// the same 10 s the destination gets: a source that had been waiting any
+/// longer had already given up, so every such run went through the relay. The
+/// source now keeps its offer standing — repeating it so the coordinator keeps
+/// the exchange open, refreshing it so the candidates are still true — until the
+/// destination's offer arrives or the coordinator says there will be none.
+/// Best-effort: `None` (→ relay) on any failure.
+#[cfg(feature = "udp")]
+pub(crate) async fn setup_direct_provider(
+    control: &mut Delimited<mux::Stream>,
+    channel_id: &str,
+    secret: Option<&str>,
+) -> Option<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
+    match setup_direct_provider_inner(control, channel_id, secret).await {
+        Ok(direct) => {
+            debug!("direct QUIC path established");
+            Some(direct)
+        }
+        Err(e) => {
+            crate::pair_cache::invalidate(channel_id);
+            warn!("direct path unavailable, using relay: {e:#}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "udp")]
+async fn setup_direct_provider_inner(
+    control: &mut Delimited<mux::Stream>,
+    channel_id: &str,
+    secret: Option<&str>,
+) -> anyhow::Result<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
+    let socket = bind_socket(0).await?;
+    let mut gathered = tokio::time::timeout(DIRECT_SETUP_TIMEOUT, gather_offer(&socket))
+        .await
+        .map_err(|_| anyhow::anyhow!("candidate gathering timed out"))??;
+    send_offer(control, &gathered).await?;
+
+    let mut reoffer = tokio::time::interval(PROVIDER_REOFFER);
+    reoffer.tick().await;
+    let mut repeats = 0u32;
+    let peer_addrs = loop {
+        tokio::select! {
+            message = control.recv_server() => {
+                match message.map_err(|e| anyhow::anyhow!("recv punch: {e}"))? {
+                    Some(ServerMsg::UdpPunch { peer_addrs, .. }) => break peer_addrs,
+                    Some(ServerMsg::UdpUnavailable) => {
+                        anyhow::bail!("server reports udp unavailable")
+                    }
+                    Some(ServerMsg::Heartbeat) => {}
+                    Some(other) => {
+                        anyhow::bail!("unexpected control message during punch: {other:?}")
+                    }
+                    None => anyhow::bail!("control closed during punch"),
+                }
+            }
+            _ = reoffer.tick() => {
+                repeats += 1;
+                if repeats.is_multiple_of(PROVIDER_REGATHER_EVERY) {
+                    if let Ok(Ok(fresh)) =
+                        tokio::time::timeout(PROVIDER_REGATHER_TIMEOUT, gather_offer(&socket)).await
+                    {
+                        gathered = fresh;
+                    }
+                }
+                send_offer(control, &gathered).await?;
+            }
+        }
+    };
+    tokio::time::timeout(
+        DIRECT_SETUP_TIMEOUT,
+        finish_direct(socket, peer_addrs, DirectRole::Provider, channel_id, secret),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("direct path setup timed out"))?
+}
+
+/// This side's hole-punch candidates, ready to offer.
+#[cfg(feature = "udp")]
+async fn gather_offer(socket: &tokio::net::UdpSocket) -> anyhow::Result<GatheredCandidates> {
+    let mut gathered = gather_candidates(socket).await?;
     crate::shared::sanitize_and_log("local offer", &mut gathered.candidates);
     gathered.candidates.truncate(MAX_V2_OFFER_CANDIDATES);
     if gathered.candidates.is_empty() {
         anyhow::bail!("no usable local candidates");
     }
+    Ok(gathered)
+}
+
+#[cfg(feature = "udp")]
+async fn send_offer(
+    control: &mut Delimited<mux::Stream>,
+    gathered: &GatheredCandidates,
+) -> anyhow::Result<()> {
     control
         .send_client(ClientMsg::UdpCandidateOffer {
             candidates: gathered
@@ -282,17 +389,27 @@ async fn setup_direct_inner(
                     priority: u16::MAX.saturating_sub(index as u16),
                 })
                 .collect(),
-            addrs: gathered.candidates,
+            addrs: gathered.candidates.clone(),
             generation: 0,
             nat_profile: crate::adaptive_nat::NatProfile {
                 mapping: Some(crate::adaptive_nat::classify_nat(&gathered.reflexive_addrs)),
-                reflexive_addrs: gathered.reflexive_addrs,
+                reflexive_addrs: gathered.reflexive_addrs.clone(),
             },
         })
         .await
-        .map_err(|e| anyhow::anyhow!("send candidate offer: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("send candidate offer: {e}"))
+}
 
-    let mut peer_addrs = recv_punch(control).await?;
+/// Punch towards the peer's candidates and bring the QUIC connection up.
+#[cfg(feature = "udp")]
+async fn finish_direct(
+    socket: tokio::net::UdpSocket,
+    mut peer_addrs: Vec<SocketAddr>,
+    role: DirectRole,
+    channel_id: &str,
+    secret: Option<&str>,
+) -> anyhow::Result<(DirectConn, [u8; crate::direct::TOKEN_LEN])> {
+    let tuning = UdpDirectTuning::default();
     // Defense in depth: the broker already sanitizes, but the punch/dial entry
     // point never trusts a peer-controlled list either.
     crate::shared::sanitize_and_log("peer punch", &mut peer_addrs);
@@ -433,25 +550,40 @@ async fn discover_reflexive(
     socket: &tokio::net::UdpSocket,
     stun_server: &str,
 ) -> anyhow::Result<SocketAddr> {
-    let server = tokio::net::lookup_host(stun_server)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("STUN server did not resolve"))?;
+    // The lookup is bounded like the exchange: on a host whose resolver does
+    // not answer (an isolated network), an unbounded one spends the whole
+    // direct-setup budget here and sends a same-LAN pair to the relay. The
+    // socket is IPv4, so only an IPv4 server address can answer it.
+    let server = tokio::time::timeout(STUN_STEP_TIMEOUT, tokio::net::lookup_host(stun_server))
+        .await
+        .map_err(|_| anyhow::anyhow!("STUN server lookup timeout"))??
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| anyhow::anyhow!("STUN server did not resolve to an IPv4 address"))?;
 
     let txid = stun_txid();
     let req = build_stun_request(&txid);
     socket.send_to(&req, server).await?;
 
     let mut buf = [0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
-        .await
-        .map_err(|_| anyhow::anyhow!("STUN response timeout"))?
-        .map(|(n, _)| n)?;
-    parse_xor_mapped_address(&buf[..n], &txid)
+    let deadline = tokio::time::Instant::now() + STUN_STEP_TIMEOUT;
+    loop {
+        let (n, from) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("STUN response timeout"))??;
+        // Anything else on this socket (a late answer from the previous server,
+        // a stray datagram) is not this server's answer.
+        if from == server {
+            return parse_xor_mapped_address(&buf[..n], &txid);
+        }
+    }
 }
 
 #[cfg(feature = "udp")]
 const STUN_MAGIC: u32 = 0x2112_A442;
+
+/// Budget for each step of one STUN exchange (name lookup, then the answer).
+#[cfg(feature = "udp")]
+const STUN_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "udp")]
 fn stun_txid() -> [u8; 12] {
@@ -481,6 +613,9 @@ fn parse_xor_mapped_address(msg: &[u8], txid: &[u8; 12]) -> anyhow::Result<Socke
 
     if msg.len() < 20 || u16::from_be_bytes([msg[0], msg[1]]) != 0x0101 {
         anyhow::bail!("not a STUN binding success response");
+    }
+    if msg[4..8] != STUN_MAGIC.to_be_bytes() || msg[8..20] != txid[..] {
+        anyhow::bail!("STUN response does not answer this request");
     }
     let mut i = 20;
     while i + 4 <= msg.len() {
@@ -587,6 +722,19 @@ mod tests {
 
         let parsed = parse_xor_mapped_address(&msg, &txid).expect("parse");
         assert_eq!(parsed, real);
+    }
+
+    #[test]
+    fn parse_rejects_an_answer_to_another_request() {
+        let mut other = stun_txid();
+        other[0] ^= 0xff;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&0x0101u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&STUN_MAGIC.to_be_bytes());
+        msg.extend_from_slice(&other);
+        let error = parse_xor_mapped_address(&msg, &stun_txid()).expect_err("foreign txid");
+        assert!(error.to_string().contains("does not answer"), "{error}");
     }
 
     #[test]

@@ -18,10 +18,11 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::channel::{
-    self, ChunkSink, DataChannel, MultiStreamChunkSink, MultiStreamChunkSource, StreamChunkSink,
-    StreamChunkSource,
+    self, ChunkEvent, ChunkSink, ChunkSource, DataChannel, MultiStreamChunkSink,
+    MultiStreamChunkSource, StreamChunkSink, StreamChunkSource,
 };
 use crate::error::{BackupError, Phase, Result};
+use crate::interrupt;
 use crate::module::{Destination, Source};
 use crate::plan::{BackupMode, BackupPlan, Preflight};
 use crate::progress::{self, Progress, Stage};
@@ -505,7 +506,7 @@ async fn source_run(
     channel::validate_plan_bounds(&plan)?;
     progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, items = plan.items.len(), "source plan ready");
-    info!("\n{}", plan.render());
+    info!("\n{}", plan.render_summary());
 
     // 3. Provider accepts the consumer's substream; exchange plan + decision.
     // The wait is bounded like every other handshake step: a destination that
@@ -971,16 +972,83 @@ where
     // Everything that can fail *after* the payload is on disk has to leave the
     // destination without an uncertified copy of the source, so the run is
     // wrapped here rather than at each of its return sites.
-    let applied = AtomicBool::new(false);
-    let outcome = progress::scope(
+    let applied = ApplyState::default();
+    let mut run = Box::pin(progress::scope(
         progress.clone(),
         run_destination_applied(dest, channel, progress, accept, &applied),
-    )
-    .await;
-    if outcome.is_err() && applied.load(Ordering::Relaxed) {
+    ));
+    let outcome = tokio::select! {
+        biased;
+        outcome = &mut run => outcome,
+        signal = interrupt::wait() => {
+            if applied.applying() {
+                // Mid-apply: the chunk stream now fails, so the module unwinds
+                // through its own error path and removes what it created.
+                (&mut run).await
+            } else {
+                Err(interrupt::error(signal))
+            }
+        }
+    };
+    drop(run);
+    if outcome.is_err() && applied.applied() {
         dest.abandon().await;
     }
     outcome
+}
+
+/// Where a destination run stands relative to its payload.
+#[derive(Default)]
+struct ApplyState {
+    applied: AtomicBool,
+    in_flight: std::sync::OnceLock<interrupt::RestoreInFlight>,
+}
+
+impl ApplyState {
+    fn begin(&self) {
+        let _ = self.in_flight.set(interrupt::RestoreInFlight::begin());
+    }
+    fn mark_applied(&self) {
+        self.applied.store(true, Ordering::Relaxed);
+    }
+    fn applied(&self) -> bool {
+        self.applied.load(Ordering::Relaxed)
+    }
+    /// `stream_in` is running: started, not yet returned successfully.
+    fn applying(&self) -> bool {
+        self.in_flight.get().is_some() && !self.applied()
+    }
+}
+
+/// Fails the chunk stream once the operator interrupts, so a restore unwinds
+/// through the module's error path instead of being dropped mid-write.
+struct Interruptible<'a>(&'a mut dyn ChunkSource);
+
+#[async_trait]
+impl ChunkSource for Interruptible<'_> {
+    async fn next(&mut self) -> Result<ChunkEvent> {
+        tokio::select! {
+            biased;
+            signal = interrupt::wait() => Err(interrupt::error(signal)),
+            event = self.0.next() => event,
+        }
+    }
+}
+
+/// Run `stream_in` under the interrupt: an interrupt that lands after the last
+/// chunk was read still fails the apply, so the copy is undone, not certified.
+async fn apply_interruptibly(
+    dest: &dyn Destination,
+    plan: &BackupPlan,
+    src: &mut dyn ChunkSource,
+    applied: &ApplyState,
+) -> Result<()> {
+    applied.begin();
+    let result = dest.stream_in(plan, &mut Interruptible(src)).await;
+    if result.is_ok() {
+        applied.mark_applied();
+    }
+    result.and_then(|()| interrupt::check())
 }
 
 async fn run_destination_applied<F, Fut>(
@@ -988,7 +1056,7 @@ async fn run_destination_applied<F, Fut>(
     channel: &dyn DataChannel,
     progress: &Progress,
     accept: &mut F,
-    applied: &AtomicBool,
+    applied: &ApplyState,
 ) -> Result<BackupPlan>
 where
     F: FnMut(&BackupPlan) -> Fut + Send,
@@ -1022,7 +1090,7 @@ where
     let peer_progress = peer_progress && separate_data_streams;
     progress.set_totals(plan.items.len(), plan.estimated_bytes);
     info!(module = %plan.module, "destination received plan");
-    info!("\n{}", plan.render());
+    info!("\n{}", plan.render_summary());
 
     // 2. Preflight (disk space, accessibility, version compat, privileges).
     progress.set_stage(Stage::Preflight);
@@ -1126,10 +1194,7 @@ where
 
     // 4. Apply the streamed payload (no temp files).
     let mut src = StreamChunkSource::new_counted(stream, progress.clone());
-    let apply_result = dest.stream_in(&plan, &mut src).await;
-    if apply_result.is_ok() {
-        applied.store(true, Ordering::Relaxed);
-    }
+    let apply_result = apply_interruptibly(dest, &plan, &mut src, applied).await;
     let received_items = src.completed_item_ids();
     let received_item_digests = src.completed_item_digests();
     let received_digest = src.completion_digest();
@@ -1300,7 +1365,7 @@ async fn destination_stream_multi(
     progress: &Progress,
     plan: BackupPlan,
     negotiated: Negotiated,
-    applied: &AtomicBool,
+    applied: &ApplyState,
 ) -> Result<BackupPlan> {
     let Negotiated {
         control,
@@ -1442,8 +1507,10 @@ fn failed_check_summary(preflight: &Preflight) -> String {
 
 /// How the destination's multi-stream run ended before its verdict frame, so
 /// the caller — which holds the rejoined control stream — tells the source the
-/// right way: an apply failure waits for the source's `AbortAck`, a verify
-/// failure does not, and a protocol failure sends nothing.
+/// right way: an apply failure waits for the source's `AbortAck`; a verify
+/// failure — the read-back, or a payload that does not add up to the source's
+/// `Done` — sends the reason without waiting; a failure the source already
+/// knows (its own abort, a broken control stream) sends nothing.
 enum VerdictError {
     Apply(BackupError),
     Verify(BackupError),
@@ -1461,7 +1528,7 @@ async fn destination_multi_until_verdict(
     mut control_read: tokio::io::ReadHalf<Box<dyn crate::channel::DuplexStream>>,
     forwarder: PeerProgressForwarder,
     progress: &Progress,
-    applied: &AtomicBool,
+    applied: &ApplyState,
 ) -> Result<(
     std::result::Result<VerificationReport, VerdictError>,
     Box<dyn crate::channel::DuplexStream>,
@@ -1478,12 +1545,9 @@ async fn destination_multi_verdict(
     src: &mut MultiStreamChunkSource,
     control_read: &mut tokio::io::ReadHalf<Box<dyn crate::channel::DuplexStream>>,
     progress: &Progress,
-    applied: &AtomicBool,
+    applied: &ApplyState,
 ) -> std::result::Result<VerificationReport, VerdictError> {
-    let apply_result = dest.stream_in(plan, src).await;
-    if apply_result.is_ok() {
-        applied.store(true, Ordering::Relaxed);
-    }
+    let apply_result = apply_interruptibly(dest, plan, src, applied).await;
     apply_result.map_err(VerdictError::Apply)?;
     let received_items = src.completed_item_ids();
     let received_item_digests = src.completed_item_digests();
@@ -1504,7 +1568,7 @@ async fn destination_multi_verdict(
             .difference(&expected_items)
             .copied()
             .collect();
-        return Err(VerdictError::Plain(BackupError::phase(
+        return Err(VerdictError::Verify(BackupError::phase(
             Phase::Verify,
             format!("item completion mismatch; missing={missing:?} unexpected={unexpected:?}"),
         )));
@@ -1519,7 +1583,7 @@ async fn destination_multi_verdict(
             blake3,
         }) => {
             if total_bytes != progress.bytes() {
-                return Err(VerdictError::Plain(BackupError::phase(
+                return Err(VerdictError::Verify(BackupError::phase(
                     Phase::Verify,
                     format!(
                         "Done.total_bytes={total_bytes} but received={}",
@@ -1528,7 +1592,7 @@ async fn destination_multi_verdict(
                 )));
             }
             if blake3 != received_digest {
-                return Err(VerdictError::Plain(BackupError::phase(
+                return Err(VerdictError::Verify(BackupError::phase(
                     Phase::Verify,
                     "Done.blake3 does not match verified item digests",
                 )));

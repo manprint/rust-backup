@@ -143,6 +143,7 @@ impl BackupModule for Module {
         let mongo_params: MongoDbParams = params.deserialize()?;
         Ok(Box::new(MongoDbDestination {
             params: mongo_params,
+            created: std::sync::Mutex::new(Vec::new()),
         }))
     }
 }
@@ -171,6 +172,9 @@ impl Source for MongoDbSource {
 /// MongoDB destination (restore).
 struct MongoDbDestination {
     params: MongoDbParams,
+    /// Collections the load created, so a run that fails after the load can
+    /// still remove exactly them (`abandon`).
+    created: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 #[async_trait]
@@ -180,7 +184,19 @@ impl Destination for MongoDbDestination {
     }
 
     async fn stream_in(&self, plan: &BackupPlan, src: &mut dyn ChunkSource) -> Result<()> {
-        dest::stream_in(&self.params, plan, src).await
+        let created = dest::stream_in(&self.params, plan, src).await?;
+        if let Ok(mut slot) = self.created.lock() {
+            *slot = created;
+        }
+        Ok(())
+    }
+
+    async fn abandon(&self) {
+        let created = match self.created.lock() {
+            Ok(mut slot) => std::mem::take(&mut *slot),
+            Err(_) => return,
+        };
+        dest::abandon_created(&self.params, &created).await;
     }
 
     async fn verify(
@@ -188,7 +204,7 @@ impl Destination for MongoDbDestination {
         plan: &BackupPlan,
         evidence: &RestoreEvidence,
     ) -> Result<VerificationReport> {
-        dest::verify_catalog(&self.params, plan).await?;
+        dest::verify_catalog(&self.params, plan, dest::TtlIndexes::Pending).await?;
         let mut verifier = VerificationSink::new(evidence);
         source::stream_out(&self.params, plan, &mut verifier)
             .await
@@ -196,6 +212,10 @@ impl Destination for MongoDbDestination {
                 BackupError::phase_src(Phase::Verify, "read back restored MongoDB documents", error)
             })?;
         verifier.finish().await?;
+        // Only now may documents start to expire: the read-back has compared
+        // every one the source sent.
+        dest::build_ttl_indexes(&self.params, plan).await?;
+        dest::verify_catalog(&self.params, plan, dest::TtlIndexes::Built).await?;
         verifier.report("MongoDB catalog and _id-ordered BSON read-back match")
     }
 }

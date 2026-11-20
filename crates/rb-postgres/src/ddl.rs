@@ -685,6 +685,19 @@ pub fn create_function(f: &PgFunction) -> String {
 
 // --- comments / ownership / grants -------------------------------------------
 
+/// `PROCEDURE` or `FUNCTION`: the keyword `ALTER`/`GRANT`/`COMMENT ON` need for
+/// this routine. PostgreSQL refuses the `FUNCTION` form on a procedure.
+pub fn routine_keyword(f: &PgFunction) -> &'static str {
+    if f.definition
+        .trim_start()
+        .starts_with("CREATE OR REPLACE PROCEDURE ")
+    {
+        "PROCEDURE"
+    } else {
+        "FUNCTION"
+    }
+}
+
 /// `ALTER … OWNER TO …;` for a table-like object (TABLE/VIEW/SEQUENCE share the
 /// `ALTER TABLE` form for ownership in PostgreSQL).
 pub fn alter_table_owner(schema: &str, name: &str, owner: &str) -> String {
@@ -759,6 +772,11 @@ pub fn build_cluster_ddl(
     for r in &payload.roles {
         roles.extend(alter_role_settings(r)?);
     }
+    for r in &payload.roles {
+        if let Some(c) = &r.comment {
+            roles.push(comment_on("ROLE", &quote_ident(&r.name), c));
+        }
+    }
     for m in &payload.memberships {
         roles.push(grant_membership(m));
     }
@@ -770,6 +788,9 @@ pub fn build_cluster_ddl(
     for d in &payload.databases {
         databases.push(create_database(d, destination_major)?);
         databases.extend(alter_database_settings(d)?);
+        if let Some(c) = &d.comment {
+            databases.push(comment_on("DATABASE", &quote_ident(&d.name), c));
+        }
     }
 
     let per_database = payload
@@ -924,14 +945,17 @@ fn build_database_ddl(
     for sc in &d.schemas {
         for f in &sc.functions {
             pre.push(create_function(f));
-            // ownership/grants for functions use the FUNCTION form.
+            let kind = routine_keyword(f);
             let fq = format!("{}({})", quote_qualified(&f.schema, &f.name), f.signature);
             post.push(format!(
-                "ALTER FUNCTION {fq} OWNER TO {};",
+                "ALTER {kind} {fq} OWNER TO {};",
                 quote_ident(&f.owner)
             ));
-            post.extend(revoke_before_grant("FUNCTION", &fq, &f.owner, &f.acl));
-            post.extend(grants_from_acl("FUNCTION", &fq, &f.acl));
+            if let Some(c) = &f.comment {
+                post.push(comment_on(kind, &fq, c));
+            }
+            post.extend(revoke_before_grant(kind, &fq, &f.owner, &f.acl));
+            post.extend(grants_from_acl(kind, &fq, &f.acl));
         }
     }
     for t in &tables {
@@ -2043,6 +2067,34 @@ mod tests {
     }
 
     #[test]
+    fn a_procedure_is_owned_commented_and_granted_as_a_procedure() {
+        let mut payload = crate::model::test_fixture();
+        let function = &mut payload.databases[0].schemas[0].functions[0];
+        function.definition =
+            "CREATE OR REPLACE PROCEDURE app.touch()\n LANGUAGE plpgsql\nAS $$ BEGIN NULL; END $$"
+                .to_string();
+        function.comment = Some("housekeeping".to_string());
+        function.acl = vec![
+            "app_owner=X/app_owner".to_string(),
+            "u=X/app_owner".to_string(),
+        ];
+        let ddl =
+            build_cluster_ddl(&payload, 16, ExtensionVersionPolicy::Source).expect("cluster DDL");
+        let post = &ddl.per_database[0].post_data;
+        for expected in [
+            "ALTER PROCEDURE \"app\".\"touch\"() OWNER TO \"app_owner\";",
+            "COMMENT ON PROCEDURE \"app\".\"touch\"() IS 'housekeeping';",
+            "GRANT EXECUTE ON PROCEDURE \"app\".\"touch\"() TO \"u\";",
+        ] {
+            assert!(
+                post.iter().any(|s| s == expected),
+                "{expected} in {post:#?}"
+            );
+        }
+        assert!(post.iter().all(|s| !s.contains(" FUNCTION ")), "{post:#?}");
+    }
+
+    #[test]
     fn cluster_ddl_assembly_ordering() {
         let payload = crate::model::test_fixture();
         let ddl =
@@ -2060,6 +2112,12 @@ mod tests {
             .any(|s| s.starts_with("CREATE TABLESPACE \"fast\"")));
 
         assert!(ddl.databases[0].starts_with("CREATE DATABASE \"appdb\""));
+        assert!(ddl
+            .roles
+            .contains(&"COMMENT ON ROLE \"app_owner\" IS 'application owner';".to_string()));
+        assert!(ddl
+            .databases
+            .contains(&"COMMENT ON DATABASE \"appdb\" IS 'the app db';".to_string()));
 
         let db = &ddl.per_database[0];
         assert_eq!(db.name, "appdb");

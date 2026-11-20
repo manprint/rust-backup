@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rb_core::error::{BackupError, Phase, Result};
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tokio_postgres::config::SslMode;
+use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, Config, CopyOutStream, NoTls, Row};
+use tokio_postgres::{Client, Config, CopyOutStream, NoTls, Row, Socket};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
@@ -702,44 +703,145 @@ impl SourcePool {
     }
 }
 
+/// Bound on one connection attempt, TCP connect through authentication. Without
+/// it a host that drops packets (a firewall, a dead address behind a VIP) held
+/// the run in `connect` for the kernel's own TCP timeout, minutes long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn connect_client(
     cfg: &mut Config,
     params: &PostgresParams,
     database: &str,
 ) -> Result<Client> {
-    let label = || {
-        format!(
-            "connect postgres {}:{}/{database}",
-            params.host, params.port
-        )
-    };
-    if matches!(
-        params.sslmode.as_str(),
-        "require" | "verify-ca" | "verify-full"
-    ) {
-        cfg.ssl_mode(SslMode::Require);
-        let (client, connection) = cfg
-            .connect(postgres_tls(params)?)
-            .await
-            .map_err(|e| BackupError::phase_src(Phase::Connect, label(), e))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::debug!(%e, "postgres connection closed");
+    connect_client_within(cfg, params, database, CONNECT_TIMEOUT).await
+}
+
+/// libpq's `sslmode` ladder. `require` and above verify the server (see
+/// [`postgres_tls`]); `prefer` asks for TLS and continues in plaintext only when
+/// the server answers that it has none; `allow` starts in plaintext and retries
+/// over TLS when the server refuses that. The two opportunistic modes encrypt
+/// without authenticating the server, exactly as in libpq.
+async fn connect_client_within(
+    cfg: &mut Config,
+    params: &PostgresParams,
+    database: &str,
+    deadline: Duration,
+) -> Result<Client> {
+    let label = format!(
+        "connect postgres {}:{}/{database}",
+        params.host, params.port
+    );
+    cfg.connect_timeout(deadline);
+    match params.sslmode.as_str() {
+        "require" | "verify-ca" | "verify-full" => {
+            cfg.ssl_mode(SslMode::Require);
+            establish(cfg, postgres_tls(params)?, deadline, &label).await
+        }
+        "prefer" => {
+            cfg.ssl_mode(SslMode::Prefer);
+            establish(cfg, opportunistic_tls()?, deadline, &label).await
+        }
+        "allow" => {
+            cfg.ssl_mode(SslMode::Disable);
+            match establish(cfg, NoTls, deadline, &label).await {
+                Ok(client) => Ok(client),
+                Err(plaintext) => {
+                    cfg.ssl_mode(SslMode::Require);
+                    establish(cfg, opportunistic_tls()?, deadline, &label)
+                        .await
+                        .map_err(|_| plaintext)
+                }
             }
-        });
-        Ok(client)
-    } else {
-        let (client, connection) = cfg
-            .connect(NoTls)
-            .await
-            .map_err(|e| BackupError::phase_src(Phase::Connect, label(), e))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::debug!(%e, "postgres connection closed");
-            }
-        });
-        Ok(client)
+        }
+        _ => {
+            cfg.ssl_mode(SslMode::Disable);
+            establish(cfg, NoTls, deadline, &label).await
+        }
     }
+}
+
+async fn establish<T>(cfg: &Config, tls: T, deadline: Duration, label: &str) -> Result<Client>
+where
+    T: MakeTlsConnect<Socket> + Send + 'static,
+    T::TlsConnect: Send,
+    T::Stream: Send + 'static,
+    <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
+{
+    let (client, connection) = tokio::time::timeout(deadline, cfg.connect(tls))
+        .await
+        .map_err(|_| {
+            BackupError::phase(
+                Phase::Connect,
+                format!("{label}: no answer within {} s", deadline.as_secs_f32()),
+            )
+        })?
+        .map_err(|e| BackupError::phase_src(Phase::Connect, label.to_string(), e))?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!(%e, "postgres connection closed");
+        }
+    });
+    Ok(client)
+}
+
+/// TLS for `prefer`/`allow`: encryption without server authentication, which
+/// is all those two modes ever promise.
+fn opportunistic_tls() -> Result<MakeRustlsConnect> {
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{DigitallySignedStruct, Error, SignatureScheme};
+
+    #[derive(Debug)]
+    struct Unauthenticated;
+
+    impl ServerCertVerifier for Unauthenticated {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            tokio_rustls::rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    let cfg = ClientConfig::builder_with_provider(std::sync::Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| BackupError::phase_src(Phase::Connect, "configure PostgreSQL TLS", e))?
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(Unauthenticated))
+    .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(cfg))
 }
 
 fn postgres_tls(params: &PostgresParams) -> Result<MakeRustlsConnect> {
@@ -944,6 +1046,99 @@ mod tests {
         ] {
             assert!(require_supported_sslmode(m).is_ok(), "mode={m}");
         }
+    }
+
+    fn pool_params(port: u16) -> PostgresParams {
+        PostgresParams {
+            allow_unsupported_objects: false,
+            hot_backup: false,
+            host: "127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            password: None,
+            database: None,
+            sslmode: "disable".into(),
+            sslrootcert: None,
+            admin: false,
+            overwrite: false,
+            extension_version: crate::ExtensionVersionPolicy::Source,
+        }
+    }
+
+    /// A server that records the first message's protocol code, optionally
+    /// answers an `SSLRequest` with `N` and records the next one, then hangs up.
+    async fn first_protocol_codes(sslmode: &str) -> Vec<u32> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move {
+            let mut codes = Vec::new();
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            for _ in 0..2 {
+                let mut head = [0u8; 8];
+                if socket.read_exact(&mut head).await.is_err() {
+                    break;
+                }
+                let code = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+                codes.push(code);
+                if code != SSL_REQUEST {
+                    break;
+                }
+                socket.write_all(b"N").await.expect("refuse TLS");
+            }
+            codes
+        });
+        let mut params = pool_params(port);
+        params.sslmode = sslmode.into();
+        let mut cfg = Config::new();
+        cfg.host("127.0.0.1").port(port).user("u").dbname("d");
+        let outcome = connect_client_within(&mut cfg, &params, "d", Duration::from_secs(5)).await;
+        assert!(outcome.is_err(), "the fake server never authenticates");
+        server.await.expect("server task")
+    }
+
+    const SSL_REQUEST: u32 = 80_877_103;
+    const STARTUP_V3: u32 = 196_608;
+
+    #[tokio::test]
+    async fn prefer_asks_for_tls_and_falls_back_to_plaintext() {
+        assert_eq!(
+            first_protocol_codes("prefer").await,
+            vec![SSL_REQUEST, STARTUP_V3]
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_and_allow_start_in_plaintext() {
+        for mode in ["disable", "allow"] {
+            assert_eq!(first_protocol_codes(mode).await, vec![STARTUP_V3], "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn require_never_falls_back_to_plaintext() {
+        assert_eq!(first_protocol_codes("require").await, vec![SSL_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_fails_the_connection_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let mut params = pool_params(port);
+        params.sslmode = "disable".into();
+        let mut cfg = Config::new();
+        cfg.host("127.0.0.1").port(port).user("u").dbname("d");
+        let started = std::time::Instant::now();
+        let error = connect_client_within(&mut cfg, &params, "d", Duration::from_millis(300))
+            .await
+            .expect_err("a server that never answers must not hold the run");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("no answer within"), "{error}");
+        drop(listener);
     }
 
     #[test]

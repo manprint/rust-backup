@@ -246,9 +246,20 @@ impl ReadOnlyDatabase {
 /// reaps a cursor idle longer than `cursorTimeoutMillis` (10 minutes by
 /// default), so a destination slower than the source by that much used to kill
 /// the backup with `CursorNotFound` on a perfectly healthy source.
-pub(crate) fn sort_by_id() -> FindOptions {
+///
+/// A capped collection is the exception: its insertion (natural) order is
+/// state — `find()` with no sort, `$natural` and tailable cursors read it, and
+/// it decides eviction — so it is read in `$natural` order. The destination
+/// inserts in stream order, which reproduces it, and its read-back in the same
+/// order proves it.
+pub(crate) fn read_order(capped: bool) -> FindOptions {
+    let sort = if capped {
+        doc! { "$natural": 1 }
+    } else {
+        doc! { "_id": 1 }
+    };
     FindOptions::builder()
-        .sort(doc! { "_id": 1 })
+        .sort(sort)
         .no_cursor_timeout(true)
         .build()
 }
@@ -348,8 +359,15 @@ mod tests {
     /// the run with `CursorNotFound` on an untouched source.
     #[test]
     fn source_reads_are_id_ordered_and_immune_to_the_cursor_reaper() {
-        let options = sort_by_id();
+        let options = read_order(false);
         assert_eq!(options.sort, Some(doc! { "_id": 1 }));
+        assert_eq!(options.no_cursor_timeout, Some(true));
+    }
+
+    #[test]
+    fn a_capped_collection_is_read_in_insertion_order() {
+        let options = read_order(true);
+        assert_eq!(options.sort, Some(doc! { "$natural": 1 }));
         assert_eq!(options.no_cursor_timeout, Some(true));
     }
 

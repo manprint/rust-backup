@@ -74,7 +74,7 @@ di righe che non torna lo fa diventare `5`. Il dettaglio delle righe è in
 | `the source ran as a hot backup (online, not audited for immutability); pass --hot-backup to the destination …` | `3` | la sorgente ha fatto un backup a caldo e la destinazione non l'ha accettato: aggiungere `--hot-backup` alla destinazione |
 | `--hot-backup is not supported by the … module` | `2` | `--hot-backup` passato a un modulo diverso da PostgreSQL |
 | `hot backup: the connection holding the snapshot of database '…' was lost; restart the backup` | `7` | durante un backup a caldo è caduta la connessione che teneva lo snapshot: ripetere |
-| `interrupted by SIGINT/SIGTERM` | `1` | esecuzione interrotta: l'elemento attivo è stato rimosso, nulla è certificato |
+| `interrupted by SIGINT/SIGTERM` | `1` | esecuzione interrotta: nulla è certificato. Il file attivo (filesystem) e i database/collection creati dal ripristino (postgres, mongodb) vengono rimossi prima dell'uscita (attesa max 30 s; un secondo segnale esce subito e può lasciare un ripristino parziale) |
 
 ## Diagnostica passo per passo
 

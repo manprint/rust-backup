@@ -60,6 +60,7 @@ pub(crate) fn validate_with(
 ) -> Result<Preflight> {
     let payload = payload(plan, Phase::Validate)?;
     validate_entries(&payload)?;
+    validate_items(&plan.items, &payload)?;
     let root = Path::new(&params.root);
     let parent = root.parent().unwrap_or_else(|| Path::new("."));
     let parent_ok = parent.is_dir();
@@ -148,11 +149,13 @@ pub(crate) async fn stream_in(
     src: &mut dyn ChunkSource,
 ) -> Result<()> {
     let payload = std::sync::Arc::new(payload(plan, Phase::Apply)?);
+    let items = plan.items.clone();
     let prepared = std::sync::Arc::clone(&payload);
     let overwrite = params.overwrite;
     let root_path = std::path::PathBuf::from(&params.root);
     crate::blocking(Phase::Apply, move || {
         validate_entries(&prepared)?;
+        validate_items(&items, &prepared)?;
         let root = root_path.as_path();
         if !destination_is_empty(root)? {
             if !overwrite {
@@ -246,9 +249,78 @@ pub(crate) async fn stream_in(
     let root_path = root.to_path_buf();
     crate::blocking(Phase::Apply, move || {
         create_nodes(&root_path, &payload)?;
-        apply_metadata(&root_path, &payload, chown)
+        apply_metadata(&root_path, &payload, chown)?;
+        sync_destination(&root_path)
     })
     .await
+}
+
+/// Flush the restored tree to stable storage. The read-back verification is
+/// served from the page cache, so without this a delayed-allocation `ENOSPC`
+/// or a write-back `EIO` would surface only after the run reported success.
+fn sync_destination(root: &Path) -> Result<()> {
+    let dir = File::open(root).map_err(|e| io_error(Phase::Apply, root, e))?;
+    #[cfg(target_os = "linux")]
+    nix::unistd::syncfs(&dir).map_err(|e| {
+        BackupError::phase(
+            Phase::Apply,
+            format!("flush restored filesystem {}: {e}", root.display()),
+        )
+    })?;
+    #[cfg(not(target_os = "linux"))]
+    dir.sync_all()
+        .map_err(|e| io_error(Phase::Apply, root, e))?;
+    Ok(())
+}
+
+/// Every stream item must be exactly one regular-file entry of the payload,
+/// and every regular-file entry must be an item: an item naming anything else
+/// would write bytes at a path the plan describes as a directory, a link or
+/// nothing at all.
+fn validate_items(items: &[rb_core::plan::PlanItem], payload: &FilesystemPlan) -> Result<()> {
+    let mut files: HashMap<&str, u64> = payload
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "file")
+        .map(|entry| (entry.path.as_str(), entry.size))
+        .collect();
+    let mut ids = std::collections::HashSet::new();
+    for item in items {
+        if !ids.insert(item.id) {
+            return Err(BackupError::phase(
+                Phase::Validate,
+                format!("duplicate filesystem plan item id {}", item.id),
+            ));
+        }
+        match files.remove(item.name.as_str()) {
+            Some(size) if size == item.estimated_bytes => {}
+            Some(size) => {
+                return Err(BackupError::phase(
+                    Phase::Validate,
+                    format!(
+                        "filesystem plan item {:?} announces {} bytes but its entry records {size}",
+                        item.name, item.estimated_bytes
+                    ),
+                ));
+            }
+            None => {
+                return Err(BackupError::phase(
+                    Phase::Validate,
+                    format!(
+                        "filesystem plan item {:?} is not a distinct regular-file entry of the plan",
+                        item.name
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(path) = files.keys().min() {
+        return Err(BackupError::phase(
+            Phase::Validate,
+            format!("filesystem plan carries no stream item for file {path:?}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Re-scan the destination after apply and compare every selected path and
@@ -279,7 +351,9 @@ pub(crate) fn verify_metadata(params: &FilesystemParams, plan: &BackupPlan) -> R
             || (source.uid == destination.uid && source.gid == destination.gid);
         if source.path != destination.path
             || source.kind != destination.kind
-            || source.size != destination.size
+            // A directory's `st_size` is the filesystem's own bookkeeping
+            // (it never shrinks on ext4), not restorable state.
+            || (source.kind != "dir" && source.size != destination.size)
             || source.mode != destination.mode
             || source.mtime != destination.mtime
             || source.mtime_nsec != destination.mtime_nsec

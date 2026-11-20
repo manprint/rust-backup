@@ -59,6 +59,17 @@ pub struct MongoCollection {
     pub estimated_bytes: u64,
 }
 
+impl MongoCollection {
+    /// Whether the collection is capped, i.e. its insertion order is state.
+    pub fn is_capped(&self) -> bool {
+        self.options
+            .as_ref()
+            .and_then(|options| options.get("capped"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
 /// A MongoDB user definition (captured for visibility/fingerprint only).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MongoUser {

@@ -18,6 +18,75 @@
 - **s3:** a multipart item that sends more bytes than it declared is aborted at
   the first excess chunk, not at the end of the item.
 
+- **postgres:** a procedure is owned, commented and granted with the
+  `PROCEDURE` keyword. `ALTER FUNCTION … OWNER TO` on a procedure made every
+  restore of a database holding one fail during apply.
+- **postgres:** database and role comments (`COMMENT ON DATABASE`/`ROLE`) and
+  function/procedure comments are restored. They were captured and compared but
+  never applied, so a commented database — including the stock `postgres`
+  database — could not pass verification.
+- **postgres:** cleanup after a failed `--overwrite` restore no longer connects
+  to a database it is about to drop.
+- **postgres:** analysis now refuses 22 more object classes and properties that
+  were silently dropped from a restore still reported as verified: extended
+  statistics, column `STORAGE`/`STATISTICS`/`COMPRESSION`/`n_distinct`
+  overrides, `REPLICA IDENTITY`, `CLUSTER ON`, `toast.*` storage parameters,
+  non-heap table access methods, view column defaults, view and materialized
+  view column comments, disabled constraint triggers, casts, operators,
+  operator classes and families, text search objects, conversions, foreign-data
+  wrappers/servers/user mappings, non-extension languages, access methods,
+  transforms and security labels. `allow_unsupported_objects=true` still
+  accepts the partial copy.
+- **mongodb:** a capped collection is read in `$natural` order, so its
+  insertion order — which decides what it evicts next — is reproduced. Both
+  peers must run this version for capped collections whose `_id` order differs
+  from their insertion order.
+- **filesystem:** a directory's `st_size` is no longer part of the read-back;
+  it failed correct restores between different file systems.
+- **filesystem:** the destination flushes the restored file system before
+  reporting success, and refuses a plan whose stream items are not exactly its
+  regular-file entries.
+- **session:** verification mismatches reach the source as the abort reason,
+  and `run --config` validates every target's module and `hot_backup` support
+  before the first target starts.
+- **cli:** the confirmation prompt renders the plan summary with control
+  characters escaped.
+- **transport:** the server bounds the TLS accept and the control substream
+  open with `HANDSHAKE_TIMEOUT`, answers a UDP request it cannot serve with an
+  immediate `UdpUnavailable`, and accepts bracketed IPv6 bind and coordinator
+  addresses; STUN replies are validated (source, transaction id, deadline).
+- **transport:** a source that waited for its destination longer than the 10 s
+  broker window no longer always runs over the relay. It keeps its candidate
+  offer standing (repeated every 4 s, re-gathered periodically) and the
+  coordinator's broker deadline now bounds a side's silence, not its wait.
+- **transport:** the direct-path token no longer crosses the (unverified) QUIC
+  connection. Each end sends a role-bound HMAC over keying material exported
+  from that session, so an on-path host cannot collect and replay it. Peers on
+  either side of this change fall back to the relay with each other.
+- **session/cli:** `SIGINT`/`SIGTERM` during a restore no longer leave the
+  partial databases (postgres) or collections (mongodb) behind: the restore
+  unwinds through its own failure path and the process waits for it (30 s, a
+  second signal exits at once).
+- **mongodb:** the collections a run created are dropped when it fails after
+  the load (verification mismatch, lost source), not only when the load fails.
+- **mongodb:** index and collection options the driver's typed structs do not
+  model (`prepareUnique`…) are carried from the raw catalog and compared on the
+  read-back instead of being dropped unnoticed.
+- **mongodb:** an index whose options the driver cannot decode (a TTL whose
+  `expireAfterSeconds` a legacy shell stored as a double) keeps its name and
+  options; it used to be recreated as a plain index and reported verified.
+  Whole catalog numbers are compared by value, not BSON type.
+- **mongodb:** TTL indexes are built after the data read-back, so the
+  destination's TTL monitor cannot delete expired documents before they are
+  verified.
+- **postgres:** every connection attempt is bounded (30 s); a server that
+  accepts the socket and never answers used to hang the run.
+- **postgres:** `sslmode=prefer` (the default) and `allow` negotiate TLS as in
+  libpq. Both used to connect in plaintext unconditionally.
+- **cli:** confirmation prompts of parallel `run --config` targets are asked
+  one at a time; they used to interleave on the terminal, so an answer could
+  approve a plan other than the one last displayed.
+
 ### Changed
 
 - **s3:** on an existing destination bucket, a bucket policy that differs from

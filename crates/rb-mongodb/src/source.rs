@@ -20,7 +20,8 @@ use rb_core::error::{BackupError, Phase, Result};
 use rb_core::plan::BackupPlan;
 use rb_core::wire::CHUNK_SIZE;
 
-use crate::connect::{sort_by_id, ReadOnlyConnection};
+use crate::connect::{read_order, ReadOnlyConnection};
+use crate::model::MongoPlanPayload;
 use crate::MongoDbParams;
 
 /// The per-item descriptor carried in `PlanItem::meta` (set by `build_plan`,
@@ -40,6 +41,7 @@ pub async fn stream_out(
     plan: &BackupPlan,
     sink: &mut dyn ChunkSink,
 ) -> Result<()> {
+    let capped = capped_namespaces(plan)?;
     let conn = ReadOnlyConnection::connect(params).await?;
 
     for item in &plan.items {
@@ -54,11 +56,13 @@ pub async fn stream_out(
         })?;
 
         // A stable order makes the source commitment reproducible when the
-        // destination is read back after restore. `_id` is unique and indexed.
+        // destination is read back after restore. `_id` is unique and indexed;
+        // a capped collection is read in its insertion order instead.
+        let order = read_order(capped.contains(&(meta.database.clone(), meta.collection.clone())));
         let mut cursor = conn
             .client
             .database(&meta.database)
-            .find(&meta.collection, doc! {}, Some(sort_by_id()))
+            .find(&meta.collection, doc! {}, Some(order))
             .await
             .map_err(|e| {
                 BackupError::phase_src(Phase::Transfer, format!("find {}", item.name), e)
@@ -74,6 +78,22 @@ pub async fn stream_out(
         out.finish().await?;
     }
     Ok(())
+}
+
+/// The `(database, collection)` namespaces the plan's catalog declares capped.
+fn capped_namespaces(plan: &BackupPlan) -> Result<std::collections::HashSet<(String, String)>> {
+    let payload: MongoPlanPayload = serde_json::from_value(plan.payload.clone())
+        .map_err(|e| BackupError::phase(Phase::Transfer, format!("bad plan payload: {e}")))?;
+    Ok(payload
+        .databases
+        .iter()
+        .flat_map(|db| {
+            db.collections
+                .iter()
+                .filter(|coll| coll.is_capped())
+                .map(move |coll| (db.name.clone(), coll.name.clone()))
+        })
+        .collect())
 }
 
 /// Re-chunks one item's concatenated documents into full `CHUNK_SIZE` wire
@@ -177,6 +197,21 @@ mod tests {
             out.write(&mongodb::bson::to_vec(doc).unwrap()).await?;
         }
         out.finish().await
+    }
+
+    #[test]
+    fn only_capped_collections_are_read_in_insertion_order() {
+        let mut payload = crate::model::test_fixture();
+        let mut log = payload.databases[0].collections[0].clone();
+        log.name = "log".to_string();
+        log.options = Some(serde_json::json!({ "capped": true, "size": 4096 }));
+        payload.databases[0].collections.push(log);
+        let plan = crate::introspect::build_plan(&payload, String::new());
+        let capped = capped_namespaces(&plan).unwrap();
+        assert_eq!(
+            capped.into_iter().collect::<Vec<_>>(),
+            vec![("appdb".to_string(), "log".to_string())]
+        );
     }
 
     #[tokio::test]

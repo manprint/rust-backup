@@ -25,6 +25,7 @@
 pub mod channel;
 pub mod config;
 pub mod error;
+pub mod interrupt;
 pub mod module;
 pub mod plan;
 pub mod progress;

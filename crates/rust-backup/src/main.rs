@@ -528,16 +528,53 @@ async fn run_main() -> anyhow::Result<()> {
     //
     // A `SIGKILL` still denies every cleanup by definition; that case is covered
     // separately by refusing a dirty destination on the next run.
-    tokio::select! {
+    let run = dispatch(cli.cmd, &registry);
+    tokio::pin!(run);
+    let signal = tokio::select! {
         biased;
-        signal = shutdown_signal() => Err(anyhow!(
+        signal = shutdown_signal() => signal,
+        result = &mut run => return result,
+    };
+    // A restore in flight is not dropped: it is told to stop, and given a
+    // bounded time to remove what it created (a half-restored database or
+    // collection has no file-level guard to do that for it).
+    rb_core::interrupt::request(signal);
+    let cleaned = if rb_core::interrupt::restores_in_flight() == 0 {
+        true
+    } else {
+        tracing::warn!(
+            "interrupted by {signal}: removing the partial restore (up to {} s; \
+             interrupt again to exit immediately)",
+            INTERRUPT_GRACE.as_secs()
+        );
+        tokio::select! {
+            biased;
+            _ = shutdown_signal() => false,
+            _ = tokio::time::sleep(INTERRUPT_GRACE) => false,
+            _ = async { tokio::select! {
+                _ = &mut run => {},
+                _ = rb_core::interrupt::restores_settled() => {},
+            } } => true,
+        }
+    };
+    if cleaned {
+        Err(anyhow!(
             "interrupted by {signal}: the run was aborted before completion. \
              Nothing incomplete is ever certified — no VERIFIED line was printed — \
-             and the destination's active item was removed. Re-run the transfer."
-        )),
-        result = dispatch(cli.cmd, &registry) => result,
+             and what the destination had partially restored was removed. Re-run the transfer."
+        ))
+    } else {
+        Err(anyhow!(
+            "interrupted by {signal}: the run was aborted before the destination finished \
+             removing its partial restore. Nothing incomplete is ever certified — no VERIFIED \
+             line was printed — but the destination may hold an incomplete copy: remove it \
+             (or re-run with --overwrite) before trusting it."
+        ))
     }
 }
+
+/// How long an interrupted restore may spend removing what it created.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Resolve on the first `SIGINT`/`SIGTERM`, naming the one that arrived.
 ///
@@ -719,6 +756,16 @@ async fn run_session(
         return Err(anyhow!(
             "`run --config` does not start `server:`; start `rust-backup server` separately"
         ));
+    }
+    // Refused before the first target starts: found at its turn, a bad later
+    // target stopped a session whose earlier targets had already run — and, in
+    // a parallel session, aborted the transfers still in flight.
+    for (i, target) in cfg.targets.iter().enumerate() {
+        let module = reg
+            .get(&target.module)
+            .ok_or_else(|| anyhow!("target {i}: unknown module '{}'", target.module))?;
+        refuse_unsupported_hot_backup(&module, &TargetParams(target.params.clone()))
+            .with_context(|| format!("target {i} ({}/{:?})", target.module, target.role))?;
     }
     if let Some(parallel) = requested_parallel {
         cfg.parallel_targets = parallel.max(1);
@@ -1075,7 +1122,7 @@ async fn execute(
                     if auto_accept {
                         return Box::pin(async { true });
                     }
-                    let rendered = plan.render();
+                    let rendered = plan.render_summary();
                     Box::pin(async move {
                         tokio::task::spawn_blocking(move || prompt_yes_rendered(&rendered))
                             .await
@@ -1105,13 +1152,28 @@ async fn execute(
 /// Interactive async-accept: show the plan and read `yes`/`no` from stdin.
 fn prompt_yes_rendered(rendered: &str) -> bool {
     use std::io::Write;
-    print!("\n{rendered}\nProceed with restore? [yes/no] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    prompt_one_at_a_time(
+        || {
+            print!("\n{rendered}\nProceed with restore? [yes/no] ");
+            let _ = std::io::stdout().flush();
+        },
+        || {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok().map(|_| line)
+        },
+    )
+}
+
+/// Ask one question and read its answer with every other prompt of this
+/// process held off: parallel targets of one `run` share a single stdin, and an
+/// answer typed under two interleaved questions would approve the wrong plan.
+fn prompt_one_at_a_time(ask: impl FnOnce(), read: impl FnOnce() -> Option<String>) -> bool {
+    static PROMPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = PROMPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ask();
+    read().is_some_and(|line| matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 /// The crates whose events reach the log by default: every crate of this
@@ -1345,6 +1407,73 @@ targets:
         .expect_err("server section must not be silently ignored");
         assert!(error.to_string().contains("does not start `server:`"));
         std::fs::remove_file(yaml).ok();
+    }
+
+    #[test]
+    fn parallel_prompts_take_turns_at_the_terminal() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answers = [("a", "yes\n"), ("b", "no\n"), ("c", " Y \n")];
+        let handles: Vec<_> = answers
+            .into_iter()
+            .map(|(name, answer)| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let asked = log.clone();
+                    let accepted = prompt_one_at_a_time(
+                        move || asked.lock().unwrap().push(format!("ask {name}")),
+                        || {
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            log.lock().unwrap().push(format!("read {name}"));
+                            Some(answer.to_string())
+                        },
+                    );
+                    (name, accepted)
+                })
+            })
+            .collect();
+        let mut verdicts: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        verdicts.sort();
+        assert_eq!(verdicts, [("a", true), ("b", false), ("c", true)]);
+        let log = log.lock().unwrap();
+        for turn in log.chunks(2) {
+            assert_eq!(
+                turn[0].replace("ask", "read"),
+                turn[1],
+                "a second question was printed before the first was answered: {log:?}"
+            );
+        }
+        assert!(!prompt_one_at_a_time(|| {}, || None));
+    }
+
+    #[tokio::test]
+    async fn a_bad_later_target_is_refused_before_any_target_runs() {
+        for (second, expected) in [
+            (
+                "module: nosuch\n    role: source\n    params: {}",
+                "target 1: unknown module 'nosuch'",
+            ),
+            (
+                "module: filesystem\n    role: source\n    params: { root: /, hot_backup: true }",
+                "--hot-backup is not supported",
+            ),
+        ] {
+            let yaml = write_yaml(&format!(
+                "targets:\n  - module: filesystem\n    role: source\n    \
+                 transport: {{ to: \"127.0.0.1:1\", channel: first }}\n    \
+                 params: {{ root: /nonexistent-rust-backup-root }}\n  - {second}\n    \
+                 transport: {{ to: \"127.0.0.1:1\", channel: second }}\n"
+            ));
+            let error = run_session(
+                &build_registry(),
+                yaml.to_str().expect("utf8 path"),
+                None,
+                false,
+            )
+            .await
+            .expect_err("the session must be refused");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            std::fs::remove_file(yaml).ok();
+        }
     }
 
     /// The YAML destination target sets `admin: true`. A `bool` field could only

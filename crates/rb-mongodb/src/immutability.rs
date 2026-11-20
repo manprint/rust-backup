@@ -16,7 +16,7 @@ use mongodb::bson::doc;
 use rb_core::error::{BackupError, Phase, Result};
 use rb_core::wire::blake3_hex;
 
-use crate::connect::{sort_by_id, ReadOnlyConnection};
+use crate::connect::{read_order, ReadOnlyConnection};
 use crate::introspect;
 use crate::model::MongoPlanPayload;
 use crate::MongoDbParams;
@@ -52,7 +52,7 @@ pub async fn fingerprint(params: &MongoDbParams) -> Result<String> {
     let mut collections = Vec::new();
     for db in &payload.databases {
         for coll in &db.collections {
-            collections.push(coll_stat(&conn, &db.name, &coll.name).await?);
+            collections.push(coll_stat(&conn, &db.name, &coll.name, coll.is_capped()).await?);
         }
     }
 
@@ -108,13 +108,18 @@ fn hash_catalog(p: &MongoPlanPayload) -> String {
 /// `_id`-ordered scan. A separate `count_documents` used to scan every
 /// collection a second time per audit, and added nothing: the checksum already
 /// changes when a document appears or disappears.
-async fn coll_stat(conn: &ReadOnlyConnection, db: &str, coll: &str) -> Result<CollStat> {
+async fn coll_stat(
+    conn: &ReadOnlyConnection,
+    db: &str,
+    coll: &str,
+    capped: bool,
+) -> Result<CollStat> {
     // `_id` is unique and indexed, so hashing every document in this order is
     // stable and cannot miss a mutation in a collection larger than a sample.
     let mut cursor = conn
         .client
         .database(db)
-        .find(coll, doc! {}, Some(sort_by_id()))
+        .find(coll, doc! {}, Some(read_order(capped)))
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("scan {db}.{coll}"), e))?;
 

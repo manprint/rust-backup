@@ -9,7 +9,7 @@
 //! The live driver calls are exercised by the mongodb e2e; the pure
 //! [`build_plan`] / [`now_rfc3339`] logic is unit-tested here.
 
-use mongodb::bson::doc;
+use mongodb::bson::{doc, Document};
 use mongodb::results::CollectionType;
 use mongodb::IndexModel;
 
@@ -160,16 +160,25 @@ async fn introspect_collection(
     let models: Vec<IndexModel> = db.list_indexes(coll_name).await.map_err(|e| {
         BackupError::phase_src(Phase::Analyze, format!("list indexes {coll_name}"), e)
     })?;
+    let raw_indexes = raw_index_specs(db, coll_name).await?;
     let mut indexes = Vec::new();
     for m in models {
-        if index_name(&m).as_deref() == Some("_id_") {
+        let name = index_name(&m);
+        if name.as_deref() == Some("_id_") {
             continue;
         }
-        reject_lossy_bson(&m, &format!("index of {db_name}.{coll_name}"))?;
-        let v = serde_json::to_value(&m).map_err(|e| {
-            BackupError::phase_src(Phase::Analyze, format!("encode index of {coll_name}"), e)
+        let what = format!("index of {db_name}.{coll_name}");
+        reject_lossy_bson(&m, &what)?;
+        let raw = raw_spec_of(&m, &raw_indexes).ok_or_else(|| {
+            BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "{what} {:?} is missing from the server's own index listing",
+                    m.keys
+                ),
+            )
         })?;
-        indexes.push(v);
+        indexes.push(with_unmodelled(&m, Some(raw), INDEX_NOISE, &what)?);
     }
 
     let estimated_docs = db
@@ -177,11 +186,17 @@ async fn introspect_collection(
         .await
         .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("count {coll_name}"), e))?;
 
-    reject_lossy_bson(options, &format!("options of {db_name}.{coll_name}"))?;
+    let what = format!("options of {db_name}.{coll_name}");
+    reject_lossy_bson(options, &what)?;
+    let raw_options = raw_collection_options(db, coll_name).await?;
+    let options = match with_unmodelled(options, raw_options.as_ref(), &[], &what)? {
+        serde_json::Value::Object(map) if !map.is_empty() => Some(serde_json::Value::Object(map)),
+        _ => None,
+    };
     Ok(MongoCollection {
         database: db_name.to_string(),
         name: coll_name.to_string(),
-        options: create_options_value(options),
+        options,
         indexes,
         estimated_docs,
         estimated_bytes: coll_size_bytes(db, coll_name).await,
@@ -242,15 +257,136 @@ fn index_name(m: &IndexModel) -> Option<String> {
     m.options.as_ref().and_then(|o| o.name.clone())
 }
 
-/// Serialize `CreateCollectionOptions` to a JSON object, returning `None` when it
-/// is empty (the common case — no capped/validator/etc.).
-fn create_options_value(
-    options: &mongodb::options::CreateCollectionOptions,
-) -> Option<serde_json::Value> {
-    match serde_json::to_value(options) {
-        Ok(serde_json::Value::Object(m)) if !m.is_empty() => Some(serde_json::Value::Object(m)),
-        _ => None,
+/// `listIndexes` keys that describe where the index lives, not what it is:
+/// pre-4.4 servers report the namespace inside every spec.
+const INDEX_NOISE: &[&str] = &["ns"];
+
+/// The JSON form of a driver-typed spec, plus every key of the server's own
+/// (`raw`) spec the driver's type does not model.
+///
+/// The typed `IndexOptions`/`CreateCollectionOptions` silently drop a key the
+/// pinned driver does not know (an index's `prepareUnique`, say). Both sides
+/// read through the same type, so the loss was invisible to verification too.
+/// Carrying the remainder verbatim makes the destination replay it and the
+/// read-back compare it.
+fn with_unmodelled<T: serde::Serialize>(
+    typed: &T,
+    raw: Option<&Document>,
+    noise: &[&str],
+    what: &str,
+) -> Result<serde_json::Value> {
+    let encode =
+        |e: serde_json::Error| BackupError::phase_src(Phase::Analyze, format!("encode {what}"), e);
+    let mut value = serde_json::to_value(typed).map_err(encode)?;
+    let (Some(raw), serde_json::Value::Object(map)) = (raw, &mut value) else {
+        return Ok(value);
+    };
+    let modelled = mongodb::bson::to_document(typed)
+        .map_err(|e| BackupError::phase_src(Phase::Analyze, format!("encode {what} as BSON"), e))?;
+    for (key, extra) in raw {
+        if modelled.contains_key(key) || noise.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(path) = find_binary(extra, key.clone()) {
+            return Err(BackupError::phase(
+                Phase::Analyze,
+                format!(
+                    "{what} contains BSON binary data at {path}, which this plan format cannot \
+                     carry without changing its type; the {what} must be recreated manually"
+                ),
+            ));
+        }
+        map.insert(key.clone(), serde_json::to_value(extra).map_err(encode)?);
     }
+    Ok(value)
+}
+
+/// Spell every whole number as an integer, for comparison only.
+///
+/// A catalog number's BSON type is not part of what it means, and servers do
+/// not preserve it: an `expireAfterSeconds: 60.0` written by a legacy shell is
+/// stored as `60` by a 5.0+ destination, and the read-back then disagreed with
+/// the plan over an identical index. The plan itself keeps the source's
+/// spelling, so the destination is handed exactly what the source holds.
+pub(crate) fn integral_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(float) = number.as_f64().filter(|_| number.is_f64()) {
+                if float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0 {
+                    *number = serde_json::Number::from(float as i64);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(integral_numbers),
+        serde_json::Value::Object(map) => map.values_mut().for_each(integral_numbers),
+        _ => {}
+    }
+}
+
+/// The server's spec for the index the driver decoded as `model`.
+///
+/// By name — unless the driver could not decode the options at all, which it
+/// reports as an index with a key and nothing else: a TTL written by a legacy
+/// shell stores `expireAfterSeconds` as a double, the typed options refuse it,
+/// and name, TTL and every other option used to vanish together. Such an index
+/// is found by its key instead, and its options come from the raw spec.
+fn raw_spec_of<'a>(model: &IndexModel, raw: &'a [Document]) -> Option<&'a Document> {
+    match index_name(model) {
+        Some(name) => raw
+            .iter()
+            .find(|spec| spec.get_str("name") == Ok(name.as_str())),
+        None => raw
+            .iter()
+            .find(|spec| spec.get_document("key").ok() == Some(&model.keys)),
+    }
+}
+
+/// The server's own index specs for one collection.
+async fn raw_index_specs(db: &ReadOnlyDatabase, coll_name: &str) -> Result<Vec<Document>> {
+    let reply = db
+        .run_command(doc! { "listIndexes": coll_name, "cursor": { "batchSize": 100_000 } })
+        .await
+        .map_err(|e| {
+            BackupError::phase_src(Phase::Analyze, format!("list raw indexes {coll_name}"), e)
+        })?;
+    first_batch(&reply, &format!("listIndexes {coll_name}"))
+}
+
+/// The server's own `create` options for one collection.
+async fn raw_collection_options(
+    db: &ReadOnlyDatabase,
+    coll_name: &str,
+) -> Result<Option<Document>> {
+    let reply = db
+        .run_command(doc! { "listCollections": 1, "filter": { "name": coll_name } })
+        .await
+        .map_err(|e| {
+            BackupError::phase_src(Phase::Analyze, format!("list raw options {coll_name}"), e)
+        })?;
+    Ok(
+        first_batch(&reply, &format!("listCollections {coll_name}"))?
+            .into_iter()
+            .find_map(|spec| spec.get_document("options").ok().cloned()),
+    )
+}
+
+/// The documents of a cursor reply that fits its first batch. A reply that
+/// does not is refused rather than read in part.
+fn first_batch(reply: &Document, what: &str) -> Result<Vec<Document>> {
+    let malformed = || BackupError::phase(Phase::Analyze, format!("{what}: malformed reply"));
+    let cursor = reply.get_document("cursor").map_err(|_| malformed())?;
+    if cursor.get("id").and_then(mongodb::bson::Bson::as_i64) != Some(0) {
+        return Err(BackupError::phase(
+            Phase::Analyze,
+            format!("{what}: the reply does not fit one batch"),
+        ));
+    }
+    Ok(cursor
+        .get_array("firstBatch")
+        .map_err(|_| malformed())?
+        .iter()
+        .filter_map(|entry| entry.as_document().cloned())
+        .collect())
 }
 
 /// Best-effort on-disk size via `collStats`; `0` when unavailable (e.g. the
@@ -380,6 +516,74 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use mongodb::bson::{doc, spec::BinarySubtype, Binary, Bson};
+
+    /// A key the driver's typed options do not model must reach the plan, or
+    /// the destination drops it and the read-back cannot tell.
+    #[test]
+    fn keys_the_driver_does_not_model_are_carried_verbatim() {
+        let model = IndexModel::builder()
+            .keys(doc! { "b": 1, "a": -1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .name("b_1_a_-1".to_string())
+                    .unique(true)
+                    .build(),
+            )
+            .build();
+        let raw = doc! {
+            "key": { "b": 1, "a": -1 }, "name": "b_1_a_-1", "unique": true,
+            "ns": "appdb.a", "prepareUnique": true, "futureOption": { "x": 1_i64 },
+        };
+        let spec = with_unmodelled(&model, Some(&raw), INDEX_NOISE, "index of appdb.a").unwrap();
+        assert_eq!(spec["prepareUnique"], serde_json::json!(true));
+        assert_eq!(spec["futureOption"], serde_json::json!({ "x": 1 }));
+        assert_eq!(spec["unique"], serde_json::json!(true));
+        assert!(spec.get("ns").is_none(), "the namespace is not an option");
+        assert_eq!(
+            spec["key"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["b", "a"],
+            "compound key order is the index"
+        );
+        // Nothing to add: the spec is exactly the typed one.
+        let plain = doc! { "key": { "b": 1, "a": -1 }, "name": "b_1_a_-1", "unique": true };
+        assert_eq!(
+            with_unmodelled(&model, Some(&plain), INDEX_NOISE, "index").unwrap(),
+            with_unmodelled(&model, None, INDEX_NOISE, "index").unwrap()
+        );
+        // The carried remainder is held to the same no-binary rule.
+        let binary = doc! { "blob": mongodb::bson::Binary {
+        subtype: mongodb::bson::spec::BinarySubtype::Generic, bytes: vec![1] } };
+        with_unmodelled(&model, Some(&binary), INDEX_NOISE, "index of appdb.a")
+            .expect_err("binary must be refused");
+    }
+
+    /// The typed options fail to decode a double `expireAfterSeconds` and the
+    /// driver then reports the index with no options at all, name included.
+    #[test]
+    fn an_index_whose_options_the_driver_could_not_decode_keeps_them() {
+        let undecoded = IndexModel::builder().keys(doc! { "at": 1.0 }).build();
+        let raw = vec![
+            doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" },
+            doc! { "v": 2, "key": { "at": 1.0 }, "name": "at_1", "expireAfterSeconds": 60.0 },
+        ];
+        let found = raw_spec_of(&undecoded, &raw).expect("matched by key");
+        let spec = with_unmodelled(&undecoded, Some(found), INDEX_NOISE, "index").unwrap();
+        assert_eq!(spec["name"], serde_json::json!("at_1"));
+        assert!(
+            spec["expireAfterSeconds"].is_f64(),
+            "the plan keeps the source's type"
+        );
+        assert!(raw_spec_of(&undecoded, &raw[..1]).is_none());
+    }
+
+    #[test]
+    fn a_cursor_reply_that_does_not_fit_one_batch_is_refused() {
+        let whole = doc! { "cursor": { "id": 0_i64, "firstBatch": [ { "name": "a" } ] } };
+        assert_eq!(first_batch(&whole, "x").unwrap().len(), 1);
+        let partial = doc! { "cursor": { "id": 7_i64, "firstBatch": [] } };
+        first_batch(&partial, "x").expect_err("a partial listing must not be trusted");
+        first_batch(&doc! {}, "x").expect_err("malformed");
+    }
 
     /// BSON binary inside an index spec or collection options would be
     /// re-rendered by serde_json as an array of integers, so the destination

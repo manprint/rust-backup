@@ -59,6 +59,63 @@ pub fn derive_token(secret: Option<&str>, nonce: &[u8]) -> Result<[u8; TOKEN_LEN
     Ok(token)
 }
 
+/// Which end of a direct connection a proof speaks for.
+#[derive(Clone, Copy)]
+enum ProofRole {
+    Consumer,
+    Provider,
+}
+
+/// What one end sends to prove it holds `token`, bound to this very QUIC
+/// connection and to its own role.
+///
+/// The token itself never travels: it is the same for every pairing of a
+/// (secret, channel), the certificate is not verified, and the consumer speaks
+/// first — so sending it would hand it to whoever answered the dial, and
+/// echoing it back would pass as the provider. The proof is keyed by the token
+/// over the TLS exporter of the session, which a relay in the middle of two
+/// sessions cannot make equal, and over the role, which an echo cannot change.
+fn session_proof(
+    conn: &Connection,
+    token: &[u8; TOKEN_LEN],
+    role: ProofRole,
+) -> Result<[u8; TOKEN_LEN]> {
+    let mut exported = [0u8; 32];
+    conn.export_keying_material(&mut exported, b"rust-backup direct path proof v1", b"")
+        .map_err(|_| anyhow::anyhow!("export direct-path keying material"))?;
+    proof_for(token, &exported, role)
+}
+
+fn proof_for(token: &[u8; TOKEN_LEN], exported: &[u8], role: ProofRole) -> Result<[u8; TOKEN_LEN]> {
+    let mut mac = HmacSha256::new_from_slice(token).context("construct direct-path HMAC")?;
+    mac.update(match role {
+        ProofRole::Consumer => b"consumer",
+        ProofRole::Provider => b"provider",
+    });
+    mac.update(exported);
+    let mut proof = [0u8; TOKEN_LEN];
+    proof.copy_from_slice(&mac.finalize().into_bytes());
+    Ok(proof)
+}
+
+/// Consumer end of the proof exchange: speak first, then check the provider.
+async fn prove_as_consumer(
+    conn: &Connection,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    token: &[u8; TOKEN_LEN],
+) -> Result<bool> {
+    send.write_all(&session_proof(conn, token, ProofRole::Consumer)?)
+        .await?;
+    send.flush().await?;
+    let mut peer = [0u8; TOKEN_LEN];
+    recv.read_exact(&mut peer).await?;
+    Ok(tokens_match(
+        &session_proof(conn, token, ProofRole::Provider)?,
+        &peer,
+    ))
+}
+
 /// Constant-time comparison of two tokens.
 fn tokens_match(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
     let mut diff = 0u8;
@@ -545,11 +602,7 @@ impl DirectConn {
             .open_bi()
             .await
             .context("carrier auth open_bi failed")?;
-        send.write_all(&token).await?;
-        send.flush().await?;
-        let mut peer_token = [0u8; TOKEN_LEN];
-        recv.read_exact(&mut peer_token).await?;
-        if !tokens_match(&token, &peer_token) {
+        if !prove_as_consumer(&conn, &mut send, &mut recv, &token).await? {
             bail!("direct carrier token mismatch");
         }
         let _ = send.finish();
@@ -674,13 +727,17 @@ impl DirectListener {
         token: [u8; TOKEN_LEN],
     ) -> Result<DirectConn> {
         let (mut send, mut recv) = conn.accept_bi().await.context("auth accept_bi failed")?;
-        let mut peer_token = [0u8; TOKEN_LEN];
-        recv.read_exact(&mut peer_token).await?;
-        if !tokens_match(&token, &peer_token) {
+        let mut peer_proof = [0u8; TOKEN_LEN];
+        recv.read_exact(&mut peer_proof).await?;
+        if !tokens_match(
+            &session_proof(conn, &token, ProofRole::Consumer)?,
+            &peer_proof,
+        ) {
             warn!("direct QUIC candidate failed token verification");
             bail!("token mismatch");
         }
-        send.write_all(&token).await?;
+        send.write_all(&session_proof(conn, &token, ProofRole::Provider)?)
+            .await?;
         send.flush().await?;
         let _ = send.finish();
         info!(target_addr = %conn.remote_address(),
@@ -752,11 +809,7 @@ pub async fn connect_direct(
                 };
                 trace!(%peer, "QUIC connected");
                 let (mut send, mut recv) = conn.open_bi().await.context("auth open_bi failed")?;
-                send.write_all(&token).await?;
-                send.flush().await?;
-                let mut peer_token = [0u8; TOKEN_LEN];
-                recv.read_exact(&mut peer_token).await?;
-                if !tokens_match(&token, &peer_token) {
+                if !prove_as_consumer(&conn, &mut send, &mut recv, &token).await? {
                     let msg = "token mismatch".to_string();
                     warn!(%peer, "direct QUIC candidate failed token verification");
                     errors
@@ -971,6 +1024,67 @@ mod tests {
     // The EOF mapping is exactly and only the graceful code: any other close, and
     // any transport-level loss, must still surface as an error so a truncated run
     // can never be mistaken for a completed one.
+    #[test]
+    fn a_proof_is_bound_to_role_session_and_token() {
+        let token = [7u8; TOKEN_LEN];
+        let consumer = proof_for(&token, b"session-a", ProofRole::Consumer).unwrap();
+        assert_ne!(consumer, token, "the token itself must never be the proof");
+        assert_ne!(
+            consumer,
+            proof_for(&token, b"session-a", ProofRole::Provider).unwrap(),
+            "an echo of the consumer's proof must not pass as the provider's"
+        );
+        assert_ne!(
+            consumer,
+            proof_for(&token, b"session-b", ProofRole::Consumer).unwrap(),
+            "a proof must not be replayable on another connection"
+        );
+        assert_ne!(
+            consumer,
+            proof_for(&[8u8; TOKEN_LEN], b"session-a", ProofRole::Consumer).unwrap()
+        );
+        assert_eq!(
+            consumer,
+            proof_for(&token, b"session-a", ProofRole::Consumer).unwrap()
+        );
+    }
+
+    // Whoever answers the consumer's dial used to be handed the token and could
+    // echo it back to pass as the provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_that_echoes_the_consumer_is_refused() {
+        let tuning = UdpDirectTuning::default();
+        let socket = bind_socket(0).await.expect("bind impostor socket");
+        let port = socket.local_addr().expect("local_addr").port();
+        let impostor = server_endpoint(socket, &tuning).expect("impostor endpoint");
+        let token = [42u8; TOKEN_LEN];
+        let echo = tokio::spawn(async move {
+            let conn = impostor
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("accept_bi");
+            let mut seen = [0u8; TOKEN_LEN];
+            recv.read_exact(&mut seen).await.expect("read proof");
+            send.write_all(&seen).await.expect("echo");
+            let _ = send.finish();
+            // Hold the connection until the consumer has judged the echo.
+            let _ = conn.closed().await;
+            seen
+        });
+        let consumer_socket = bind_socket(0).await.expect("bind consumer socket");
+        let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let outcome = connect_direct(consumer_socket, vec![target], token, tuning).await;
+        assert!(
+            outcome.is_err(),
+            "an echoed proof was accepted as the provider"
+        );
+        let seen = echo.await.expect("impostor join");
+        assert_ne!(seen, token, "the consumer sent the token itself");
+    }
+
     #[test]
     fn only_application_close_zero_reads_as_eof() {
         let graceful = io::Error::from(quinn::ReadError::ConnectionLost(

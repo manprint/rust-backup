@@ -53,7 +53,7 @@ RUST_BACKUP_PASSWORD="$DEST_PG_PASSWORD" rust-backup postgres destination \
 | `--user <nome>` | `RUST_BACKUP_USER` | — (obbligatorio) | entrambi | utente di connessione |
 | `--password <pw>` | `RUST_BACKUP_PASSWORD` | nessuna | entrambi | password. **Usare la variabile d'ambiente**, non il flag |
 | `--database <nome>` | `RUST_BACKUP_DATABASE` | nessuno | entrambi | sorgente: limita la copia a quel database (se assente: tutto il cluster). È anche il database di aggancio per l'introspezione globale; in mancanza si usa `postgres` |
-| `--sslmode <modo>` | `RUST_BACKUP_SSLMODE` | `prefer` | entrambi | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `--sslmode <modo>` | `RUST_BACKUP_SSLMODE` | `prefer` | entrambi | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. `prefer`/`allow` cifrano se il server lo consente ma **non** ne verificano l'identità; da `require` in su catena e hostname sono verificati |
 | `--admin[=bool]` | `RUST_BACKUP_ADMIN` | falso | destinazione | dichiara che la connessione è amministrativa: serve per creare ruoli, database e applicare le proprietà |
 | `--overwrite[=bool]` | `RUST_BACKUP_OVERWRITE` | falso | destinazione | autorizza il ripristino sopra database già esistenti. Senza, il preflight fallisce |
 | `--hot-backup[=bool]` | `RUST_BACKUP_HOT_BACKUP` | falso | entrambi | backup **a caldo** di una sorgente che resta in linea: la sorgente legge ogni database da un solo snapshot e non viene sottoposta all'audit di immutabilità; la destinazione deve passarlo anch'essa per accettare il piano. Vedi [Backup a caldo](#backup-a-caldo---hot-backup) |

@@ -19,7 +19,7 @@ use rb_core::config::ServerConfig;
 use crate::auth::Authenticator;
 use crate::mux;
 use crate::pool::CarrierPool;
-use crate::proto::{ClientMsg, Delimited, ServerMsg, UdpCandidate};
+use crate::proto::{ClientMsg, Delimited, ServerMsg, UdpCandidate, HANDSHAKE_TIMEOUT};
 use crate::shared::{proxy_buffer_size, tune_tcp};
 use crate::transport::load_server_tls;
 
@@ -96,6 +96,12 @@ struct UdpMatchInner {
     to_provider: Option<oneshot::Sender<UdpOffer>>,
     /// Delivers the provider's addresses to the consumer task.
     to_consumer: Option<oneshot::Sender<UdpOffer>>,
+    /// The one exchange this matchmaker brokers is over: delivered, or given up
+    /// on by a side whose broker deadline passed. A side that registers after
+    /// that gets a dropped sink, which its control loop turns into an immediate
+    /// `UdpUnavailable` — the peer is no longer listening for a punch, so
+    /// handing out its old candidates only stalls the newcomer.
+    closed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,8 +134,10 @@ impl UdpMatchmaker {
     pub fn register_provider(&self) -> oneshot::Receiver<UdpOffer> {
         let (tx, rx) = oneshot::channel();
         let mut g = self.lock();
-        g.to_provider = Some(tx);
-        Self::try_match(&mut g);
+        if !g.closed {
+            g.to_provider = Some(tx);
+            Self::try_match(&mut g);
+        }
         rx
     }
 
@@ -137,8 +145,10 @@ impl UdpMatchmaker {
     pub fn register_consumer(&self) -> oneshot::Receiver<UdpOffer> {
         let (tx, rx) = oneshot::channel();
         let mut g = self.lock();
-        g.to_consumer = Some(tx);
-        Self::try_match(&mut g);
+        if !g.closed {
+            g.to_consumer = Some(tx);
+            Self::try_match(&mut g);
+        }
         rx
     }
 
@@ -164,9 +174,29 @@ impl UdpMatchmaker {
         Self::try_match(&mut g);
     }
 
+    /// A matchmaker that brokers nothing: every registration is told at once
+    /// that the direct path is unavailable.
+    fn closed() -> Self {
+        let matchmaker = Self::default();
+        matchmaker.close();
+        matchmaker
+    }
+
+    /// End the exchange without a match. Dropping the pending sinks wakes the
+    /// other side's control loop, which reports `UdpUnavailable` immediately.
+    pub fn close(&self) {
+        let mut g = self.lock();
+        g.closed = true;
+        g.to_provider = None;
+        g.to_consumer = None;
+    }
+
     /// Fire both sinks (each gets the *other* side's addresses) once both peers
-    /// have offered. Idempotent: the `take()`s ensure it delivers at most once.
+    /// have offered and both are still waiting. Delivers at most once.
     fn try_match(g: &mut UdpMatchInner) {
+        if g.closed || g.to_provider.is_none() || g.to_consumer.is_none() {
+            return;
+        }
         let (Some(provider), Some(consumer)) = (&g.provider_addrs, &g.consumer_addrs) else {
             return;
         };
@@ -176,6 +206,7 @@ impl UdpMatchmaker {
         if let Some(tx) = g.to_consumer.take() {
             let _ = tx.send(provider.clone());
         }
+        g.closed = true;
     }
 }
 
@@ -269,23 +300,27 @@ where
             }
             res = &mut udp_rx, if udp_pending => {
                 udp_pending = false;
-                if let Ok(peer) = res {
-                    info!(%id, peer_candidate_count = peer.addrs.len(), "received peer candidates");
-                    if !send_control(
-                        id,
-                        control,
+                let msg = match res {
+                    Ok(peer) => {
+                        info!(%id, peer_candidate_count = peer.addrs.len(), "received peer candidates");
                         ServerMsg::UdpPunch {
                             peer_addrs: peer.addrs,
                             peer_candidates: peer.candidates,
                             peer_profile: peer.profile,
-                        },
-                    ).await {
-                        return Ok(());
+                        }
                     }
+                    Err(_) => {
+                        info!(%id, "the peer is not negotiating a direct path; using the relay");
+                        ServerMsg::UdpUnavailable
+                    }
+                };
+                if !send_control(id, control, msg).await {
+                    return Ok(());
                 }
             }
             _ = &mut udp_deadline, if udp_pending => {
                 udp_pending = false;
+                matchmaker.close();
                 warn!(%id, "udp broker timeout; falling back to relay");
                 if !send_control(id, control, ServerMsg::UdpUnavailable).await {
                     return Ok(());
@@ -310,6 +345,13 @@ where
                         candidates.retain(|candidate| addrs.contains(&candidate.addr));
                         candidates.truncate(crate::shared::MAX_UDP_CANDIDATES);
                         info!(%id, candidate_count = addrs.len(), "peer offered udp candidates");
+                        // A side that keeps offering is still waiting for its peer:
+                        // the deadline bounds silence, not the wait. A source
+                        // registered minutes before its destination would
+                        // otherwise always be past it.
+                        if udp_pending {
+                            udp_deadline.as_mut().reset(Instant::now() + UDP_BROKER_TIMEOUT);
+                        }
                         match side {
                             BrokerSide::Provider => matchmaker.offer_provider_v2(UdpOffer { addrs, candidates, profile: nat_profile }),
                             BrokerSide::Consumer => matchmaker.offer_consumer_v2(UdpOffer { addrs, candidates, profile: nat_profile }),
@@ -324,7 +366,12 @@ where
 }
 
 pub async fn run_server(cfg: &ServerConfig) -> Result<()> {
-    let addr = format!("{}:{}", cfg.bind_addr, cfg.control_port);
+    // A bare IPv6 bind address (`::`) needs brackets to take a port.
+    let addr = if cfg.bind_addr.contains(':') && !cfg.bind_addr.starts_with('[') {
+        format!("[{}]:{}", cfg.bind_addr, cfg.control_port)
+    } else {
+        format!("{}:{}", cfg.bind_addr, cfg.control_port)
+    };
     let listener = TcpListener::bind(&addr)
         .await
         .context(format!("bind {addr}"))?;
@@ -399,7 +446,12 @@ async fn handle_accepted_conn(
     auth: Option<Authenticator>,
 ) -> Result<()> {
     if let Some(tls) = tls {
-        let stream = tls.accept(socket).await.context("TLS handshake failed")?;
+        // Bounded like every other handshake step: this task holds a session
+        // permit, so a peer that connects and never speaks TLS must not keep it.
+        let stream = timeout(HANDSHAKE_TIMEOUT, tls.accept(socket))
+            .await
+            .context("timed out during TLS handshake")?
+            .context("TLS handshake failed")?;
         handle_conn(stream, peer, registry, max_conns, udp_registry, auth).await
     } else {
         handle_conn(socket, peer, registry, max_conns, udp_registry, auth).await
@@ -418,12 +470,16 @@ async fn handle_conn<S: mux::Transport>(
     // that first write flushes the lazy yamux SYN so our accept fires. Auth (if
     // any) happens AFTER reading the first message (bore's Hello-before-auth rule).
     let (opener, mut acceptor) = mux::server(socket);
-    let ctrl_stream = match acceptor.accept().await {
-        Some(s) => s,
-        None => {
+    // The substream is owed immediately too: a peer that completes TCP (and
+    // TLS) and then never opens it would hold a session permit indefinitely,
+    // and `max_conns` such peers would stop the accept loop for everyone.
+    let ctrl_stream = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept()).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
             warn!("client disconnected before control stream");
             return Ok(());
         }
+        Err(_) => anyhow::bail!("timed out waiting for the control substream"),
     };
     let mut control = Delimited::new(ctrl_stream);
 
@@ -572,10 +628,13 @@ async fn serve_consumer(
 
     // The shared control loop (heartbeat, UDP broker, reaper) runs alongside the
     // consumer-specific relay-accept loop; whichever ends first ends the task.
+    // Only the provider installs (and later removes) the matchmaker. A consumer
+    // that inserted one after the provider left would leave it behind for the
+    // next source registering this channel id, stale offer included.
     let matchmaker = udp_registry
-        .entry(id.clone())
-        .or_insert_with(|| Arc::new(UdpMatchmaker::default()))
-        .clone();
+        .get(&id)
+        .map(|entry| Arc::clone(entry.value()))
+        .unwrap_or_else(|| Arc::new(UdpMatchmaker::closed()));
 
     tokio::select! {
         r = serve_control(&mut control, &matchmaker, BrokerSide::Consumer, &id, SECRET_CTRL_TIMEOUT) => r,
@@ -864,5 +923,119 @@ mod tests {
             .await
             .expect("loop must end after the peer disconnects");
         joined.expect("join").expect("serve_control ok");
+    }
+
+    /// A connection that never opens its control substream holds a session
+    /// permit, so it is dropped once the handshake deadline passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_without_a_control_substream_is_dropped() {
+        let (server_side, _client_side) = duplex(1024);
+        let error = handle_conn(
+            server_side,
+            "127.0.0.1:1".parse().expect("address"),
+            Arc::new(DashMap::new()),
+            Arc::new(Semaphore::new(1)),
+            Arc::new(DashMap::new()),
+            None,
+        )
+        .await
+        .expect_err("a silent connection must not be served forever");
+        assert!(
+            error.to_string().contains("control substream"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A source that registered long before its destination has already been
+    /// told the direct path is unavailable and is no longer listening for a
+    /// punch. The destination must hear that at once instead of receiving the
+    /// source's old candidates and stalling on them.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_arriving_after_the_broker_gave_up_is_told_immediately() {
+        let matchmaker = Arc::new(UdpMatchmaker::default());
+        let _provider_sink = matchmaker.register_provider();
+        matchmaker.offer_provider(vec!["192.0.2.1:4000".parse().expect("address")]);
+        matchmaker.close();
+
+        let (srv, cli) = duplex(8192);
+        let mut server = Delimited::new(srv);
+        let mm = Arc::clone(&matchmaker);
+        let handle = tokio::spawn(async move {
+            serve_control(
+                &mut server,
+                &mm,
+                BrokerSide::Consumer,
+                "chan",
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        let mut client = Delimited::new(cli);
+        let verdict = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match client.recv_server().await.expect("control frame") {
+                    Some(ServerMsg::Heartbeat) => {}
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .expect("the verdict must not wait for the broker deadline");
+        assert_eq!(verdict, Some(ServerMsg::UdpUnavailable));
+        handle.abort();
+    }
+
+    /// The broker's verdict on the direct path, if it reaches one within `window`.
+    async fn verdict_within(
+        client: &mut Delimited<tokio::io::DuplexStream>,
+        window: Duration,
+    ) -> Option<Option<ServerMsg>> {
+        tokio::time::timeout(window, async {
+            loop {
+                match client.recv_server().await.expect("control frame") {
+                    Some(ServerMsg::Heartbeat) => {}
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// A source repeats its offer while it waits for the destination. The broker
+    /// deadline bounds its silence, not its wait: it stays open across far more
+    /// than one window, and still closes once the offers stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_side_that_keeps_offering_keeps_the_broker_open() {
+        let matchmaker = Arc::new(UdpMatchmaker::default());
+        let (srv, cli) = duplex(1 << 20);
+        let mut server = Delimited::new(srv);
+        let mm = Arc::clone(&matchmaker);
+        let handle = tokio::spawn(async move {
+            serve_control(
+                &mut server,
+                &mm,
+                BrokerSide::Provider,
+                "chan",
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        let mut client = Delimited::new(cli);
+        let offer = || ClientMsg::UdpCandidateOffer {
+            addrs: vec!["192.0.2.1:4000".parse().expect("address")],
+            candidates: Vec::new(),
+            generation: 0,
+            nat_profile: Default::default(),
+        };
+        for _ in 0..8 {
+            client.send_client(offer()).await.expect("offer");
+            let verdict = verdict_within(&mut client, Duration::from_secs(4)).await;
+            assert_eq!(verdict, None, "the broker gave up on a side still offering");
+        }
+
+        let verdict = verdict_within(&mut client, UDP_BROKER_TIMEOUT).await;
+        assert_eq!(verdict, Some(Some(ServerMsg::UdpUnavailable)));
+        handle.abort();
     }
 }

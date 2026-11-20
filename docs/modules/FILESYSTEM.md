@@ -83,7 +83,14 @@ Before reporting verified completion, the destination rescans the root and
 compares the exact planned path/type set, sizes, modes, mtimes, symlink and
 hardlink topology, requested ownership and xattrs. It then reopens every regular
 file and reproduces all item and payload BLAKE3 commitments. Extra, missing,
-unreadable, changed or truncated entries fail the run.
+unreadable, changed or truncated entries fail the run. A directory's own
+`st_size` is not compared: it is an allocation detail of the destination file
+system, not content (it differs between ext4, XFS, btrfs and tmpfs for the same
+entries), and comparing it failed cross-filesystem restores of correct trees.
+
+After the last metadata is applied the destination flushes the restored file
+system (`syncfs` on Linux), so "verified" is not reported for data still only in
+the page cache.
 
 ## Plan hardening (the destination treats the plan as hostile input)
 
@@ -121,6 +128,11 @@ controlled from the destination's point of view. Concretely:
   `destination root is a symlink: /restore`.
 - Metadata verification sorts the received entries before comparing, so it does
   not depend on the peer's ordering.
+- The plan's stream items must be exactly its regular-file entries: one item
+  per distinct file (hardlink aliases share one), with a unique id and the
+  entry's size. A plan that announces an item for a directory, repeats an id,
+  omits a file's item or disagrees on a size is refused before anything is
+  written.
 
 Names are carried in the plan as UTF-8. A source path or symlink target that is
 not valid UTF-8 fails analysis with the offending on-disk path, rather than

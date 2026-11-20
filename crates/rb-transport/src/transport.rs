@@ -141,12 +141,25 @@ impl Endpoint {
         };
         let authority = rest.split('/').next().unwrap_or(rest);
 
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
-                Ok(port) => (host, port),
-                Err(_) => (authority, default_port),
-            },
-            _ => (authority, default_port),
+        // An IPv6 literal carries colons of its own: `[::1]:7835` keeps its port
+        // outside the brackets (which the resolver must not see), and a bare
+        // `::1` has no port at all — its last group is not one.
+        let (host, port) = if let Some((host, rest)) = authority
+            .strip_prefix('[')
+            .and_then(|inner| inner.split_once(']'))
+        {
+            let port = rest.strip_prefix(':').and_then(|port| port.parse().ok());
+            (host, port.unwrap_or(default_port))
+        } else if authority.matches(':').count() > 1 {
+            (authority, default_port)
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
+                    Ok(port) => (host, port),
+                    Err(_) => (authority, default_port),
+                },
+                _ => (authority, default_port),
+            }
         };
         Endpoint {
             host: host.to_string(),
@@ -252,4 +265,45 @@ fn insecure_client_config() -> Result<ClientConfig> {
     .dangerous()
     .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
     .with_no_client_auth())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(to: &str) -> (String, u16, bool) {
+        let endpoint = Endpoint::parse(to);
+        (endpoint.host, endpoint.port, endpoint.tls)
+    }
+
+    #[test]
+    fn hostnames_and_ipv4_keep_their_port_and_scheme() {
+        assert_eq!(
+            parsed("coord.example"),
+            ("coord.example".into(), CONTROL_PORT, false)
+        );
+        assert_eq!(parsed("10.0.0.1:9000"), ("10.0.0.1".into(), 9000, false));
+        assert_eq!(
+            parsed("https://coord.example/x"),
+            ("coord.example".into(), 443, true)
+        );
+        assert_eq!(
+            parsed("http://coord.example:8080"),
+            ("coord.example".into(), 8080, false)
+        );
+    }
+
+    #[test]
+    fn ipv6_literals_are_not_split_inside_the_address() {
+        assert_eq!(parsed("[::1]:9000"), ("::1".into(), 9000, false));
+        assert_eq!(
+            parsed("[2001:db8::7]"),
+            ("2001:db8::7".into(), CONTROL_PORT, false)
+        );
+        assert_eq!(parsed("::1"), ("::1".into(), CONTROL_PORT, false));
+        assert_eq!(
+            parsed("https://[2001:db8::7]:8443"),
+            ("2001:db8::7".into(), 8443, true)
+        );
+    }
 }

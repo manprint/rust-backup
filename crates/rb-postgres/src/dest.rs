@@ -301,13 +301,10 @@ pub async fn abandon_created(params: &PostgresParams, created: &[String]) {
     if created.is_empty() {
         return;
     }
-    let bootstrap = params.bootstrap_database();
     // Never from inside a database that is about to be dropped.
-    let elsewhere = if created.iter().any(|name| name == &bootstrap) {
-        "postgres".to_string()
-    } else {
-        bootstrap
-    };
+    let elsewhere = admin_database_outside(&params.bootstrap_database(), |name| {
+        created.iter().any(|database| database == name)
+    });
     let boot = match PgConnection::connect(params, &elsewhere).await {
         Ok(conn) => conn,
         Err(error) => {
@@ -1177,11 +1174,19 @@ fn normalize_catalog(payload: &mut PgPlanPayload) {
 
 /// Select a cluster database that is not one of the overwrite targets.
 fn restore_bootstrap_database(params: &PostgresParams, payload: &PgPlanPayload) -> String {
-    let preferred = params.bootstrap_database();
-    if payload.databases.iter().all(|db| db.name != preferred) {
-        return preferred;
+    admin_database_outside(&params.bootstrap_database(), |name| {
+        payload.databases.iter().any(|db| db.name == name)
+    })
+}
+
+/// The database to run cluster-scope DDL from: `preferred`, unless it is one of
+/// the databases being replaced or removed — a session cannot drop the database
+/// it is connected to.
+fn admin_database_outside(preferred: &str, is_target: impl Fn(&str) -> bool) -> String {
+    if !is_target(preferred) {
+        return preferred.to_string();
     }
-    if payload.databases.iter().all(|db| db.name != "postgres") {
+    if !is_target("postgres") {
         return "postgres".to_string();
     }
     // Source discovery excludes template databases, making template1 the safe
@@ -1505,6 +1510,21 @@ async fn finish_current(current: &mut Option<ActiveCopy>) -> Result<Option<(u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_ddl_never_runs_from_a_database_being_dropped() {
+        let targets = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+        assert_eq!(admin_database_outside("app", targets(&["other"])), "app");
+        assert_eq!(admin_database_outside("app", targets(&["app"])), "postgres");
+        assert_eq!(
+            admin_database_outside("postgres", targets(&["postgres", "app"])),
+            "template1"
+        );
+        assert_eq!(
+            admin_database_outside("app", targets(&["app", "postgres"])),
+            "template1"
+        );
+    }
 
     fn probe(major: u32, is_super: bool, createdb: bool, createrole: bool) -> DestProbe {
         DestProbe {

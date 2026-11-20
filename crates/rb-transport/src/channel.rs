@@ -42,6 +42,12 @@ pub struct PairedChannel {
     control_lost: watch::Receiver<Option<String>>,
 }
 
+#[cfg(feature = "udp")]
+type NegotiatedDirect = Option<(DirectConn, [u8; crate::direct::TOKEN_LEN])>;
+
+#[cfg(feature = "udp")]
+type PendingDirect = tokio::sync::oneshot::Receiver<NegotiatedDirect>;
+
 enum PairedChannelInner {
     Source {
         acceptor: mux::Acceptor,
@@ -51,6 +57,9 @@ enum PairedChannelInner {
         direct_token: Option<[u8; crate::direct::TOKEN_LEN]>,
         #[cfg(feature = "udp")]
         direct_streams: usize,
+        /// The direct-path negotiation still running in the keepalive task.
+        #[cfg(feature = "udp")]
+        pending_direct: Option<PendingDirect>,
     },
     Destination {
         opener: mux::Opener,
@@ -86,9 +95,50 @@ impl PairedChannel {
                 direct_token: None,
                 #[cfg(feature = "udp")]
                 direct_streams: 0,
+                #[cfg(feature = "udp")]
+                pending_direct: None,
             })),
             carriers: carriers.clamp(1, 32) as usize,
             _heartbeat: AbortOnDrop(tokio::spawn(drive_control(control, lost_tx))),
+            control_lost,
+        }
+    }
+
+    /// Create a source channel that negotiates its direct path while it waits
+    /// for the destination.
+    ///
+    /// The negotiation needs the control stream for as long as the destination
+    /// takes to arrive, so it runs in the task that owns that stream and hands
+    /// the stream to the keepalive when it is done. `accept_stream` waits for
+    /// its outcome — or for the destination to show up on the relay, whichever
+    /// comes first.
+    #[cfg(feature = "udp")]
+    pub(crate) fn source_with_pending_direct(
+        acceptor: mux::Acceptor,
+        mut control: Delimited<mux::Stream>,
+        carriers: u32,
+        channel_id: String,
+        secret: Option<String>,
+    ) -> Self {
+        let (lost_tx, control_lost) = watch::channel(None);
+        let (direct_tx, pending_direct) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            let direct =
+                crate::client::setup_direct_provider(&mut control, &channel_id, secret.as_deref())
+                    .await;
+            let _ = direct_tx.send(direct);
+            drive_control(control, lost_tx).await;
+        });
+        Self {
+            inner: std::sync::Arc::new(Mutex::new(PairedChannelInner::Source {
+                acceptor,
+                direct: None,
+                direct_token: None,
+                direct_streams: 0,
+                pending_direct: Some(pending_direct),
+            })),
+            carriers: carriers.clamp(1, 32) as usize,
+            _heartbeat: AbortOnDrop(driver),
             control_lost,
         }
     }
@@ -143,11 +193,13 @@ impl PairedChannel {
                 direct: d,
                 direct_token,
                 direct_streams,
+                pending_direct,
                 ..
             } => {
                 *d = Some(direct);
                 *direct_token = Some(token);
                 *direct_streams = 0;
+                *pending_direct = None;
             }
             PairedChannelInner::Destination {
                 direct: d,
@@ -266,10 +318,39 @@ impl DataChannel for PairedChannel {
                 direct_token,
                 #[cfg(feature = "udp")]
                 direct_streams,
-                ..
-            } => {
                 #[cfg(feature = "udp")]
-                if let (Some(dc), Some(token)) = (direct, direct_token) {
+                pending_direct,
+            } => {
+                // A negotiation still under way decides where this stream
+                // arrives. A destination that gave up on the direct path opens
+                // on the relay instead, and must not be kept waiting for it.
+                #[cfg(feature = "udp")]
+                let mut early_relay = None;
+                #[cfg(feature = "udp")]
+                if let Some(pending) = pending_direct.as_mut() {
+                    tokio::select! {
+                        biased;
+                        negotiated = pending => {
+                            *pending_direct = None;
+                            if let Ok(Some((dc, token))) = negotiated {
+                                *direct = Some(dc);
+                                *direct_token = Some(token);
+                                *direct_streams = 0;
+                            }
+                        }
+                        stream = acceptor.accept() => early_relay = Some(stream),
+                        reason = wait_control_lost(&mut lost) => {
+                            return Err(registration_lost(&reason));
+                        }
+                    }
+                }
+                #[cfg(feature = "udp")]
+                let relay_first = early_relay.is_some();
+                #[cfg(not(feature = "udp"))]
+                let relay_first = false;
+
+                #[cfg(feature = "udp")]
+                if let (false, Some(dc), Some(token)) = (relay_first, direct, direct_token) {
                     let result: anyhow::Result<_> = async {
                         if *direct_streams == 0 {
                             timeout(DIRECT_SETUP_TIMEOUT, dc.accept_stream())
@@ -322,18 +403,23 @@ impl DataChannel for PairedChannel {
                 }
 
                 // Fallback to relay
-                let stream = tokio::select! {
-                    stream = acceptor.accept() => stream.ok_or_else(|| {
-                        BackupError::phase(
-                            Phase::Connect,
-                            "the connection to the coordination server closed while waiting \
-                             for the destination",
-                        )
-                    })?,
-                    reason = wait_control_lost(&mut lost) => {
-                        return Err(registration_lost(&reason));
-                    }
+                #[cfg(feature = "udp")]
+                let accepted = match early_relay {
+                    Some(stream) => stream,
+                    None => relay_accept(acceptor, &mut lost).await?,
                 };
+                #[cfg(not(feature = "udp"))]
+                let accepted = {
+                    let _ = relay_first;
+                    relay_accept(acceptor, &mut lost).await?
+                };
+                let stream = accepted.ok_or_else(|| {
+                    BackupError::phase(
+                        Phase::Connect,
+                        "the connection to the coordination server closed while waiting for the \
+                         destination",
+                    )
+                })?;
                 let mut s = stream;
                 let mut marker = [0u8; 1];
                 s.read_exact(&mut marker)
@@ -387,6 +473,16 @@ async fn wait_control_lost(lost: &mut watch::Receiver<Option<String>>) -> String
             // going away, so nothing is lost that the caller can act on.
             std::future::pending::<()>().await;
         }
+    }
+}
+
+async fn relay_accept(
+    acceptor: &mut mux::Acceptor,
+    lost: &mut watch::Receiver<Option<String>>,
+) -> Result<Option<mux::Stream>> {
+    tokio::select! {
+        stream = acceptor.accept() => Ok(stream),
+        reason = wait_control_lost(lost) => Err(registration_lost(&reason)),
     }
 }
 

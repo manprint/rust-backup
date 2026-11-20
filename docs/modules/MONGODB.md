@@ -58,6 +58,11 @@ collection the run found already present is never touched: without
 before the restore began. A cleanup that itself fails is reported as an `ERROR`
 naming the namespace; the original failure is what the process exits with.
 
+The same holds for a run that fails *after* the load — a verification
+mismatch, a lost source — and for `SIGINT`/`SIGTERM`: an interrupted restore
+unwinds through this path before the process exits (a bounded 30 s; a second
+signal exits at once and says what may be left).
+
 The live proof is `e2e/fault_matrix.sh mongodb`.
 
 ## The plan is treated as hostile input by the destination
@@ -85,7 +90,14 @@ limit is refused outright rather than treated as "wait for more bytes", which
 would buffer a whole item in memory and break I-NOTEMP.
 
 Documents are inserted `ordered(true)`: a capped collection's natural order is
-its insertion order, so unordered batching would not reproduce it.
+its insertion order, so unordered batching would not reproduce it. For the same
+reason the source reads a capped collection in `$natural` order (transfer and
+fingerprint alike) and every other collection in `_id` order: sorting a capped
+collection by `_id` restored the same documents in a different insertion order,
+which changes what the collection evicts next. A destination older than this
+change reads its capped collections back in `_id` order and so fails
+verification against a newer source whenever the two orders differ; upgrade
+both peers together.
 
 ## Views, time-series and other non-ordinary namespaces
 
@@ -162,6 +174,20 @@ fresh collection name and switch over if they must survive a failed attempt.
   minutes by default) killed the run with `CursorNotFound` on an untouched
   source. A deployment that forbids `noCursorTimeout` (some hosted shared tiers
   do) will refuse the `find` outright rather than fail halfway.
+- Index and collection options the driver's typed
+  `IndexOptions`/`CreateCollectionOptions` do not model (for example an index's
+  `prepareUnique`) are read from the raw `listIndexes`/`listCollections` reply
+  and carried verbatim; indexes are built with a raw `createIndexes`, and the
+  read-back compares the same raw view. A destination server that does not know
+  such an option refuses it at apply — a cross-major downgrade fails loudly
+  instead of dropping it. An option whose value is BSON binary is refused at
+  analysis. Whole numbers in a spec are compared by value: a server may store
+  `expireAfterSeconds: 60.0` as `60`, and that is the same index.
+- A TTL index is built only after the data read-back: the destination's TTL
+  monitor would otherwise delete documents already past their expiry before
+  they were compared. The catalog is verified twice, without the TTL indexes
+  before they exist and with them after. Once `RESTORE VERIFIED` is printed the
+  monitor is free to expire those documents, exactly as on the source.
 - Views and time-series collections are not copied; the run refuses to proceed
   unless `allow_skipped_namespaces` is set (see above).
 - Discrete host/port parameters are plaintext unless the server policy provides
