@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — release (2026-11-20)
 
 - **postgres:** the foreign-data probe reads the `pg_user_mappings` view
   instead of the `pg_user_mapping` table, which a non-superuser cannot read
